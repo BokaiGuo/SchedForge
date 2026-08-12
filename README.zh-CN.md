@@ -4,9 +4,9 @@
 
 **SchedForge — A Target-Aware CPU Tensor Compiler**
 
-**调度锻造器：将张量计算调度锻造成高效 CPU 代码。**
+**调度锻造器：把张量计算逐层编译成高效的 CPU 代码。**
 
-[English](README.md) · [架构文档](docs/ARCHITECTURE.md) · [实验报告](results/FINAL_REPORT.md) · [参与贡献](CONTRIBUTING.zh-CN.md)
+[English](README.md) · [架构说明](docs/ARCHITECTURE.md) · [实验报告](results/FINAL_REPORT.md) · [参与贡献](CONTRIBUTING.zh-CN.md)
 
 [![CI](https://github.com/BokaiGuo/SchedForge/actions/workflows/ci.yml/badge.svg)](https://github.com/BokaiGuo/SchedForge/actions/workflows/ci.yml)
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C.svg)](https://isocpp.org/)
@@ -15,57 +15,68 @@
 
 </div>
 
-SchedForge 是一个使用 C++20 实现、面向教学与研究的 CPU Tensor
-Compiler。它把张量计算 Lower 到可调度的 Loop IR，通过
-Cache/TLB/Register 代价模型筛选候选方案，再使用原生 AVX2 微内核或
-LLVM 18 ORC JIT 执行最终代码。
+SchedForge 是一个使用 C++20 编写的 CPU 张量编译器原型，主要用于学习、
+实验和编译器研究。项目从张量计算出发，将程序转换成可调度的循环中间表示，
+再结合 Cache、TLB、寄存器压力和内存带宽模型筛选执行方案，最终交给原生
+AVX2 后端或 `LLVM ORC JIT` 生成并执行机器代码。
 
-项目选择深入完成一条核心主线——融合的 FP32 `MatMul + Bias + ReLU`，
-而不是堆叠大量浅层算子。同一个 Schedule 对象会同时被 Lowering、模拟器、
-原生后端、LLVM 后端、调试工具和 AutoScheduler 消费，从而保证“预测对象”
-与“实际执行对象”一致。
+项目没有追求“算子数量越多越好”，而是围绕融合的 FP32
+`MatMul + Bias + ReLU` 深入打通一条完整链路：
+
+```text
+张量计算
+  → SSA Tensor IR
+  → Loop IR
+  → 循环变换与调度搜索
+  → 硬件代价预测
+  → 原生 AVX2 / LLVM 即时编译
+  → 真机测量与模型校准
+```
+
+同一份调度方案会同时交给循环变换、模拟器、原生后端、LLVM 后端和自动调优器，
+避免出现“模拟器预测的是一种执行方式，真正运行的却是另一种实现”的问题。
 
 ```mermaid
 flowchart LR
-    A["Tensor Graph"] --> B["SSA Tensor IR"]
-    B --> C["Canonical Loop IR"]
-    C --> D["Schedule DSL"]
-    D --> E["多级 Tiling"]
-    D --> F["Packing / Micro-kernel"]
-    D --> G["向量化 / 多线程 / 融合"]
-    E --> H["Cache + TLB + Register 模拟器"]
+    A["张量计算图"] --> B["SSA Tensor IR"]
+    B --> C["标准 Loop IR"]
+    C --> D["调度描述"]
+    D --> E["多级分块"]
+    D --> F["数据打包与微内核"]
+    D --> G["向量化、多线程与算子融合"]
+    E --> H["Cache、TLB 与寄存器模型"]
     F --> H
     G --> H
-    H --> I["Cost Model / AutoScheduler"]
+    H --> I["代价模型与自动调优"]
     I --> J["原生 AVX2 后端"]
-    I --> K["LLVM 18 ORC JIT"]
-    J --> L["Benchmark / perf"]
+    I --> K["LLVM 即时编译后端"]
+    J --> L["真机测试与 perf"]
     K --> L
-    L --> M["校准与预测误差研究"]
+    L --> M["模型校准与误差分析"]
 ```
 
-## 项目亮点
+## 主要能力
 
-- **编译器基础设施：** SSA `Type`、`Value`、use-def chain、`Operation`、
-  嵌套 `Block`、`Module`、`IRBuilder` 与分层 PassManager。
-- **Tensor/Loop 分层：** 将“算什么”与“怎么算”分离；模拟器与代码生成器
-  消费同一份 Loop IR。
-- **CPU Schedule：** 多级 tiling、MR/NR register block、K 展开、PackA/PackB、
-  prefetch、SIMD、算子融合、线程亲和性与多线程执行。
-- **双执行后端：** 原生 AVX2/FMA 微内核，以及真实 LLVM 18
-  `IRBuilder` + O3 + ORC `LLJIT`，支持汇编生成和分析。
-- **硬件感知模型：** 组相联 L1/L2/L3 Cache、DTLB、预取有效性、寄存器压力、
-  spill penalty、packing 流量、带宽校准和 target-aware cost model。
-- **自动调度与研究工具：** grid/random/greedy/evolutionary 搜索、模拟器 Top-k
-  真机测量、Spearman 相关性和 Top-k recall 分析。
-- **运行时能力：** 动态 shape bucket、持久化 kernel artifact、layout propagation、
-  生命周期内存规划、NUMA 拓扑检测、线程绑定、BF16 和 INT8 参考路径。
+- **编译器基础设施**：实现 SSA 类型系统、`Value`、use-def 关系、
+  `Operation`、嵌套 `Block`、`Module`、`IRBuilder` 和分层 PassManager。
+- **Tensor IR 与 Loop IR 分层**：Tensor IR 描述“算什么”，Loop IR 描述
+  “具体怎么执行”，调度策略独立于计算语义。
+- **CPU 循环优化**：支持多级分块、MR/NR 寄存器分块、K 维展开、A/B 矩阵
+  数据打包、软件预取、SIMD 向量化、尾部处理、算子融合和多线程执行。
+- **两套可执行后端**：一套是原生 AVX2/FMA 微内核；另一套使用 LLVM 18
+  构造 IR、执行 O3 优化并通过 `ORC LLJIT` 运行，同时支持汇编导出与检查。
+- **硬件感知代价模型**：模拟组相联 L1/L2/L3 Cache、DTLB、软件预取、
+  寄存器占用、潜在 Spill、数据打包开销和内存带宽。
+- **自动调优**：支持网格搜索、随机搜索、贪心搜索和进化搜索，并使用模拟器
+  先排序、再对少量候选进行真机测试。
+- **运行时支持**：包含动态尺寸分桶、编译产物缓存、布局传播、生命周期内存规划、
+  CPU 亲和性、NUMA 拓扑检测，以及 BF16、INT8 参考实现。
 
 ## 快速开始
 
 ### 1. 安装依赖
 
-Ubuntu 24.04：
+以下命令适用于 Ubuntu 24.04：
 
 ```bash
 sudo apt-get update
@@ -74,13 +85,13 @@ sudo apt-get install -y \
   llvm-18-dev llvm-18-runtime llvm-18-tools clang-18
 ```
 
-可选硬件计数器：
+如果还需要采集硬件性能计数器，可以安装：
 
 ```bash
 sudo apt-get install -y linux-tools-common linux-tools-generic
 ```
 
-### 2. 构建与测试
+### 2. 编译并运行测试
 
 ```bash
 git clone https://github.com/BokaiGuo/SchedForge.git
@@ -91,7 +102,7 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
-如果 CMake 没有自动定位 LLVM，可显式指定：
+如果 CMake 没有自动找到 LLVM，可以显式指定配置目录：
 
 ```bash
 cmake -S . -B build -G Ninja \
@@ -99,117 +110,122 @@ cmake -S . -B build -G Ninja \
   -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm
 ```
 
-### 3. 运行工具链
+### 3. 体验完整工具链
 
 ```bash
-# 输出 Tensor IR、Scheduled Loop IR 和 LLVM IR
+# 查看 Tensor IR、调度后的 Loop IR 和生成的 LLVM IR
 ./build/schedforge-opt --M=129 --N=131 --K=127
 
-# 运行 Cache/TLB/Register/Prefetch 模拟
+# 查看 Cache、TLB、寄存器压力和预取效果的预测结果
 ./build/schedforge-sim --M=256 --N=256 --K=256
 
-# 原生 AVX2 后端
+# 使用原生 AVX2 后端运行
 ./build/schedforge-run --backend=native --M=256 --N=256 --K=256
 
-# LLVM ORC JIT 后端
+# 使用 LLVM 即时编译后端运行
 ./build/schedforge-run --backend=llvm --M=256 --N=256 --K=256
 
-# 校准后的自动调度
+# 校准硬件参数后执行自动调优
 ./build/schedforge-bench --M=192 --N=192 --K=192 \
   --threads=8 --autoschedule --top-k=12 --calibrate
 ```
 
-## Schedule DSL
+## 调度描述语言
 
-Schedule 是可被多个编译阶段复用的领域对象，而不是 LLVM 后端参数集合：
+SchedForge 使用一段紧凑文本描述执行方案。它不是某个后端的临时参数，而是
+循环变换、模拟器、代码生成器和自动调优器共同使用的编译器对象。
 
 ```text
 order=ikj;outer=64,128,64;tile=32,64,32;micro=4,8;
 vector=8;unroll=4;threads=8;pack=ab;prefetch=4;fuse=true;pin=true
 ```
 
-| 字段 | 含义 |
+| 字段 | 作用 |
 |---|---|
-| `order` | 循环顺序（`ijk` 或 `ikj`） |
-| `outer` | `MC,NC,KC` 外层/Cache tile |
-| `tile` | `BM,BN,BK` 内层 tile |
-| `micro` | `MR,NR` 寄存器分块 |
-| `vector` | FP32 SIMD lane 数量 |
-| `unroll` | K 循环展开因子 |
-| `pack` | Pack A、B、两者或均不 Packing |
-| `prefetch` | 软件预取距离 |
-| `threads` | Runtime 线程数量 |
-| `fuse` | 是否融合 Bias/ReLU epilogue |
-| `pin` | 是否将工作线程绑定到 CPU |
+| `order` | 指定循环顺序，例如 `ijk` 或 `ikj` |
+| `outer` | 设置 `MC,NC,KC` 外层分块 |
+| `tile` | 设置 `BM,BN,BK` 内层 Cache 分块 |
+| `micro` | 设置 `MR,NR` 寄存器分块 |
+| `vector` | 设置 FP32 SIMD 向量宽度 |
+| `unroll` | 设置 K 循环展开倍数 |
+| `pack` | 选择是否打包 A、B 矩阵 |
+| `prefetch` | 设置软件预取距离 |
+| `threads` | 设置工作线程数量 |
+| `fuse` | 选择是否融合 Bias 和 ReLU |
+| `pin` | 选择是否将工作线程绑定到固定 CPU |
 
 ## 命令行工具
 
 | 工具 | 用途 |
 |---|---|
-| `schedforge-opt` | 查看 Tensor IR、Loop IR 和 LLVM IR |
-| `schedforge-sim` | 运行硬件模拟器与代价模型 |
-| `schedforge-run` | 执行 native、LLVM、BF16 或 INT8 后端 |
-| `schedforge-bench` | 自动调度并实测候选配置 |
-| `schedforge-calibrate` | 校准内存带宽与模型比例 |
-| `schedforge-search` | 对比不同 Schedule 搜索策略 |
-| `schedforge-study` | 运行 Packing crossover 与预测误差实验 |
+| `schedforge-opt` | 查看各级中间表示和 LLVM IR |
+| `schedforge-sim` | 运行硬件模型并输出代价预测 |
+| `schedforge-run` | 运行原生、LLVM、BF16 或 INT8 后端 |
+| `schedforge-bench` | 搜索调度方案并测试候选性能 |
+| `schedforge-calibrate` | 测量内存带宽并校准代价模型 |
+| `schedforge-search` | 对比不同调度搜索算法 |
+| `schedforge-study` | 分析数据打包收益和预测误差 |
 
-## 已记录实验结果
+## 实测结果
 
-以下结果来自 Intel Core i5-14600K，仅作为仓库实验快照，不能视为跨平台性能承诺。
+下面的数据来自一台 Intel Core i5-14600K，仅用于展示当前实现的实验结果，
+不代表其他 CPU 或其他运行环境能够得到相同性能。
 
-| 实验 | 记录结果 |
+| 测试项目 | 实测结果 |
 |---|---:|
-| 校准后 native auto-schedule，融合 192³ | **84.584 GFLOPS** |
-| LLVM ORC JIT，融合 192³ | **31.216 GFLOPS** |
-| 模拟器/真机 Schedule Spearman | **0.968** |
-| 模拟器 Top-5 / Top-10 recall | **0.40 / 0.70** |
-| BF16 相对 FP32 最大误差，128³ | **0.0303** |
-| INT8 相对 FP32 最大误差，128³ | **0.0805** |
+| 原生后端自动调优，融合 192³ 矩阵乘 | **84.584 GFLOPS** |
+| `LLVM ORC JIT` 后端，融合 192³ 矩阵乘 | **31.216 GFLOPS** |
+| 模拟排序与真机排序的 Spearman 相关系数 | **0.968** |
+| 预测前 5 / 前 10 名的命中率 | **0.40 / 0.70** |
+| BF16 相对 FP32 的最大绝对误差，128³ | **0.0303** |
+| INT8 相对 FP32 的最大绝对误差，128³ | **0.0805** |
 
-完整方法、负结果、原始 artifact 和 claim boundary 请查看
+完整实验方法、负结果、原始数据和结论的适用范围，请查看
 [最终实验报告](results/FINAL_REPORT.md)。
 
 ## 项目结构
 
 ```text
-include/schedforge/   编译器、IR、Runtime 与 Simulator 公共 API
-src/                   IR、Lowering、LLVM、Runtime、模拟和调度实现
-tools/                 编译器命令行工具
-tests/                 单元测试与端到端测试
-docs/                  架构与设计决策
-results/               可复现实验快照和报告
-scripts/               硬件计数器辅助脚本
+include/schedforge/   对外公开的编译器、IR、运行时和模拟器接口
+src/                  IR、循环变换、LLVM 后端、运行时、模拟器和调度器实现
+tools/                命令行工具
+tests/                单元测试与端到端测试
+docs/                 架构说明和设计决策记录
+results/              经过整理的实验结果与报告
+scripts/              性能计数器辅助脚本
 ```
 
-## 范围与限制
+## 当前边界
 
-- SchedForge 是 CPU Tensor Compiler 原型，不是 BLIS、oneDNN 或生产级图编译器的替代品。
-- 当前只在真实硬件上验证了 AVX2。AVX-512 和 NEON 目前属于 Target abstraction，
-  本版本不声称已经完成对应机器码后端验证。
-- 已实现 NUMA-aware partitioning，但实验主机只有一个 NUMA node，因此不做跨 Socket 性能声明。
-- Simulator 目标是相对 Schedule 排序，而不是 cycle-accurate Intel 乱序执行模拟。
-- 性能受 CPU、频率策略、编译器、输入规模和后台负载影响，请在自己的机器上重新实验。
+- SchedForge 是用于学习和研究的 CPU 张量编译器原型，不是 BLIS、oneDNN
+  或生产级图编译器的替代品。
+- 当前只在真实硬件上验证了 AVX2 后端。AVX-512 和 NEON 目前只有目标抽象，
+  不能视为已经完成并验证的机器码后端。
+- 项目已经实现 NUMA 拓扑检测和任务划分，但实验机器只有一个 NUMA 节点，
+  因此不对跨处理器插槽的性能作出结论。
+- 模拟器的目标是帮助比较调度方案，而不是逐周期复现 Intel 处理器的乱序执行。
+- 性能会受到 CPU 型号、频率策略、编译器版本、输入规模和后台负载影响，
+  请在自己的机器上重新运行实验。
 
-## 文档
+## 延伸阅读
 
 - [架构说明](docs/ARCHITECTURE.md)
-- [实验设计](docs/EXPERIMENT.md)
+- [实验方法](docs/EXPERIMENT.md)
 - [最终实验报告](results/FINAL_REPORT.md)
 - [架构决策记录](docs/decisions/)
-- [贡献指南](CONTRIBUTING.zh-CN.md)
+- [中文贡献指南](CONTRIBUTING.zh-CN.md)
 - [安全策略](SECURITY.md)
 
 ## 参与贡献
 
-欢迎提交 Issue 和 Pull Request。请先阅读 [贡献指南](CONTRIBUTING.zh-CN.md)，
-并在提交前运行完整测试。
+欢迎提交 Issue 和 Pull Request。开始之前请先阅读
+[中文贡献指南](CONTRIBUTING.zh-CN.md)，并确保完整测试已经通过。
 
 ## 引用
 
-如果 SchedForge 对课程、研究或工程实验有帮助，请使用 [CITATION.cff](CITATION.cff)
-中的信息引用本仓库。
+如果 SchedForge 对课程、研究或工程实验有帮助，可以按照
+[CITATION.cff](CITATION.cff) 中的信息引用本项目。
 
-## 许可证
+## 开源许可证
 
-SchedForge 使用 [MIT License](LICENSE) 开源。
+SchedForge 使用 [MIT License](LICENSE) 发布。
