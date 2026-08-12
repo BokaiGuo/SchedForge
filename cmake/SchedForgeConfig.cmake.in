@@ -1,0 +1,14 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(LLVM CONFIG)
+if(NOT LLVM_VERSION_MAJOR EQUAL 18)
+    set(SchedForge_FOUND FALSE)
+    set(SchedForge_NOT_FOUND_MESSAGE
+        "SchedForge requires LLVM 18, found ${LLVM_PACKAGE_VERSION}")
+    return()
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/SchedForgeTargets.cmake")
+
+check_required_components(SchedForge)

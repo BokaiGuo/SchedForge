@@ -1,0 +1,4 @@
+backend: int8
+time_ms: 0.786414
+gops: 5.33346
+max_error_vs_fp32: 0.0805197

@@ -1,0 +1,4 @@
+target: x86_64 AVX2 vector=8 registers=16 cpus=20
+memory_bandwidth_gbps: 20.3549
+fma_proxy_gflops: 5.08871
+stream_ns: 1.64847e+06

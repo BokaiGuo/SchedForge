@@ -1,0 +1,24 @@
+Calibrated target: x86_64 AVX2 vector=8 registers=16 cpus=20 bandwidth=12.5789 GB/s
+Search space: 10368 schedules
+Static pruning: 10368 -> 3564
+Cache simulation: 3564 -> 12
+
+Best schedule:
+  ikj-tile16x64x64-v8-mr8-t8-fused
+  tile = 16x64x64
+  register block = 8x8
+  outer tile = 64x128x64
+  vector width = 8
+  packing = none
+  prefetch distance = 0
+  threads = 8
+
+Performance:
+  execution = 0.167 ms
+  GFLOPS = 84.584
+  max error = 0.000
+  simulated L1 miss = 0.097%
+  simulated LLC miss = 100.000%
+  simulated DTLB misses = 36
+  register pressure = 12.000
+  simulator ranking = #2

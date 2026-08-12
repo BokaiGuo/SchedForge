@@ -1,0 +1,4 @@
+grid,candidates=2673,hardware=12,best_gflops=39.8369,elapsed_ms=24217.7
+random,candidates=2673,hardware=12,best_gflops=28.5443,elapsed_ms=26.5933
+greedy,candidates=2673,hardware=12,best_gflops=37.2589,elapsed_ms=24499.1
+evolutionary,candidates=12,hardware=12,best_gflops=36.5243,elapsed_ms=24427.7

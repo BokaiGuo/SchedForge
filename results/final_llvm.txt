@@ -1,0 +1,8 @@
+backend: llvm-orc-jit
+compile_ms: 13.9057
+time_ms: 0.453477
+gflops: 31.2161
+max_error: 4.76837e-06
+vector_instructions: 16
+fma_instructions: 3
+spill_pattern: 0

@@ -1,0 +1,4 @@
+backend: bf16
+time_ms: 0.824167
+gops: 5.08914
+max_error_vs_fp32: 0.0303199

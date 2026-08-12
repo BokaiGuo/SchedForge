@@ -1,0 +1,4 @@
+study_csv: results/final_depth_study.csv
+schedule_spearman: 0.968211
+top5_recall: 0.4
+top10_recall: 0.7
