@@ -15,21 +15,24 @@
 
 </div>
 
-SchedForge is a C++20 model-to-machine CPU AI compiler for dense and dynamically
-routed sparse tensor programs. It imports a practical
+SchedForge is a C++20 model-to-machine CPU AI compiler for dense, dynamically
+routed sparse, and attention tensor programs. It imports a practical
 StableHLO subset into a multi-operation Tensor SSA graph, performs shape
 inference, graph canonicalization, fusion, dispatch formation, layout planning,
 bufferization, and workspace reuse, then lowers each dispatch through
 Structured Tensor Compute, Transform IR, scheduled Loop IR, tensorization, and
 LLVM 18 ORC JIT or native AVX2 execution.
 
-The flagship graph workloads are a Transformer MLP block and a Top-2 MoE MLP:
-`Linear → Bias → GELU → Linear → Bias → Residual`. MatMul remains the kernel
+The flagship graph workloads are a Transformer MLP block, a Top-2 MoE MLP, and
+exact Flash-style CPU attention. MatMul remains the kernel
 benchmark and hardware auto-tuning laboratory; the MLP is the graph/compiler
 benchmark that exercises real use-def chains, fusion boundaries, dynamic shape
 guards, temporary tensors, layout propagation, memory lifetime, and dispatch.
 
 `Router → Softmax → TopK → Segmented Dispatch → Grouped Expert SwiGLU → Weighted Combine`.
+
+`QKᵀ → Scale → Causal Mask → Online Softmax → PV`, without materializing the
+full attention matrix for the IO-aware lowering.
 
 ```mermaid
 flowchart TD
@@ -37,10 +40,14 @@ flowchart TD
     B --> C["Canonicalization + Fusion Planner"]
     C --> D["Dense Dispatch IR + Layout Planning"]
     C --> M1["MoE Router + TopK"]
+    C --> A1["SDPA Fusion + Attention Strategy Planner"]
     M1 --> M2["Histogram + Prefix Sum + Dispatch"]
     M2 --> M3["Segmented Tensor + Grouped Expert IR"]
     M3 --> M4["Routing-Aware Strategy Planner"]
     M4 --> D
+    A1 --> A2["Materialized / IO-Aware / Split-KV"]
+    A2 --> A3["TilePipelineIR + QK/PV LoopIR"]
+    A3 --> D
     D --> E["Bufferization + ExecutablePlan"]
     E --> F["Structured Tensor Compute"]
     F --> G["Transform IR + AutoScheduler"]
@@ -61,6 +68,9 @@ flowchart TD
 - **MoE compiler:** decomposed Router/TopK/Histogram/Prefix/Dispatch/Combine IR,
   segmented tensors, variable-M grouped expert GEMM, SwiGLU, token buckets,
   routing traces, and load-aware expert task scheduling.
+- **Attention compiler:** SDPA graph fusion, MHA/GQA/MQA types, causal tiled
+  execution, exact online softmax, TilePipelineIR, materialized and IO-aware
+  prefill, growable KV cache, and parallel Split-KV decode.
 - **Memory and layout compiler:** layout is part of tensor type; graph layout
   propagation, dispatch-boundary materialization, bufferization, lifetime
   analysis, aligned workspace reuse, and guarded shape specialization.
@@ -84,8 +94,8 @@ flowchart TD
   learned cost-model APIs consume the resulting measurement database.
 - **AI runtime:** serializable `.sfe` ExecutablePlan with constants, buffers,
   dispatches, shape guards, Transform IR, LLVM kernel artifacts, and workspace.
-- **Transformer and inference abstractions:** executable MLP, mini-attention
-  graph construction, quantized tensor metadata, per-axis quantization
+- **Transformer and inference abstractions:** executable Dense MLP, MoE, prefill
+  attention and KV-cache decode; quantized tensor metadata, per-axis quantization
   propagation, BF16/INT8 reference paths, and adaptive specialization guards.
 
 ## Quick Start
@@ -156,6 +166,18 @@ cmake -S . -B build -G Ninja \
   --experts=8 --top-k=2 --threads=8 --router-data \
   --strategy=auto -o results/moe_mlp.sfe
 
+# Compile and run exact CPU Flash-style causal prefill attention
+./build/schedforge-attention \
+  --batch=1 --q-heads=8 --kv-heads=8 --sq=128 --sk=128 \
+  --head-dim=64 --value-dim=64 --causal --threads=8 \
+  --strategy=auto -o results/attention_prefill.sfe
+
+# Compile and run GQA Split-KV decode against a KV cache
+./build/schedforge-attention \
+  --batch=1 --q-heads=8 --kv-heads=2 --sq=1 --sk=1024 \
+  --head-dim=64 --value-dim=64 --causal --threads=8 \
+  --strategy=auto -o results/attention_decode.sfe
+
 # Run routing-skew, grouped-execution, and scheduler experiments
 ./build/schedforge-moe --tokens=64 --hidden=64 --intermediate=128 \
   --experts=8 --top-k=2 --threads=8 --routing=heavy \
@@ -209,6 +231,7 @@ inspectable and verifiable before target lowering.
 | `schedforge-resolution` | Measure tuning noise and candidate-resolution limits |
 | `schedforge-compile` | Compile StableHLO graphs into `.sfe` ExecutablePlans |
 | `schedforge-moe` | Compile, simulate, execute, and compare MoE execution plans |
+| `schedforge-attention` | Compile, tune, simulate, and execute attention plans |
 
 ## MoE Compiler Demo
 
@@ -229,6 +252,27 @@ raises fixed grouped simulated imbalance to 2.0. Load-aware splitting reduces
 it to 0 and improves grouped P50 latency from **26.780 ms** to **20.113 ms** on
 the recorded run. The complete 27-case matrix is stored in
 `results/moe_strategy_matrix.csv`.
+
+## Attention Compiler Demo
+
+SchedForge 0.5 recognizes the semantic SDPA chain, forms `attention.sdpa`, and
+selects among materialized, tiled-materialized, IO-aware prefill, and Split-KV
+decode algorithms. The IO-aware path uses a fused `BQ×BK` TilePipelineIR with
+online row maximum, denominator, rescaling, and output numerator state. It is
+exact attention and never allocates the full `Sq×Sk` score/probability matrices.
+
+On the recorded Intel Core i5-14600K, causal MHA prefill
+`B=1, H=8, Sq=Sk=128, D=64` runs in **0.262 ms P50** with zero printed error.
+GQA decode `Hq=8, Hkv=2, Sq=1, Sk=1024, D=64` selects parallel Split-KV and
+runs in **0.112 ms P50** with zero printed error.
+
+At `S=512`, the measured four-strategy study reduces temporary storage from
+**16 MiB** for materialized attention to **49 KiB** for auto-scheduled
+IO-aware attention, while P50 latency falls from **18.929 ms** to **2.947 ms**.
+The 96-case scaling analysis covers heads `8/12`, dimensions `64/128`, and
+sequence lengths `128–4096`. A 200-execution Linux PMU run at `S=512` records
+P-core IPC **2.561**, L1D miss rate **1.066%**, and cache-reference miss rate
+**16.230%**; these process counters include runtime/framework overhead.
 
 ## Graph Compiler Demo
 
@@ -288,13 +332,16 @@ scripts/               Hardware-counter helpers
 
 - SchedForge is a research compiler prototype, not a replacement for oneDNN,
   XLA, IREE, TVM, or production inference runtimes.
-- The Transformer MLP and FP32 Top-2 MoE MLP paths execute and validate end to
-  end. Mini-attention, quantization propagation, and the learned model are
-  implemented abstractions but are not production-optimized backends.
+- The Transformer MLP, FP32 Top-2 MoE, exact IO-aware prefill attention, and
+  contiguous-KV Split-KV decode paths execute and validate end to end.
 - AVX2 is the physically validated SIMD backend. AVX-512 and NEON are target
   abstractions but are not validated code-generation backends in this release.
 - MoE P-core/E-core placement, NUMA-aware execution, quantized experts,
   block-sparse lowering, and distributed expert parallelism are not implemented.
+- Attention is a CPU cache-hierarchy adaptation of Flash-style exact attention,
+  not an implementation or performance claim for GPU FlashAttention-2.
+- Paged KV allocation, BF16/INT8 attention, dropout/backward, distributed
+  attention, and production fused LLVM attention machine code remain future work.
 - The simulator is a diagnostic model, not a performance-selection oracle or a
   cycle-accurate Intel out-of-order simulator.
 - Performance numbers depend on CPU, frequency policy, compiler, workload, and
@@ -306,6 +353,7 @@ scripts/               Hardware-counter helpers
 - [Graph compiler and `.sfe` format](docs/GRAPH_COMPILER.md)
 - [Explicit Scheduled LoopIR](docs/LOOP_IR.md)
 - [MoE compiler pipeline](docs/MOE_COMPILER.md)
+- [Attention compiler pipeline](docs/ATTENTION_COMPILER.md)
 - [Experiment design](docs/EXPERIMENT.md)
 - [Final experiment report](results/FINAL_REPORT.md)
 - [Architecture decisions](docs/decisions/)

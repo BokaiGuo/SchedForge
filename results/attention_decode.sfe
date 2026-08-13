@@ -1,0 +1,361 @@
+sfe.attention_executable version=0.5.0 strategy=split-kv-decode
+hardware=x86_64 AVX2 vector=8 registers=16 cpus=20
+config B=1 Hq=8 Hkv=2 Sq<=1 Sk<=1024 D=64 Dv=64 causal=true
+graph @model {
+  %v0 = tensor.input : tensor<1x8xSqx64xf32, layout=row_major>
+  %v1 = tensor.input : tensor<1x2xSkx64xf32, layout=row_major>
+  %v2 = tensor.input : tensor<1x2xSkx64xf32, layout=row_major>
+  %v3 = attention.sdpa %v0 %v1 %v2 : tensor<1x8xSqx64xf32, layout=row_major>
+  func.return %v3
+}
+attention.schedule {
+  qtile 1
+  kvtile 128
+  qk_micro 4x8
+  pv_micro 4x8
+  softmax_vector 8
+  pack_k true
+  pack_v false
+  prefetch_k 2
+  prefetch_v 2
+  threads 8
+}
+tile.pipeline @attention {
+  %scores = attention.qk %Q_tile, %K_tile
+  %scaled = attention.scale %scores
+  %masked = attention.causal_mask %scaled
+  %row_max = reduce.max %masked
+  %new_max = vector.max %running_max, %row_max
+  %probability = vector.exp %masked - %new_max
+  %block_sum = reduce.sum %probability
+  %rescaled = attention.rescale %running_state, %new_max
+  %online = attention.online_softmax %probability, %block_sum
+  %output = attention.pv %probability, %V_tile
+  %normalized = vector.div %output, %denominator
+  tile.yield %output
+}
+guards {
+  0 < Sq
+  Sq <= 1
+  0 < Sk
+  Sk <= 1024
+  Hq % Hkv == 0
+}
+attention.memory temporary=16896 score=0 probability=0 online_state=16896
+attention.simulation flops=2.09715e+06 bytes_read=1.05062e+06 bytes_written=2048 arithmetic_intensity=1.99222 temporary=16896 qk_tiles=64 skipped_causal_tiles=0 score_evaluations=8192 exp_evaluations=8256 reduction_operations=16384 l2_traffic=1.05267e+06 llc_traffic=1.05267e+06 l2_hit_rate=0 llc_hit_rate=0
+qk_loop {
+func @matmul(%A, %B, %bias, %C) {
+  %packed_b = buffer.alloc -> %packedB
+  buffer.pack %B -> %packedB
+  scf.for %ii = 0 to M step 1 {
+    scf.for %jj = 0 to N step 128 {
+      scf.for %i = 0 to min(ii+1,M) step 4 {
+        scf.for %j = 0 to min(jj+128,N) step 8 {
+          %acc = vector.accumulator.init : vector<8xf32>
+          scf.for %kk = 0 to K step 64 {
+            scf.for %k = 0 to min(kk+64,K) step 1 {
+              memref.prefetch %packedB[%k,%j] distance=2
+              %a = memref.load %A[%i,%k]
+              %b = vector.load %packedB[%k,%j] : vector<8xf32>
+              %a_vec = vector.broadcast %a : vector<8xf32>
+              %acc = vector.fma %a_vec,%b,%acc : vector<8xf32>
+            }
+          }
+          vector.store %acc -> %C[%i,%j] : vector<8xf32>
+        }
+      }
+    }
+  }
+}
+}
+pv_loop {
+func @matmul(%A, %B, %bias, %C) {
+  scf.for %ii = 0 to M step 1 {
+    scf.for %jj = 0 to N step 64 {
+      scf.for %i = 0 to min(ii+1,M) step 4 {
+        scf.for %j = 0 to min(jj+64,N) step 8 {
+          %acc = vector.accumulator.init : vector<8xf32>
+          scf.for %kk = 0 to K step 128 {
+            scf.for %k = 0 to min(kk+128,K) step 1 {
+              memref.prefetch %B[%k,%j] distance=2
+              %a = memref.load %A[%i,%k]
+              %b = vector.load %B[%k,%j] : vector<8xf32>
+              %a_vec = vector.broadcast %a : vector<8xf32>
+              %acc = vector.fma %a_vec,%b,%acc : vector<8xf32>
+            }
+          }
+          vector.store %acc -> %C[%i,%j] : vector<8xf32>
+        }
+      }
+    }
+  }
+}
+}
+llvm.qk {
+; ModuleID = 'schedforge_jit'
+source_filename = "schedforge_jit"
+
+; Function Attrs: nofree norecurse nosync nounwind memory(argmem: readwrite)
+define void @schedforge_matmul(ptr nocapture readonly %A, ptr nocapture readonly %B, ptr nocapture readnone %bias, ptr nocapture %C, i64 %M, i64 %N, i64 %K) local_unnamed_addr #0 {
+entry:
+  %.not19 = icmp eq i64 %N, 0
+  br i1 %.not19, label %epilogue.i.preheader, label %compute.i.preheader
+
+compute.i.preheader:                              ; preds = %entry
+  %umax = tail call i64 @llvm.umax.i64(i64 %M, i64 1)
+  %0 = mul i64 %umax, %N
+  %1 = shl i64 %0, 2
+  tail call void @llvm.memset.p0.i64(ptr align 4 %C, i8 0, i64 %1, i1 false)
+  %.not510 = icmp ult i64 %N, 8
+  br i1 %.not510, label %compute.i.us.us, label %compute.i
+
+compute.i.us.us:                                  ; preds = %compute.i.preheader, %compute.i.latch.split.us.split.us.us.us
+  %i.us.us = phi i64 [ %18, %compute.i.latch.split.us.split.us.us.us ], [ 0, %compute.i.preheader ]
+  %2 = mul i64 %i.us.us, %K
+  %3 = getelementptr float, ptr %A, i64 %2
+  %4 = mul i64 %i.us.us, %N
+  %5 = getelementptr float, ptr %C, i64 %4
+  br label %compute.k.us.us.us.us
+
+compute.k.us.us.us.us:                            ; preds = %scalar.j.compute.k.latch_crit_edge.us.us.us.us, %compute.i.us.us
+  %k.us.us.us.us = phi i64 [ 0, %compute.i.us.us ], [ %17, %scalar.j.compute.k.latch_crit_edge.us.us.us.us ]
+  %6 = getelementptr float, ptr %3, i64 %k.us.us.us.us
+  %7 = load float, ptr %6, align 4
+  %8 = mul i64 %k.us.us.us.us, %N
+  %9 = getelementptr float, ptr %B, i64 %8
+  br label %scalar.j.body.us.us.us.us
+
+scalar.j.body.us.us.us.us:                        ; preds = %scalar.j.body.us.us.us.us, %compute.k.us.us.us.us
+  %j.scalar12.us.us.us.us = phi i64 [ 0, %compute.k.us.us.us.us ], [ %15, %scalar.j.body.us.us.us.us ]
+  %10 = getelementptr float, ptr %9, i64 %j.scalar12.us.us.us.us
+  %11 = getelementptr float, ptr %5, i64 %j.scalar12.us.us.us.us
+  %12 = load float, ptr %10, align 4
+  %13 = load float, ptr %11, align 4
+  %14 = tail call float @llvm.fma.f32(float %7, float %12, float %13)
+  store float %14, ptr %11, align 4
+  %15 = add nuw i64 %j.scalar12.us.us.us.us, 1
+  %16 = icmp ult i64 %15, %N
+  br i1 %16, label %scalar.j.body.us.us.us.us, label %scalar.j.compute.k.latch_crit_edge.us.us.us.us
+
+scalar.j.compute.k.latch_crit_edge.us.us.us.us:   ; preds = %scalar.j.body.us.us.us.us
+  %17 = add nuw i64 %k.us.us.us.us, 1
+  %.not6.us.us.us.us = icmp ult i64 %17, %K
+  br i1 %.not6.us.us.us.us, label %compute.k.us.us.us.us, label %compute.i.latch.split.us.split.us.us.us
+
+compute.i.latch.split.us.split.us.us.us:          ; preds = %scalar.j.compute.k.latch_crit_edge.us.us.us.us
+  %18 = add nuw i64 %i.us.us, 1
+  %.not7.us.us = icmp ult i64 %18, %M
+  br i1 %.not7.us.us, label %compute.i.us.us, label %epilogue.i.preheader
+
+compute.i:                                        ; preds = %compute.i.preheader, %compute.i.latch.split
+  %i = phi i64 [ %44, %compute.i.latch.split ], [ 0, %compute.i.preheader ]
+  %19 = mul i64 %i, %K
+  %20 = getelementptr float, ptr %A, i64 %19
+  %21 = mul i64 %i, %N
+  %22 = getelementptr float, ptr %C, i64 %21
+  br label %compute.k
+
+compute.k:                                        ; preds = %compute.k.latch, %compute.i
+  %k = phi i64 [ 0, %compute.i ], [ %45, %compute.k.latch ]
+  %23 = getelementptr float, ptr %20, i64 %k
+  %24 = load float, ptr %23, align 4
+  %25 = mul i64 %k, %N
+  %26 = getelementptr float, ptr %B, i64 %25
+  %27 = insertelement <8 x float> poison, float %24, i64 0
+  %28 = shufflevector <8 x float> %27, <8 x float> poison, <8 x i32> zeroinitializer
+  br label %vector.j.body
+
+vector.j.scalar.j.preheader_crit_edge:            ; preds = %vector.j.body
+  %29 = icmp ult i64 %30, %N
+  br i1 %29, label %scalar.j.body, label %compute.k.latch
+
+vector.j.body:                                    ; preds = %compute.k, %vector.j.body
+  %30 = phi i64 [ 8, %compute.k ], [ %36, %vector.j.body ]
+  %j.vec11 = phi i64 [ 0, %compute.k ], [ %30, %vector.j.body ]
+  %31 = getelementptr float, ptr %26, i64 %j.vec11
+  %32 = getelementptr float, ptr %22, i64 %j.vec11
+  %33 = load <8 x float>, ptr %31, align 1
+  %34 = load <8 x float>, ptr %32, align 1
+  %35 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %28, <8 x float> %33, <8 x float> %34)
+  store <8 x float> %35, ptr %32, align 1
+  %36 = add i64 %30, 8
+  %.not5 = icmp ugt i64 %36, %N
+  br i1 %.not5, label %vector.j.scalar.j.preheader_crit_edge, label %vector.j.body
+
+scalar.j.body:                                    ; preds = %vector.j.scalar.j.preheader_crit_edge, %scalar.j.body
+  %j.scalar12 = phi i64 [ %42, %scalar.j.body ], [ %30, %vector.j.scalar.j.preheader_crit_edge ]
+  %37 = getelementptr float, ptr %26, i64 %j.scalar12
+  %38 = getelementptr float, ptr %22, i64 %j.scalar12
+  %39 = load float, ptr %37, align 4
+  %40 = load float, ptr %38, align 4
+  %41 = tail call float @llvm.fma.f32(float %24, float %39, float %40)
+  store float %41, ptr %38, align 4
+  %42 = add nuw i64 %j.scalar12, 1
+  %43 = icmp ult i64 %42, %N
+  br i1 %43, label %scalar.j.body, label %compute.k.latch
+
+compute.i.latch.split:                            ; preds = %compute.k.latch
+  %44 = add nuw i64 %i, 1
+  %.not7 = icmp ult i64 %44, %M
+  br i1 %.not7, label %compute.i, label %epilogue.i.preheader
+
+epilogue.i.preheader:                             ; preds = %compute.i.latch.split, %compute.i.latch.split.us.split.us.us.us, %entry
+  ret void
+
+compute.k.latch:                                  ; preds = %scalar.j.body, %vector.j.scalar.j.preheader_crit_edge
+  %45 = add nuw i64 %k, 1
+  %.not6 = icmp ult i64 %45, %K
+  br i1 %.not6, label %compute.k, label %compute.i.latch.split
+}
+
+; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare <8 x float> @llvm.fma.v8f32(<8 x float>, <8 x float>, <8 x float>) #1
+
+; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare float @llvm.fma.f32(float, float, float) #1
+
+; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: write)
+declare void @llvm.memset.p0.i64(ptr nocapture writeonly, i8, i64, i1 immarg) #2
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare i64 @llvm.umax.i64(i64, i64) #3
+
+attributes #0 = { nofree norecurse nosync nounwind memory(argmem: readwrite) }
+attributes #1 = { mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+attributes #2 = { nocallback nofree nounwind willreturn memory(argmem: write) }
+attributes #3 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+}
+llvm.pv {
+; ModuleID = 'schedforge_jit'
+source_filename = "schedforge_jit"
+
+; Function Attrs: nofree norecurse nosync nounwind memory(argmem: readwrite)
+define void @schedforge_matmul(ptr nocapture readonly %A, ptr nocapture readonly %B, ptr nocapture readnone %bias, ptr nocapture %C, i64 %M, i64 %N, i64 %K) local_unnamed_addr #0 {
+entry:
+  %.not19 = icmp eq i64 %N, 0
+  br i1 %.not19, label %epilogue.i.preheader, label %compute.i.preheader
+
+compute.i.preheader:                              ; preds = %entry
+  %umax = tail call i64 @llvm.umax.i64(i64 %M, i64 1)
+  %0 = mul i64 %umax, %N
+  %1 = shl i64 %0, 2
+  tail call void @llvm.memset.p0.i64(ptr align 4 %C, i8 0, i64 %1, i1 false)
+  %.not510 = icmp ult i64 %N, 8
+  br i1 %.not510, label %compute.i.us.us, label %compute.i
+
+compute.i.us.us:                                  ; preds = %compute.i.preheader, %compute.i.latch.split.us.split.us.us.us
+  %i.us.us = phi i64 [ %18, %compute.i.latch.split.us.split.us.us.us ], [ 0, %compute.i.preheader ]
+  %2 = mul i64 %i.us.us, %K
+  %3 = getelementptr float, ptr %A, i64 %2
+  %4 = mul i64 %i.us.us, %N
+  %5 = getelementptr float, ptr %C, i64 %4
+  br label %compute.k.us.us.us.us
+
+compute.k.us.us.us.us:                            ; preds = %scalar.j.compute.k.latch_crit_edge.us.us.us.us, %compute.i.us.us
+  %k.us.us.us.us = phi i64 [ 0, %compute.i.us.us ], [ %17, %scalar.j.compute.k.latch_crit_edge.us.us.us.us ]
+  %6 = getelementptr float, ptr %3, i64 %k.us.us.us.us
+  %7 = load float, ptr %6, align 4
+  %8 = mul i64 %k.us.us.us.us, %N
+  %9 = getelementptr float, ptr %B, i64 %8
+  br label %scalar.j.body.us.us.us.us
+
+scalar.j.body.us.us.us.us:                        ; preds = %scalar.j.body.us.us.us.us, %compute.k.us.us.us.us
+  %j.scalar12.us.us.us.us = phi i64 [ 0, %compute.k.us.us.us.us ], [ %15, %scalar.j.body.us.us.us.us ]
+  %10 = getelementptr float, ptr %9, i64 %j.scalar12.us.us.us.us
+  %11 = getelementptr float, ptr %5, i64 %j.scalar12.us.us.us.us
+  %12 = load float, ptr %10, align 4
+  %13 = load float, ptr %11, align 4
+  %14 = tail call float @llvm.fma.f32(float %7, float %12, float %13)
+  store float %14, ptr %11, align 4
+  %15 = add nuw i64 %j.scalar12.us.us.us.us, 1
+  %16 = icmp ult i64 %15, %N
+  br i1 %16, label %scalar.j.body.us.us.us.us, label %scalar.j.compute.k.latch_crit_edge.us.us.us.us
+
+scalar.j.compute.k.latch_crit_edge.us.us.us.us:   ; preds = %scalar.j.body.us.us.us.us
+  %17 = add nuw i64 %k.us.us.us.us, 1
+  %.not6.us.us.us.us = icmp ult i64 %17, %K
+  br i1 %.not6.us.us.us.us, label %compute.k.us.us.us.us, label %compute.i.latch.split.us.split.us.us.us
+
+compute.i.latch.split.us.split.us.us.us:          ; preds = %scalar.j.compute.k.latch_crit_edge.us.us.us.us
+  %18 = add nuw i64 %i.us.us, 1
+  %.not7.us.us = icmp ult i64 %18, %M
+  br i1 %.not7.us.us, label %compute.i.us.us, label %epilogue.i.preheader
+
+compute.i:                                        ; preds = %compute.i.preheader, %compute.i.latch.split
+  %i = phi i64 [ %44, %compute.i.latch.split ], [ 0, %compute.i.preheader ]
+  %19 = mul i64 %i, %K
+  %20 = getelementptr float, ptr %A, i64 %19
+  %21 = mul i64 %i, %N
+  %22 = getelementptr float, ptr %C, i64 %21
+  br label %compute.k
+
+compute.k:                                        ; preds = %compute.k.latch, %compute.i
+  %k = phi i64 [ 0, %compute.i ], [ %45, %compute.k.latch ]
+  %23 = getelementptr float, ptr %20, i64 %k
+  %24 = load float, ptr %23, align 4
+  %25 = mul i64 %k, %N
+  %26 = getelementptr float, ptr %B, i64 %25
+  %27 = insertelement <8 x float> poison, float %24, i64 0
+  %28 = shufflevector <8 x float> %27, <8 x float> poison, <8 x i32> zeroinitializer
+  br label %vector.j.body
+
+vector.j.scalar.j.preheader_crit_edge:            ; preds = %vector.j.body
+  %29 = icmp ult i64 %30, %N
+  br i1 %29, label %scalar.j.body, label %compute.k.latch
+
+vector.j.body:                                    ; preds = %compute.k, %vector.j.body
+  %30 = phi i64 [ 8, %compute.k ], [ %36, %vector.j.body ]
+  %j.vec11 = phi i64 [ 0, %compute.k ], [ %30, %vector.j.body ]
+  %31 = getelementptr float, ptr %26, i64 %j.vec11
+  %32 = getelementptr float, ptr %22, i64 %j.vec11
+  %33 = load <8 x float>, ptr %31, align 1
+  %34 = load <8 x float>, ptr %32, align 1
+  %35 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %28, <8 x float> %33, <8 x float> %34)
+  store <8 x float> %35, ptr %32, align 1
+  %36 = add i64 %30, 8
+  %.not5 = icmp ugt i64 %36, %N
+  br i1 %.not5, label %vector.j.scalar.j.preheader_crit_edge, label %vector.j.body
+
+scalar.j.body:                                    ; preds = %vector.j.scalar.j.preheader_crit_edge, %scalar.j.body
+  %j.scalar12 = phi i64 [ %42, %scalar.j.body ], [ %30, %vector.j.scalar.j.preheader_crit_edge ]
+  %37 = getelementptr float, ptr %26, i64 %j.scalar12
+  %38 = getelementptr float, ptr %22, i64 %j.scalar12
+  %39 = load float, ptr %37, align 4
+  %40 = load float, ptr %38, align 4
+  %41 = tail call float @llvm.fma.f32(float %24, float %39, float %40)
+  store float %41, ptr %38, align 4
+  %42 = add nuw i64 %j.scalar12, 1
+  %43 = icmp ult i64 %42, %N
+  br i1 %43, label %scalar.j.body, label %compute.k.latch
+
+compute.i.latch.split:                            ; preds = %compute.k.latch
+  %44 = add nuw i64 %i, 1
+  %.not7 = icmp ult i64 %44, %M
+  br i1 %.not7, label %compute.i, label %epilogue.i.preheader
+
+epilogue.i.preheader:                             ; preds = %compute.i.latch.split, %compute.i.latch.split.us.split.us.us.us, %entry
+  ret void
+
+compute.k.latch:                                  ; preds = %scalar.j.body, %vector.j.scalar.j.preheader_crit_edge
+  %45 = add nuw i64 %k, 1
+  %.not6 = icmp ult i64 %45, %K
+  br i1 %.not6, label %compute.k, label %compute.i.latch.split
+}
+
+; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare <8 x float> @llvm.fma.v8f32(<8 x float>, <8 x float>, <8 x float>) #1
+
+; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare float @llvm.fma.f32(float, float, float) #1
+
+; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: write)
+declare void @llvm.memset.p0.i64(ptr nocapture writeonly, i8, i64, i1 immarg) #2
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare i64 @llvm.umax.i64(i64, i64) #3
+
+attributes #0 = { nofree norecurse nosync nounwind memory(argmem: readwrite) }
+attributes #1 = { mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+attributes #2 = { nocallback nofree nounwind willreturn memory(argmem: write) }
+attributes #3 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+}

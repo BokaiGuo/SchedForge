@@ -3,6 +3,7 @@
 #include "schedforge/compiler.h"
 #include "schedforge/graph_compiler.h"
 #include "schedforge/moe_compiler.h"
+#include "schedforge/attention_compiler.h"
 
 #include <algorithm>
 #include <cmath>
@@ -412,6 +413,124 @@ void test_moe_compiler() {
             "moe end-to-end execution");
 }
 
+void test_attention_compiler() {
+    const schedforge::AttentionConfig config{1, 4, 2, 9, 9, 8, 8, true};
+    auto graph = schedforge::build_sdpa_graph(config, true);
+    const auto unfused_constraints = schedforge::ShapeInferencePass{}.run(graph);
+    require(graph.dump().find("tensor.softmax") != std::string::npos &&
+            graph.dump().find("tensor.mask") != std::string::npos &&
+            !unfused_constraints.empty(),
+            "unfused sdpa tensor graph");
+    auto fused = schedforge::AttentionFusionPass{}.run(graph);
+    require(fused.dump().find("attention.sdpa") != std::string::npos,
+            "attention fusion pass");
+    const auto constraints = schedforge::ShapeInferencePass{}.run(fused);
+    require(!constraints.empty() &&
+            fused.values().at(static_cast<std::size_t>(fused.returnValue())).type.shape.size() == 4,
+            "attention shape inference");
+
+    const auto data = schedforge::make_attention_data(config, 43);
+    schedforge::AttentionSchedule schedule;
+    schedule.query_tile = 4;
+    schedule.kv_tile = 3;
+    schedule.threads = 2;
+    const auto materialized = schedforge::AttentionCompiler{}.compile(
+        config, {schedforge::AttentionLoweringStrategy::Materialized, schedule});
+    const auto io_aware = schedforge::AttentionCompiler{}.compile(
+        config, {schedforge::AttentionLoweringStrategy::IOAware, schedule});
+    const auto baseline = schedforge::execute_attention(materialized, data, 0, 1);
+    const auto streaming = schedforge::execute_attention(io_aware, data, 0, 1);
+    require(baseline.max_error < 1.0e-4 && streaming.max_error < 1.0e-4 &&
+            schedforge::max_abs_error(baseline.output, streaming.output) < 1.0e-4,
+            "exact io-aware online softmax");
+    require(io_aware.memory.temporary_bytes < materialized.memory.temporary_bytes &&
+            io_aware.memory.temporary_bytes == io_aware.simulation.temporary_bytes &&
+            io_aware.memory.temporary_bytes > 0 &&
+            io_aware.simulation.estimated_l2_traffic > io_aware.simulation.bytes_read &&
+            io_aware.pipeline.dump().find("attention.online_softmax") != std::string::npos &&
+            io_aware.pipeline.dump().find("reduce.max") != std::string::npos,
+            "attention tile pipeline and memory reduction");
+    auto dynamic_config = config;
+    dynamic_config.sequence_query = 5;
+    dynamic_config.sequence_kv = 7;
+    const auto dynamic_data = schedforge::make_attention_data(dynamic_config, 45);
+    const auto dynamic_result = schedforge::execute_attention(
+        io_aware, dynamic_data, 5, 7, 0, 1);
+    require(dynamic_result.max_error < 1.0e-4,
+            "dynamic attention sequence specialization");
+
+    auto prefill_config = config;
+    prefill_config.sequence_query = 128;
+    prefill_config.sequence_kv = 128;
+    const auto selected = schedforge::select_attention_plan(
+        prefill_config, schedforge::TargetInfo::detect(), 4);
+    require(selected.strategy == schedforge::AttentionLoweringStrategy::AutoScheduledIOAware,
+            "prefill attention strategy selection");
+    auto small_config = config;
+    small_config.sequence_query = 8;
+    small_config.sequence_kv = 8;
+    small_config.causal = false;
+    const auto small_selected = schedforge::select_attention_plan(
+        small_config, schedforge::TargetInfo::detect(), 4);
+    require(small_selected.strategy == schedforge::AttentionLoweringStrategy::Materialized,
+            "small attention materialized selection");
+    const auto small_data = schedforge::make_attention_data(small_config, 46);
+    auto small_io_options = small_selected;
+    small_io_options.strategy = schedforge::AttentionLoweringStrategy::IOAware;
+    small_io_options.schedule.query_tile = 4;
+    small_io_options.schedule.kv_tile = 4;
+    const auto small_io_plan = schedforge::AttentionCompiler{}.compile(
+        small_config, small_io_options);
+    require(schedforge::execute_attention(small_io_plan, small_data, 0, 1).max_error < 1.0e-4,
+            "non-causal io-aware attention execution");
+
+    schedforge::AttentionConfig decode_config{1, 4, 2, 1, 11, 8, 8, true};
+    const auto decode_data = schedforge::make_attention_data(decode_config, 47);
+    auto cache = schedforge::make_kv_cache(decode_config);
+    const int first_tokens = 5;
+    std::vector<float> first_keys;
+    std::vector<float> first_values;
+    std::vector<float> second_keys;
+    std::vector<float> second_values;
+    for (int head = 0; head < decode_config.kv_heads; ++head) {
+        const auto key_head = decode_data.key.begin() +
+            static_cast<std::ptrdiff_t>(head * decode_config.sequence_kv * decode_config.head_dim);
+        first_keys.insert(first_keys.end(), key_head,
+            key_head + first_tokens * decode_config.head_dim);
+        second_keys.insert(second_keys.end(), key_head + first_tokens * decode_config.head_dim,
+            key_head + decode_config.sequence_kv * decode_config.head_dim);
+        const auto value_head = decode_data.value.begin() +
+            static_cast<std::ptrdiff_t>(head * decode_config.sequence_kv * decode_config.head_dim_value);
+        first_values.insert(first_values.end(), value_head,
+            value_head + first_tokens * decode_config.head_dim_value);
+        second_values.insert(second_values.end(), value_head + first_tokens * decode_config.head_dim_value,
+            value_head + decode_config.sequence_kv * decode_config.head_dim_value);
+    }
+    schedforge::append_kv(cache, first_keys, first_values, first_tokens);
+    schedforge::append_kv(cache, second_keys, second_values,
+                         decode_config.sequence_kv - first_tokens);
+    const auto decode_plan = schedforge::AttentionCompiler{}.compile(
+        decode_config, schedforge::select_attention_plan(
+            decode_config, schedforge::TargetInfo::detect(), 4));
+    require(decode_plan.plan.strategy == schedforge::AttentionLoweringStrategy::SplitKVDecode &&
+            decode_plan.plan.split_kv > 1,
+            "split-kv decode strategy");
+    const auto decoded = schedforge::execute_decode_attention(
+        decode_plan, decode_data.query, cache, 0, 1);
+    require(decoded.max_error < 1.0e-4 &&
+            decoded.output.size() == static_cast<std::size_t>(
+                decode_config.batch * decode_config.query_heads * decode_config.head_dim_value),
+            "gqa kv-cache decode execution");
+    auto mqa_config = decode_config;
+    mqa_config.kv_heads = 1;
+    const auto mqa_data = schedforge::make_attention_data(mqa_config, 49);
+    const auto mqa_plan = schedforge::AttentionCompiler{}.compile(
+        mqa_config, schedforge::select_attention_plan(
+            mqa_config, schedforge::TargetInfo::detect(), 4));
+    const auto mqa_result = schedforge::execute_attention(mqa_plan, mqa_data, 0, 1);
+    require(mqa_result.max_error < 1.0e-4, "mqa attention execution");
+}
+
 }  // namespace
 
 int main() {
@@ -423,6 +542,7 @@ int main() {
         test_compiler_architecture();
         test_graph_compiler();
         test_moe_compiler();
+        test_attention_compiler();
         std::cout << "all tests passed\n";
         return 0;
     } catch (const std::exception& error) {

@@ -15,19 +15,23 @@
 
 </div>
 
-SchedForge 是一个使用 C++20 编写、同时面向稠密与动态路由稀疏张量程序的
+SchedForge 是一个使用 C++20 编写、同时面向稠密、动态路由稀疏与 Attention
+张量程序的
 model-to-machine CPU AI 编译器。它能够
 导入 StableHLO 子集，构建真正的多算子 Tensor SSA Graph，执行 Shape 推导、
 图正规化、融合、Dispatch 形成、Layout 传播、Bufferization 和 Workspace
 复用，再通过 Structured Tensor Compute、Transform IR、Loop IR、Tensorization
 和 LLVM 18 ORC JIT 或原生 AVX2 后端生成并执行 CPU 代码。
 
-当前 Graph 级旗舰路径包括 Transformer MLP 与 Top-2 MoE MLP：
-`Linear → Bias → GELU → Linear → Bias → Residual`。MatMul 继续作为 Kernel
+当前 Graph 级旗舰路径包括 Transformer MLP、Top-2 MoE MLP 与精确的 CPU
+Flash-style Attention。MatMul 继续作为 Kernel
 性能基准，MLP 则作为 Graph Compiler 基准，真实覆盖 use-def、融合边界、
 动态 Shape Guard、临时张量、布局、内存生命周期和 Dispatch。
 
 `Router → Softmax → TopK → Segmented Dispatch → Grouped Expert SwiGLU → Weighted Combine`。
+
+`QKᵀ → Scale → Causal Mask → Online Softmax → PV`；IO-aware Lowering 不会物化
+完整 Attention Matrix。
 
 ```text
 StableHLO / AI Graph
@@ -48,10 +52,13 @@ flowchart LR
     A["张量计算图"] --> B["SSA Tensor IR"]
     B --> C["Dense Dispatch"]
     B --> R["MoE Router + TopK"]
+    B --> A["SDPA Fusion + Attention Planner"]
     R --> S["Segmented Tensor + Grouped Expert IR"]
     S --> P["Routing-aware Strategy Planner"]
     C --> D["显式 Scheduled LoopIR"]
     P --> D
+    A --> T["Materialized / IO-aware / Split-KV"]
+    T --> D
     D --> E["多级分块"]
     D --> F["数据打包与微内核"]
     D --> G["向量化、多线程与算子融合"]
@@ -75,6 +82,9 @@ flowchart LR
 - **MoE Compiler**：显式 Router/TopK/Histogram/Prefix/Dispatch/Combine IR、
   Segmented Tensor、Variable-M Grouped Expert GEMM、SwiGLU、Token Bucket、
   Routing Trace 与 Load-aware Expert Task Scheduler。
+- **Attention Compiler**：SDPA 结构融合、MHA/GQA/MQA、Causal Tile、精确在线
+  Softmax、TilePipelineIR、Materialized/IO-aware Prefill、可增长 KV Cache 与
+  并行 Split-KV Decode。
 - **内存与布局编译**：Layout 进入 Tensor Type；支持跨 Dispatch 布局传播、
   Bufferization、生命周期分析、64 字节对齐 Workspace 复用和 Guarded Specialization。
 - **结构化 Kernel Compiler**：Iteration Domain、并行/归约 Iterator、Indexing Map、
@@ -92,8 +102,8 @@ flowchart LR
   前列随机交错复测；测量数据库可用于 analytical + learned 混合模型。
 - **AI Runtime**：可序列化 `.sfe` ExecutablePlan，包含常量、Buffer、Dispatch、
   Shape Guard、Transform IR、LLVM Kernel Artifact 和 Workspace。
-- **Transformer/推理抽象**：可执行 MLP、Mini Attention Graph、量化 Tensor
-  元数据与传播、BF16/INT8 参考路径和动态多版本 Guard。
+- **Transformer/推理抽象**：可执行 Dense MLP、MoE、IO-aware Prefill 与
+  KV-cache Decode；量化 Tensor 元数据与传播、BF16/INT8 参考路径和动态 Guard。
 
 ## 快速开始
 
@@ -163,6 +173,18 @@ cmake -S . -B build -G Ninja \
   --experts=8 --top-k=2 --threads=8 --router-data \
   --strategy=auto -o results/moe_mlp.sfe
 
+# 编译并真实运行 CPU Flash-style Causal Prefill
+./build/schedforge-attention \
+  --batch=1 --q-heads=8 --kv-heads=8 --sq=128 --sk=128 \
+  --head-dim=64 --value-dim=64 --causal --threads=8 \
+  --strategy=auto -o results/attention_prefill.sfe
+
+# 使用 KV Cache 运行 GQA Split-KV Decode
+./build/schedforge-attention \
+  --batch=1 --q-heads=8 --kv-heads=2 --sq=1 --sk=1024 \
+  --head-dim=64 --value-dim=64 --causal --threads=8 \
+  --strategy=auto -o results/attention_decode.sfe
+
 # 运行 Routing Skew、Grouped Execution 与 Scheduler 对比实验
 ./build/schedforge-moe --tokens=64 --hidden=64 --intermediate=128 \
   --experts=8 --top-k=2 --threads=8 --routing=heavy \
@@ -210,6 +232,7 @@ vector=8;unroll=4;threads=8;pack=ab;prefetch=4;fuse=true;pin=true
 | `schedforge-resolution` | 测量调优噪声与候选区分能力 |
 | `schedforge-compile` | 将 StableHLO Graph 编译为 `.sfe` ExecutablePlan |
 | `schedforge-moe` | 编译、模拟、执行并对比 MoE Execution Plan |
+| `schedforge-attention` | 编译、调优、模拟并执行 Attention Plan |
 
 ## MoE Compiler 实测 Demo
 
@@ -228,6 +251,25 @@ Intel Core i5-14600K 上真实运行，P50 延迟 **35.843 ms**、P95 延迟
 Grouped 执行的模拟不均衡度为 2.0；Load-aware splitting 将其降为 0，并把实测
 Grouped P50 从 **26.780 ms** 降至 **20.113 ms**。完整 27 组结果见
 `results/moe_strategy_matrix.csv`。
+
+## Attention Compiler 实测 Demo
+
+SchedForge 0.5 会识别完整 SDPA 链并形成 `attention.sdpa`，在 Materialized、
+Tiled Materialized、IO-aware Prefill 与 Split-KV Decode 之间选择。IO-aware
+路径使用 `BQ×BK` TilePipelineIR，维护在线 Row Max、分母、Rescale 与 Output
+Numerator；它是精确 Attention，并且不会分配完整 `Sq×Sk` Score/Probability。
+
+在当前 Intel Core i5-14600K 上，Causal MHA Prefill
+`B=1, H=8, Sq=Sk=128, D=64` 的 P50 为 **0.262 ms**，打印精度下误差为 0；
+GQA Decode `Hq=8, Hkv=2, Sq=1, Sk=1024, D=64` 自动选择并行 Split-KV，
+P50 为 **0.112 ms**，打印精度下误差为 0。
+
+在 `S=512` 的四策略实测中，Materialized Attention 的临时内存为 **16 MiB**，
+Auto-scheduled IO-aware 仅为 **49 KiB**；P50 从 **18.929 ms** 降至
+**2.947 ms**。96 组 Scaling Analysis 覆盖 Head `8/12`、D `64/128` 和
+序列长度 `128–4096`。`S=512`、200 次执行的 Linux PMU 记录为 P-core IPC
+**2.561**、L1D Miss Rate **1.066%**、Cache-reference Miss Rate **16.230%**；
+这些进程级计数包含 Runtime/框架开销。
 
 ## Graph Compiler 实测 Demo
 
@@ -284,12 +326,16 @@ scripts/              性能计数器辅助脚本
 
 - SchedForge 是研究型 CPU AI 编译器原型，不是 oneDNN、XLA、IREE、TVM
   或生产级推理 Runtime 的替代品。
-- Transformer MLP 与 FP32 Top-2 MoE MLP 已端到端执行并验证；Mini Attention、
-  量化传播和 Learned Cost Model 已有抽象与测试，但还不是生产级后端。
+- Transformer MLP、FP32 Top-2 MoE、精确 IO-aware Prefill Attention 与连续
+  KV Cache Split-KV Decode 已端到端执行并验证。
 - 当前只在真实硬件上验证了 AVX2 后端。AVX-512 和 NEON 目前只有目标抽象，
   不能视为已经完成并验证的机器码后端。
 - MoE 的 P-core/E-core 放置、NUMA-aware 执行、量化 Expert、Block-sparse
   Lowering 与分布式 Expert Parallelism 尚未实现。
+- Attention 是面向 CPU Cache Hierarchy 的 Flash-style 精确 Attention，不是
+  GPU FlashAttention-2 的实现或性能声明。
+- Paged KV、BF16/INT8 Attention、Dropout/Backward、分布式 Attention 与生产级
+  LLVM Fused Attention Machine Code 尚未实现。
 - 模拟器只提供诊断信息，既不是性能选择裁判，也不会逐周期复现 Intel
   处理器的乱序执行。
 - 性能会受到 CPU 型号、频率策略、编译器版本、输入规模和后台负载影响，
@@ -301,6 +347,7 @@ scripts/              性能计数器辅助脚本
 - [Graph Compiler 与 `.sfe` 格式](docs/GRAPH_COMPILER.md)
 - [显式 Scheduled LoopIR](docs/LOOP_IR.md)
 - [MoE Compiler Pipeline](docs/MOE_COMPILER.md)
+- [Attention Compiler Pipeline](docs/ATTENTION_COMPILER.md)
 - [实验方法](docs/EXPERIMENT.md)
 - [最终实验报告](results/FINAL_REPORT.md)
 - [架构决策记录](docs/decisions/)

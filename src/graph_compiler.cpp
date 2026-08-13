@@ -30,6 +30,8 @@ std::string op_name(GraphOpKind kind) {
         case GraphOpKind::Rsqrt: return "tensor.rsqrt";
         case GraphOpKind::Convert: return "tensor.convert";
         case GraphOpKind::Softmax: return "tensor.softmax";
+        case GraphOpKind::Mask: return "tensor.mask";
+        case GraphOpKind::AttentionSdpa: return "attention.sdpa";
         case GraphOpKind::TopK: return "tensor.topk";
         case GraphOpKind::MoeHistogram: return "moe.histogram";
         case GraphOpKind::MoePrefixSum: return "moe.prefix_sum";
@@ -199,22 +201,57 @@ std::vector<ShapeConstraint> ShapeInferencePass::run(TensorGraph& graph) const {
         if (operation.kind == GraphOpKind::MatMul) {
             const auto& lhs = graph.values().at(static_cast<std::size_t>(operation.inputs[0])).type;
             const auto& rhs = graph.values().at(static_cast<std::size_t>(operation.inputs[1])).type;
-            if (lhs.shape.size() != 2 || rhs.shape.size() != 2)
-                throw std::invalid_argument("matmul requires rank-2 tensors after flattening");
-            if (!same_dimension(lhs.shape[1], rhs.shape[0]))
-                throw std::invalid_argument("matmul reduction dimensions do not match");
-            constraints.push_back({lhs.shape[1].str() + " == " + rhs.shape[0].str(),
-                                   lhs.shape[1].kind != DimensionKind::Static ||
-                                   rhs.shape[0].kind != DimensionKind::Static});
-            output = {{lhs.shape[0], rhs.shape[1]}, lhs.dtype, {}, std::nullopt, 0, -1};
+            if (lhs.shape.size() == 2 && rhs.shape.size() == 2) {
+                if (!same_dimension(lhs.shape[1], rhs.shape[0]))
+                    throw std::invalid_argument("matmul reduction dimensions do not match");
+                constraints.push_back({lhs.shape[1].str() + " == " + rhs.shape[0].str(),
+                                       lhs.shape[1].kind != DimensionKind::Static ||
+                                       rhs.shape[0].kind != DimensionKind::Static});
+                output = {{lhs.shape[0], rhs.shape[1]}, lhs.dtype, {}, std::nullopt, 0, -1};
+            } else if (lhs.shape.size() == 4 && rhs.shape.size() == 4) {
+                if (!same_dimension(lhs.shape[0], rhs.shape[0]) ||
+                    !same_dimension(lhs.shape[3], rhs.shape[2]))
+                    throw std::invalid_argument("batched matmul dimensions do not match");
+                if (lhs.shape[1].kind == DimensionKind::Static &&
+                    rhs.shape[1].kind == DimensionKind::Static &&
+                    lhs.shape[1].value % rhs.shape[1].value != 0)
+                    throw std::invalid_argument("batched matmul head dimensions do not broadcast");
+                constraints.push_back({lhs.shape[3].str() + " == " + rhs.shape[2].str(),
+                                       lhs.shape[3].kind != DimensionKind::Static ||
+                                       rhs.shape[2].kind != DimensionKind::Static});
+                constraints.push_back({lhs.shape[1].str() + " % " + rhs.shape[1].str() + " == 0",
+                                       lhs.shape[1].kind != DimensionKind::Static ||
+                                       rhs.shape[1].kind != DimensionKind::Static});
+                output = {{lhs.shape[0], lhs.shape[1], lhs.shape[2], rhs.shape[3]},
+                          lhs.dtype, {}, std::nullopt, 0, -1};
+            } else {
+                throw std::invalid_argument("matmul requires matching rank-2 or rank-4 tensors");
+            }
         } else if (operation.kind == GraphOpKind::Add || operation.kind == GraphOpKind::Multiply ||
                    operation.kind == GraphOpKind::Maximum) {
             const auto& lhs = graph.values().at(static_cast<std::size_t>(operation.inputs[0])).type;
             const auto& rhs = graph.values().at(static_cast<std::size_t>(operation.inputs[1])).type;
             output = lhs.shape.size() >= rhs.shape.size() ? lhs : rhs;
+        } else if (operation.kind == GraphOpKind::AttentionSdpa) {
+            const auto& query = graph.values().at(static_cast<std::size_t>(operation.inputs[0])).type;
+            const auto& key = graph.values().at(static_cast<std::size_t>(operation.inputs[1])).type;
+            const auto& value = graph.values().at(static_cast<std::size_t>(operation.inputs[2])).type;
+            if (query.shape.size() != 4 || key.shape.size() != 4 || value.shape.size() != 4)
+                throw std::invalid_argument("attention.sdpa requires rank-4 Q/K/V tensors");
+            if (!same_dimension(query.shape[0], key.shape[0]) ||
+                !same_dimension(key.shape[0], value.shape[0]) ||
+                !same_dimension(query.shape[3], key.shape[3]) ||
+                !same_dimension(key.shape[2], value.shape[2]))
+                throw std::invalid_argument("attention.sdpa Q/K/V dimensions do not match");
+            output = {{query.shape[0], query.shape[1], query.shape[2], value.shape[3]},
+                      query.dtype, {}, std::nullopt, 0, -1};
+            constraints.push_back({query.shape[1].str() + " % " + key.shape[1].str() + " == 0",
+                                   query.shape[1].kind != DimensionKind::Static ||
+                                   key.shape[1].kind != DimensionKind::Static});
         } else if (operation.kind == GraphOpKind::Gelu || operation.kind == GraphOpKind::Exp ||
                    operation.kind == GraphOpKind::Rsqrt || operation.kind == GraphOpKind::Convert ||
                    operation.kind == GraphOpKind::Broadcast || operation.kind == GraphOpKind::Softmax ||
+                   operation.kind == GraphOpKind::Mask ||
                    operation.kind == GraphOpKind::SwiGLU || operation.kind == GraphOpKind::MoeCombine) {
             if (output.shape.empty())
                 output = graph.values().at(static_cast<std::size_t>(operation.inputs[0])).type;
@@ -316,7 +353,8 @@ std::vector<StructuredCompute> StructuredComputeLowering::run(const TensorGraph&
                 {IteratorKind::Parallel, IteratorKind::Parallel, IteratorKind::Reduction},
                 {"A(i,k)", "B(k,j)", "C(i,j)"}, "C(i,j) += A(i,k) * B(k,j)"});
         } else if (operation.kind == GraphOpKind::Add || operation.kind == GraphOpKind::Gelu ||
-                   operation.kind == GraphOpKind::Softmax || operation.kind == GraphOpKind::SwiGLU ||
+                   operation.kind == GraphOpKind::Softmax || operation.kind == GraphOpKind::Mask ||
+                   operation.kind == GraphOpKind::AttentionSdpa || operation.kind == GraphOpKind::SwiGLU ||
                    operation.kind == GraphOpKind::MoeCombine) {
             computes.push_back({operation.name, {"i", "j"},
                 {IteratorKind::Parallel, IteratorKind::Parallel},
@@ -327,6 +365,12 @@ std::vector<StructuredCompute> StructuredComputeLowering::run(const TensorGraph&
                  IteratorKind::Parallel, IteratorKind::Reduction},
                 {"X(offset[e]+i,k)", "W(e,k,j)", "Y(offset[e]+i,j)"},
                 "Y_e(i,j) += X_e(i,k) * W_e(k,j)"});
+        } else if (operation.kind == GraphOpKind::AttentionSdpa) {
+            computes.push_back({operation.name, {"b", "h", "qi", "kj", "d", "dv"},
+                {IteratorKind::Parallel, IteratorKind::Parallel, IteratorKind::Parallel,
+                 IteratorKind::Reduction, IteratorKind::Reduction, IteratorKind::Parallel},
+                {"Q(b,h,qi,d)", "K(b,hkv,kj,d)", "V(b,hkv,kj,dv)", "O(b,h,qi,dv)"},
+                "attention.qk -> reduce.max -> vector.exp -> reduce.sum -> attention.pv"});
         }
     }
     return computes;

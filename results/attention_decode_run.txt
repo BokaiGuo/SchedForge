@@ -1,0 +1,36 @@
+[KV Cache]
+!sfg.kv_cache<batch=1, heads=2, length=1024/1024, key_dim=64, value_dim=64>
+
+[Attention]
+strategy: split-kv-decode
+shape: B=1 Hq=8 Hkv=2 Sq=1 Sk=1024 D=64
+
+[Schedule]
+attention.schedule {
+  qtile 1
+  kvtile 128
+  qk_micro 4x8
+  pv_micro 4x8
+  softmax_vector 8
+  pack_k true
+  pack_v false
+  prefetch_k 2
+  prefetch_v 2
+  threads 8
+}
+
+[Memory]
+attention.memory temporary=16896 score=0 probability=0 online_state=16896
+
+[Simulation]
+attention.simulation flops=2.09715e+06 bytes_read=1.05062e+06 bytes_written=2048 arithmetic_intensity=1.99222 temporary=16896 qk_tiles=64 skipped_causal_tiles=0 score_evaluations=8192 exp_evaluations=8256 reduction_operations=16384 l2_traffic=1.05267e+06 llc_traffic=1.05267e+06 l2_hit_rate=0 llc_hit_rate=0
+
+[Runtime]
+P50 execution: 0.112 ms
+P95 execution: 0.128 ms
+
+[Validation]
+max error: 0.000
+
+[Hardware]
+x86_64 AVX2 vector=8 registers=16 cpus=20

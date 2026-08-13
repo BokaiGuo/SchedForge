@@ -1,0 +1,47 @@
+[Attention]
+strategy: auto-io-aware
+shape: B=1 Hq=8 Hkv=8 Sq=512 Sk=512 D=64
+
+[Schedule]
+attention.schedule {
+  qtile 32
+  kvtile 32
+  qk_micro 4x8
+  pv_micro 4x8
+  softmax_vector 8
+  pack_k true
+  pack_v false
+  prefetch_k 2
+  prefetch_v 2
+  threads 8
+}
+
+[Memory]
+attention.memory temporary=100352 score=0 probability=0 online_state=100352
+
+[Simulation]
+attention.simulation flops=2.6896e+08 bytes_read=3.14573e+06 bytes_written=1.04858e+06 arithmetic_intensity=64.125 temporary=100352 qk_tiles=1088 skipped_causal_tiles=960 score_evaluations=1.05062e+06 exp_evaluations=1.11616e+06 reduction_operations=2.10125e+06 l2_traffic=3.56516e+07 llc_traffic=4.1943e+06 l2_hit_rate=0.882353 llc_hit_rate=0
+
+[Runtime]
+P50 execution: 3.217 ms
+P95 execution: 3.412 ms
+
+[Validation]
+max error: 0.000
+
+[Hardware]
+x86_64 AVX2 vector=8 registers=16 cpus=20
+
+[PMU process counters; 200 measured executions]
+2057590175,,cpu_atom/cycles/,409843,0.00,,
+21762076014,,cpu_core/cycles/,4164512873,99.00,,
+1802076324,,cpu_atom/instructions/,409843,0.00,,
+55725588165,,cpu_core/instructions/,4164512873,99.00,,
+22372139,,cpu_atom/cache-references/,409843,0.00,,
+47386601,,cpu_core/cache-references/,4164512873,99.00,,
+5256274,,cpu_atom/cache-misses/,409843,0.00,,
+7690835,,cpu_core/cache-misses/,4164512873,99.00,,
+446509330,,cpu_atom/L1-dcache-loads/,409843,0.00,,
+17275795032,,cpu_core/L1-dcache-loads/,4164512873,99.00,,
+<not supported>,,cpu_atom/L1-dcache-load-misses/,0,100.00,,
+184210953,,cpu_core/L1-dcache-load-misses/,4164512873,99.00,,

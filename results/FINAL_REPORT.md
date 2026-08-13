@@ -97,7 +97,7 @@ ISA-specialized AVX-512 BF16 or VNNI implementations.
 
 ## Graph Compiler Validation
 
-SchedForge 0.4 retains the explicit executable-IR backbone for the model-to-machine
+SchedForge 0.5 retains the explicit executable-IR backbone for the model-to-machine
 Transformer MLP path. The checked-in
 StableHLO example is canonicalized to 12 Tensor SSA operations and compiled into
 two dispatches: `MatMul + Bias + GELU` and `MatMul + Bias + Residual`.
@@ -156,6 +156,41 @@ matrix is stored in `results/moe_strategy_matrix.csv`; the executable artifact
 and representative run are `results/moe_mlp.sfe` and
 `results/moe_mlp_run.txt`.
 
+## CPU Flash-Style Attention Validation
+
+SchedForge 0.5 adds structural SDPA fusion and four exact FP32 CPU algorithms:
+Materialized, Tiled Materialized, IO-aware online-softmax prefill, and Split-KV
+decode. Attention is represented by explicit TilePipelineIR operations for QK,
+scale, causal mask, row max/sum reductions, vector exp, online rescaling, PV,
+and final division. QK/PV scheduled LoopIR and LLVM ORC artifacts are embedded
+in each `.sfe` plan.
+
+Representative real executions on the recorded Intel Core i5-14600K:
+
+- causal MHA prefill `B=1, H=8, Sq=Sk=128, D=64`: **0.262 ms P50**
+- causal GQA decode `Hq=8, Hkv=2, Sq=1, Sk=1024, D=64`: **0.112 ms P50**
+- maximum printed validation error for both: **0.000**
+
+The checked-in 12-case measured matrix compares four algorithms at sequence
+lengths 128, 256, and 512. At `B=1, H=8, S=512, D=64`:
+
+- Materialized temporary footprint: **16 MiB**
+- Auto-scheduled IO-aware temporary footprint: **49 KiB**
+- Materialized P50: **18.929 ms**
+- Auto-scheduled IO-aware P50: **2.947 ms**
+
+The 96-case analytical matrix covers heads `8/12`, dimensions `64/128`, and
+sequence lengths `128, 256, 512, 1024, 2048, 4096`. At the largest
+`H=12, S=4096, D=128` point, the materialized intermediate is 1.5 GiB while the
+fixed IO-aware concurrent tile state is 194 KiB. These long-sequence rows are simulator/
+IO-analysis results, not claimed hardware latencies.
+
+A Linux `perf` snapshot over 200 measured `S=512` executions records P-core IPC
+2.561, L1D miss rate 1.066%, and cache-reference miss rate 16.230%. These are
+process-level counters and include runtime/framework overhead. Raw evidence is
+stored in `results/attention_pmu.txt`; plans and runs are in
+`results/attention_prefill.*` and `results/attention_decode.*`.
+
 ## Simulator Boundary
 
 The simulator now consumes explicit LoopIR and traverses the full problem by
@@ -180,5 +215,8 @@ only selection and are preserved in `results/top_resolution_*`.
 - The machine has one NUMA node, so cross-node performance is not validated.
 - MoE quantization, heterogeneous-core placement, NUMA scheduling, block-sparse
   lowering, and distributed expert parallelism are outside this release.
+- Attention is a CPU cache-hierarchy Flash-style lowering, not GPU
+  FlashAttention-2. Paged KV, reduced-precision attention, backward/dropout,
+  distributed attention, and one fused LLVM attention function are outside this release.
 - Full fresh tuning is deliberately expensive because every deduplicated candidate
   is executed on hardware; cached runs are much faster and are labeled as cache hits.

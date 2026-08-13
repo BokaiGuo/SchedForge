@@ -2,6 +2,30 @@
 
 All notable changes to SchedForge are documented here.
 
+## [0.5.0] - 2026-08-13
+
+### Added
+
+- SDPA graph construction and structural `AttentionFusionPass` recognition.
+- Materialized, tiled-materialized, IO-aware online-softmax, and Split-KV
+  decode lowerings for FP32 CPU attention.
+- `TilePipelineIR` for fused QK, scale, causal mask, reductions, online
+  softmax rescaling, PV, and normalization.
+- MHA, GQA, and MQA layouts with dynamic `Sq`/`Sk` guards.
+- Growable contiguous KV cache and parallel Split-KV partial-state merging.
+- Cache-aware attention schedule selection and real-hardware tile tuning.
+- Attention IO/arithmetic-intensity simulator, 12-case measured strategy
+  matrix, 96-case scaling analysis, and Linux PMU snapshot.
+- `schedforge-attention` compiler/runtime CLI and serialized attention `.sfe`
+  plans containing QK/PV LoopIR and LLVM ORC artifacts.
+
+### Changed
+
+- SchedForge now has three executable flagship paths: Dense MLP, sparse MoE,
+  and exact CPU Flash-style attention.
+- The cost-model scope now includes algorithm selection and intermediate
+  materialization cost in addition to GEMM schedule ranking.
+
 ## [0.4.0] - 2026-08-13
 
 ### Added

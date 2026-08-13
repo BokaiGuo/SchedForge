@@ -1,0 +1,33 @@
+[Attention]
+strategy: auto-io-aware
+shape: B=1 Hq=8 Hkv=8 Sq=128 Sk=128 D=64
+
+[Schedule]
+attention.schedule {
+  qtile 32
+  kvtile 32
+  qk_micro 4x8
+  pv_micro 4x8
+  softmax_vector 8
+  pack_k true
+  pack_v false
+  prefetch_k 2
+  prefetch_v 2
+  threads 8
+}
+
+[Memory]
+attention.memory temporary=100352 score=0 probability=0 online_state=100352
+
+[Simulation]
+attention.simulation flops=1.69083e+07 bytes_read=786432 bytes_written=262144 arithmetic_intensity=16.125 temporary=100352 qk_tiles=80 skipped_causal_tiles=48 score_evaluations=66048 exp_evaluations=70144 reduction_operations=132096 l2_traffic=2.62144e+06 llc_traffic=1.04858e+06 l2_hit_rate=0.6 llc_hit_rate=0
+
+[Runtime]
+P50 execution: 0.262 ms
+P95 execution: 0.289 ms
+
+[Validation]
+max error: 0.000
+
+[Hardware]
+x86_64 AVX2 vector=8 registers=16 cpus=20

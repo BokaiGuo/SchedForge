@@ -28,6 +28,8 @@ enum class GraphOpKind {
     Rsqrt,
     Convert,
     Softmax,
+    Mask,
+    AttentionSdpa,
     TopK,
     MoeHistogram,
     MoePrefixSum,

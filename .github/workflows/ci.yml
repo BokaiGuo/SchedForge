@@ -69,3 +69,16 @@ jobs:
           grep -q "!sfg.segmented_tensor" build/moe_mlp.sfe
           grep -q "moe.schedule" build/moe_mlp.sfe
           grep -q "vector.fma" build/moe_mlp.sfe
+
+      - name: Smoke test attention compiler and runtime
+        run: |
+          ./build/schedforge-attention \
+            --batch=1 --q-heads=4 --kv-heads=2 \
+            --sq=16 --sk=16 --head-dim=16 --value-dim=16 \
+            --causal --threads=2 --strategy=io-aware \
+            --qtile=8 --kvtile=8 --repetitions=2 \
+            -o build/attention.sfe
+          grep -q "attention.sdpa" build/attention.sfe
+          grep -q "tile.pipeline @attention" build/attention.sfe
+          grep -q "attention.online_softmax" build/attention.sfe
+          grep -q "llvm.fma" build/attention.sfe
