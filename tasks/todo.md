@@ -10,6 +10,6 @@
 - [x] Run real feasible benchmark and optimizer study
   - Acceptance: checked-in raw CSV/report with claim-safe status fields.
   - Verify: rows marked measured have nonzero latency and zero validation error.
-- [ ] Complete v0.9 release validation
+- [x] Complete v0.9 release validation
   - Acceptance: Release, ASan/UBSan, install, CI, commit, push all pass.
   - Verify: clean git status and green GitHub Actions.
