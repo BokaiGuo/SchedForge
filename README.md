@@ -72,6 +72,12 @@ flowchart TD
 - **Decoder Layer compiler:** one StableHLO graph to one executable plan with
   RMSNorm, compile-time packed QKV/Gate-Up weights, RoPE, GQA/MQA attention,
   residuals, Dense SwiGLU, and optional Top-K MoE execution.
+- **Realistic Decoder suite:** 24 Tiny/Medium/Large Prefill, Decode, and MoE
+  profiles with real-vs-compile-only evidence labels, stage percentages, peak
+  workspace, compile/JIT time, and equivalent tokens/s.
+- **Whole-graph planner:** `ExecutablePlanOptimizer` jointly chooses Attention
+  strategy, layout, materialization, workspace reuse, schedule family, thread
+  count, and placement using budgeted end-to-end hardware measurements.
 - **MoE compiler:** decomposed Router/TopK/Histogram/Prefix/Dispatch/Combine IR,
   segmented tensors, variable-M grouped expert GEMM, SwiGLU, token buckets,
   routing traces, and load-aware expert task scheduling.
@@ -184,6 +190,16 @@ cmake -S . -B build -G Ninja \
   --q-heads=4 --kv-heads=2 --head-dim=4 --experts=4 --top-k=2 \
   --threads=2 -o results/decoder_moe.sfe
 
+# Run the realistic Decoder matrix; expensive rows remain compile-only
+./build/schedforge-decoder-bench --suite=realistic --threads=8 \
+  --repetitions=5 --max-real-gflop=1.2 --max-weight-mib=256 \
+  --output=results/decoder_realistic.csv
+
+# Measure whole-graph plan candidates against the explicit default baseline
+./build/schedforge-decoder-bench --suite=optimizer --threads=8 \
+  --repetitions=9 --max-real-gflop=1.2 --max-weight-mib=256 \
+  --output=results/decoder_plan_optimizer.csv
+
 # Compile and run a dynamically routed Top-2 MoE MLP
 ./build/schedforge-moe --tokens=128 --hidden=512 --intermediate=2048 \
   --experts=8 --top-k=2 --threads=8 --router-data \
@@ -256,6 +272,7 @@ inspectable and verifiable before target lowering.
 | `schedforge-moe` | Compile, simulate, execute, and compare MoE execution plans |
 | `schedforge-attention` | Compile, tune, simulate, and execute attention plans |
 | `schedforge-decoder` | Compile and execute a complete Dense or MoE Decoder Layer |
+| `schedforge-decoder-bench` | Run realistic Decoder and whole-plan studies |
 
 ## Decoder Layer Compiler Demo
 
@@ -272,6 +289,30 @@ The Dense path records **0.025 ms** end-to-end and the MoE path **0.099 ms**, bo
 with **0.000** maximum printed error. These tiny-shape numbers validate one-plan
 execution and are not throughput claims. See `results/decoder_dense_run.txt`,
 `results/decoder_moe_run.txt`, and [the Decoder compiler design](docs/DECODER_COMPILER.md).
+
+## Realistic Decoder and Whole-Graph Planning
+
+SchedForge 0.8/0.9 adds a 24-profile architecture matrix. On the recorded
+Intel Core i5-14600K, **12 profiles executed on real hardware** and **12 were
+retained as compile-only feasibility rows** because they exceeded the configured
+1.2 GFLOP or 256 MiB weight budget. Compile-only rows contain zero runtime
+latency by construction; they are not simulator estimates.
+
+Representative measured results include Tiny Prefill `S=128` at **3.753 ms**
+(**34,110 token/s**), Tiny Decode `KV=512` at **1.443 ms**
+(**693 token/s**), Medium Decode `KV=4096` at **12.817 ms**
+(**78 token/s**), and Tiny 8-expert Top-2 MoE at **8.509 ms** under uniform
+routing. All measured rows validate below `1e-3` error.
+
+The whole-graph study evaluates the explicit default plan plus six
+analytically prioritized alternatives for Tiny Prefill and Decode. Every
+candidate receives equal warmup; an apparent winner is then checked by three
+interleaved baseline/winner measurements. Tiny Prefill retained the default
+plan (**1.000×**), while Tiny Decode `KV=512` selected a one-thread,
+non-materializing Split-KV plan at a confirmed **1.400×** over the default.
+See `results/decoder_realistic.csv`,
+`results/decoder_plan_optimizer.csv`, and
+`results/decoder_plan_optimizer_candidates.csv`.
 
 ## MoE Compiler Demo
 
@@ -375,6 +416,8 @@ scripts/               Hardware-counter helpers
 - The complete Dense/MoE Decoder Layer, Transformer MLP, FP32 Top-2 MoE, exact
   IO-aware prefill attention, and contiguous-KV Split-KV decode paths execute
   and validate end to end.
+- Realistic Large rows are compile-feasibility evidence on this host; no Large
+  runtime latency is claimed when weight or FLOP budgets reject execution.
 - AVX2 is the physically validated SIMD backend. AVX-512 and NEON are target
   abstractions but are not validated code-generation backends in this release.
 - MoE P-core/E-core placement, NUMA-aware execution, quantized experts,

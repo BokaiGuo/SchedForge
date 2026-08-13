@@ -377,7 +377,8 @@ std::vector<float> execute_streaming(const AttentionExecutablePlan& plan,
 }
 
 AttentionBenchmarkResult benchmark(const AttentionExecutablePlan& plan,
-                                   const AttentionData& data, int warmup, int repetitions) {
+                                   const AttentionData& data, int warmup, int repetitions,
+                                   bool validate_result) {
     auto run = [&] {
         if (plan.plan.strategy == AttentionLoweringStrategy::Materialized)
             return execute_materialized(plan.config, data, false, plan.plan.schedule);
@@ -405,7 +406,8 @@ AttentionBenchmarkResult benchmark(const AttentionExecutablePlan& plan,
     result.p50_milliseconds = measured[p50_index].first;
     result.p95_milliseconds = measured[p95_index].first;
     result.output = std::move(measured[p50_index].second);
-    result.max_error = max_abs_error(reference_attention(plan.config, data), result.output);
+    if (validate_result)
+        result.max_error = max_abs_error(reference_attention(plan.config, data), result.output);
     return result;
 }
 
@@ -842,6 +844,8 @@ AttentionExecutablePlan AttentionCompiler::compile(const AttentionConfig& config
         make_data(executable.pv_loop.problem, 79), 0, 1);
     executable.llvm_qk = qk_compilation.llvm_ir;
     executable.llvm_pv = pv_compilation.llvm_ir;
+    executable.llvm_compile_milliseconds = qk_compilation.compile_milliseconds +
+                                           pv_compilation.compile_milliseconds;
     executable.hardware = target_.str();
     executable.guards = {"0 < Sq", "Sq <= " + std::to_string(config.sequence_query),
         "0 < Sk", "Sk <= " + std::to_string(config.sequence_kv),
@@ -874,9 +878,10 @@ void AttentionExecutablePlan::save(const std::filesystem::path& path) const {
 
 AttentionBenchmarkResult execute_attention(const AttentionExecutablePlan& plan,
                                            const AttentionData& data,
-                                           int warmup, int repetitions) {
+                                           int warmup, int repetitions,
+                                           bool validate_result) {
     validate_data(plan.config, data);
-    return benchmark(plan, data, warmup, repetitions);
+    return benchmark(plan, data, warmup, repetitions, validate_result);
 }
 
 AttentionBenchmarkResult execute_attention(const AttentionExecutablePlan& plan,
@@ -904,7 +909,7 @@ AttentionBenchmarkResult execute_attention(const AttentionExecutablePlan& plan,
     if (data.query.size() != expected_query || data.key.size() != expected_key ||
         data.value.size() != expected_value)
         throw std::invalid_argument("runtime attention data shape mismatch");
-    return benchmark(specialized, data, warmup, repetitions);
+    return benchmark(specialized, data, warmup, repetitions, true);
 }
 
 std::string KVCache::dump() const {
@@ -963,7 +968,8 @@ void append_kv(KVCache& cache, const std::vector<float>& keys,
 AttentionBenchmarkResult execute_decode_attention(const AttentionExecutablePlan& plan,
                                                   const std::vector<float>& query,
                                                   const KVCache& cache,
-                                                  int warmup, int repetitions) {
+                                                  int warmup, int repetitions,
+                                                  bool validate_result) {
     if (cache.length <= 0 || cache.length > plan.config.sequence_kv)
         throw std::invalid_argument("KV cache length violates compiled guard");
     AttentionData data;
@@ -997,7 +1003,7 @@ AttentionBenchmarkResult execute_decode_attention(const AttentionExecutablePlan&
         ? std::clamp(std::max(2, cache.length / 128), 2,
                      specialized.plan.schedule.threads)
         : 1;
-    return benchmark(specialized, data, warmup, repetitions);
+    return benchmark(specialized, data, warmup, repetitions, validate_result);
 }
 
 void write_attention_experiment_csv(const std::filesystem::path& path,

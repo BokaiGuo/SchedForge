@@ -1,0 +1,4 @@
+[Profile] tiny-prefill-s128 ... measured 3.416 ms, 37472.042 token/s, error 0.000 optimizer=1.000x/7 measurements
+[Profile] tiny-decode-kv512 ... measured 1.075 ms, 930.190 token/s, error 0.000 optimizer=1.400x/13 measurements
+[Candidates] output=results/decoder_plan_optimizer_candidates.csv
+[Summary] profiles=2 measured=2 compile-only=0 output=results/decoder_plan_optimizer.csv

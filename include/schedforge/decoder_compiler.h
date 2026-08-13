@@ -28,6 +28,7 @@ struct DecoderConfig {
     DecoderFFNKind ffn = DecoderFFNKind::Dense;
     int experts = 4;
     int top_k = 2;
+    int context_sequence = 0;
 };
 
 struct DecoderData {
@@ -42,6 +43,25 @@ struct DecoderData {
     std::vector<float> up_weight;
     std::vector<float> down_weight;
     MoeData moe;
+    std::vector<float> cached_key;
+    std::vector<float> cached_value;
+    std::optional<RoutingTrace> routing_trace;
+};
+
+enum class DecoderIntermediateLayout { HeadMajor, TokenMajor };
+enum class DecoderScheduleFamily { Latency, Throughput };
+enum class DecoderCorePlacement { Compact, Spread };
+
+struct DecoderPlanPolicy {
+    DecoderIntermediateLayout attention_layout = DecoderIntermediateLayout::HeadMajor;
+    DecoderScheduleFamily schedule_family = DecoderScheduleFamily::Latency;
+    DecoderCorePlacement core_placement = DecoderCorePlacement::Compact;
+    bool materialize_attention_output = true;
+    bool reuse_workspace = true;
+    int threads = 0;
+    AttentionLoweringStrategy attention_strategy = AttentionLoweringStrategy::IOAware;
+    std::string dump() const;
+    bool operator==(const DecoderPlanPolicy&) const = default;
 };
 
 struct DecoderConstant {
@@ -87,6 +107,10 @@ struct DecoderExecutablePlan {
     AttentionExecutablePlan attention;
     std::optional<MoeExecutablePlan> moe;
     std::vector<std::string> llvm_ir;
+    DecoderPlanPolicy policy;
+    double compile_milliseconds = 0.0;
+    double llvm_compile_milliseconds = 0.0;
+    double memory_planning_milliseconds = 0.0;
     std::string hardware;
     std::string dump() const;
     void save(const std::filesystem::path& path) const;
@@ -95,7 +119,12 @@ struct DecoderExecutablePlan {
 struct DecoderBenchmarkResult {
     double milliseconds = 0.0;
     double attention_milliseconds = 0.0;
+    double projection_milliseconds = 0.0;
+    double norm_rope_milliseconds = 0.0;
     double ffn_milliseconds = 0.0;
+    double residual_milliseconds = 0.0;
+    double dispatch_overhead_milliseconds = 0.0;
+    double tokens_per_second = 0.0;
     double max_error = 0.0;
     std::vector<float> output;
 };
@@ -103,6 +132,74 @@ struct DecoderBenchmarkResult {
 struct DecoderCompileOptions {
     int max_threads = 8;
     bool tune_attention = false;
+    bool emit_llvm = true;
+    bool specialize_constants = true;
+    std::optional<DecoderPlanPolicy> policy;
+};
+
+struct DecoderPlanCost {
+    double measured_milliseconds = 0.0;
+    double analytical_score = 0.0;
+    std::size_t workspace_bytes = 0;
+    std::size_t materialization_bytes = 0;
+    bool measured = false;
+    std::string dump() const;
+};
+
+struct DecoderPlanCandidate {
+    DecoderPlanPolicy policy;
+    DecoderPlanCost cost;
+};
+
+struct DecoderOptimizationResult {
+    DecoderExecutablePlan plan;
+    DecoderPlanCost baseline;
+    DecoderPlanCost winner;
+    std::vector<DecoderPlanCandidate> candidates;
+    std::size_t hardware_measurements = 0;
+    double speedup = 1.0;
+    std::string dump() const;
+};
+
+class ExecutablePlanOptimizer {
+public:
+    explicit ExecutablePlanOptimizer(TargetInfo target = TargetInfo::detect());
+    DecoderPlanCost evaluate(const DecoderExecutablePlan& plan) const;
+    DecoderOptimizationResult optimize(const TensorGraph& graph,
+                                       const DecoderConfig& config,
+                                       const DecoderData& data,
+                                       int max_threads,
+                                       int measurement_budget = 8,
+                                       int repetitions = 2) const;
+private:
+    TargetInfo target_;
+};
+
+enum class DecoderEvidenceKind { Measured, CompileOnly, Skipped };
+
+struct DecoderBenchmarkProfile {
+    std::string name;
+    DecoderConfig config;
+    RoutingDistribution routing = RoutingDistribution::Uniform;
+    std::uint64_t estimated_flops = 0;
+    std::size_t estimated_weight_bytes = 0;
+    std::size_t estimated_activation_bytes = 0;
+};
+
+struct DecoderBenchmarkRecord {
+    DecoderBenchmarkProfile profile;
+    DecoderEvidenceKind evidence = DecoderEvidenceKind::Skipped;
+    DecoderBenchmarkResult measured;
+    DecoderPlanCost plan_cost;
+    double compile_milliseconds = 0.0;
+    double llvm_compile_milliseconds = 0.0;
+    double memory_planning_milliseconds = 0.0;
+    double optimizer_speedup = 1.0;
+    double optimizer_baseline_milliseconds = 0.0;
+    std::size_t hardware_measurements = 0;
+    std::string selected_policy;
+    std::vector<DecoderPlanCandidate> optimizer_candidates;
+    std::string note;
 };
 
 class DecoderCompiler {
@@ -125,5 +222,19 @@ DecoderBenchmarkResult execute_decoder_layer(const DecoderExecutablePlan& plan,
                                              int warmup = 1,
                                              int repetitions = 5);
 std::string decoder_ffn_name(DecoderFFNKind kind);
+std::string decoder_evidence_name(DecoderEvidenceKind kind);
+std::vector<DecoderBenchmarkProfile> realistic_decoder_profiles();
+DecoderBenchmarkRecord benchmark_decoder_profile(const DecoderBenchmarkProfile& profile,
+                                                  const TensorGraph& graph,
+                                                  int max_threads,
+                                                  std::uint64_t max_real_flops,
+                                                  std::size_t max_real_weight_bytes,
+                                                  bool optimize_plan,
+                                                  int repetitions = 2);
+void write_decoder_benchmark_csv(const std::filesystem::path& path,
+                                 const std::vector<DecoderBenchmarkRecord>& records);
+void write_decoder_plan_candidates_csv(
+    const std::filesystem::path& path,
+    const std::vector<DecoderBenchmarkRecord>& records);
 
 }  // namespace schedforge

@@ -85,6 +85,12 @@ flowchart LR
 - **Decoder Layer Compiler**：一个 StableHLO Graph 编译成一个可执行计划，覆盖
   RMSNorm、编译期 QKV/Gate-Up 权重打包、RoPE、GQA/MQA Attention、残差、
   Dense SwiGLU 与可选 Top-K MoE。
+- **真实规模 Decoder Suite**：覆盖 24 个 Tiny/Medium/Large Prefill、Decode 与
+  MoE Profile，明确区分真机实测和 compile-only，并报告阶段占比、Peak Workspace、
+  Compile/JIT 时间和等效 token/s。
+- **Whole-Graph Planner**：`ExecutablePlanOptimizer` 联合选择 Attention 策略、
+  Layout、Materialization、Workspace 复用、Schedule Family、线程数与放置策略，
+  最终依据预算内的端到端真机测量选择计划。
 - **MoE Compiler**：显式 Router/TopK/Histogram/Prefix/Dispatch/Combine IR、
   Segmented Tensor、Variable-M Grouped Expert GEMM、SwiGLU、Token Bucket、
   Routing Trace 与 Load-aware Expert Task Scheduler。
@@ -190,6 +196,16 @@ cmake -S . -B build -G Ninja \
   --q-heads=4 --kv-heads=2 --head-dim=4 --experts=4 --top-k=2 \
   --threads=2 -o results/decoder_moe.sfe
 
+# 运行真实规模 Decoder 矩阵；过重档位明确保留为 compile-only
+./build/schedforge-decoder-bench --suite=realistic --threads=8 \
+  --repetitions=5 --max-real-gflop=1.2 --max-weight-mib=256 \
+  --output=results/decoder_realistic.csv
+
+# 将全图候选与显式默认计划进行端到端真机对比
+./build/schedforge-decoder-bench --suite=optimizer --threads=8 \
+  --repetitions=9 --max-real-gflop=1.2 --max-weight-mib=256 \
+  --output=results/decoder_plan_optimizer.csv
+
 # 编译并真实运行动态路由 Top-2 MoE MLP
 ./build/schedforge-moe --tokens=128 --hidden=512 --intermediate=2048 \
   --experts=8 --top-k=2 --threads=8 --router-data \
@@ -256,6 +272,7 @@ vector=8;unroll=4;threads=8;pack=ab;prefetch=4;fuse=true;pin=true
 | `schedforge-moe` | 编译、模拟、执行并对比 MoE Execution Plan |
 | `schedforge-attention` | 编译、调优、模拟并执行 Attention Plan |
 | `schedforge-decoder` | 编译并执行完整 Dense 或 MoE Decoder Layer |
+| `schedforge-decoder-bench` | 运行真实规模 Decoder 与全图计划实验 |
 
 ## Decoder Layer Compiler 实测 Demo
 
@@ -271,6 +288,26 @@ Dense 端到端记录为 **0.025 ms**，MoE 为 **0.099 ms**，最大打印误�
 **0.000**。这些小尺寸结果用于验证单 Plan 真实执行，不是吞吐性能声明。详见
 `results/decoder_dense_run.txt`、`results/decoder_moe_run.txt` 与
 [Decoder Compiler 设计](docs/DECODER_COMPILER.md)。
+
+## 真实规模 Decoder 与 Whole-Graph Planning
+
+SchedForge 0.8/0.9 增加了 24 个架构 Profile。在当前 Intel Core i5-14600K
+上，**12 个 Profile 完成真实硬件执行**，另有 **12 个 Profile 因超过配置的
+1.2 GFLOP 或 256 MiB 权重预算而明确标记为 compile-only**。compile-only 行的
+Runtime Latency 固定为 0，不是 Simulator 估算。
+
+代表性实测包括 Tiny Prefill `S=128` **3.753 ms**（**34,110 token/s**）、
+Tiny Decode `KV=512` **1.443 ms**（**693 token/s**），Medium Decode
+`KV=4096` **12.817 ms**（**78 token/s**），以及 Tiny 8-Expert Top-2 MoE
+Uniform Routing **8.509 ms**。所有实测行的验证误差均低于 `1e-3`。
+
+Whole-Graph 实验会测量显式默认计划，以及分析模型优先选出的 6 个候选。所有
+候选使用相同预热；若出现候选胜者，再执行 3 轮 Baseline/Winner 交错复测。
+Tiny Prefill 仍由默认计划获胜（**1.000×**）；Tiny Decode `KV=512` 则选择
+单线程、非物化的 Split-KV 计划，交错复测后相对默认计划为 **1.400×**。
+完整证据见
+`results/decoder_realistic.csv`、`results/decoder_plan_optimizer.csv` 与
+`results/decoder_plan_optimizer_candidates.csv`。
 
 ## MoE Compiler 实测 Demo
 
@@ -366,6 +403,8 @@ scripts/              性能计数器辅助脚本
   或生产级推理 Runtime 的替代品。
 - 完整 Dense/MoE Decoder Layer、Transformer MLP、FP32 Top-2 MoE、精确
   IO-aware Prefill Attention 与连续 KV Cache Split-KV Decode 已端到端执行并验证。
+- Large Profile 在当前主机上属于 compile-feasibility 证据；被权重或 FLOP 预算
+  拒绝的档位不声明真实 Runtime Latency。
 - 当前只在真实硬件上验证了 AVX2 后端。AVX-512 和 NEON 目前只有目标抽象，
   不能视为已经完成并验证的机器码后端。
 - MoE 的 P-core/E-core 放置、NUMA-aware 执行、量化 Expert、Block-sparse

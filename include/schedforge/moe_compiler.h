@@ -132,6 +132,7 @@ struct MoeExecutablePlan {
     std::string target;
     std::string hardware;
     std::vector<std::string> guards;
+    double llvm_compile_milliseconds = 0.0;
     std::string dump() const;
     void save(const std::filesystem::path& path) const;
 };
@@ -166,9 +167,13 @@ TensorGraph build_moe_mlp_graph(const MoeConfig& config, bool dynamic_tokens = t
 MoeProgram lower_moe_program(const MoeConfig& config);
 MoeData make_moe_data(const MoeConfig& config, std::uint32_t seed = 7);
 RoutingTrace route_topk(const MoeConfig& config, const MoeData& data);
+RoutingTrace route_topk(const MoeConfig& config, const MoeData& data,
+                        const std::vector<float>& input);
 RoutingTrace make_routing_trace(const MoeConfig& config, RoutingDistribution distribution,
                                 std::uint32_t seed = 7);
 SegmentedTensor dispatch_tokens(const MoeConfig& config, const MoeData& data,
+                                const RoutingTrace& routing);
+SegmentedTensor dispatch_tokens(const MoeConfig& config, const std::vector<float>& input,
                                 const RoutingTrace& routing);
 std::vector<MoeTask> plan_moe_tasks(const RoutingTrace& routing,
                                     const MoeExecutionSchedule& schedule);
@@ -180,11 +185,22 @@ MoeExecutionSchedule select_moe_schedule(const MoeConfig& config,
                                          int max_threads);
 std::vector<float> reference_moe(const MoeConfig& config, const MoeData& data,
                                  const RoutingTrace& routing);
+std::vector<float> reference_moe(const MoeConfig& config, const MoeData& data,
+                                 const std::vector<float>& input,
+                                 const RoutingTrace& routing);
 MoeBenchmarkResult execute_moe(const MoeExecutablePlan& plan, const MoeData& data,
                                const RoutingTrace& routing, int warmup = 1,
-                               int repetitions = 5);
+                               int repetitions = 5, bool validate_result = true);
 MoeBenchmarkResult execute_moe(const MoeExecutablePlan& plan, const MoeData& data,
-                               int warmup = 1, int repetitions = 5);
+                               const std::vector<float>& input,
+                               const RoutingTrace& routing, int warmup = 1,
+                               int repetitions = 5, bool validate_result = true);
+MoeBenchmarkResult execute_moe(const MoeExecutablePlan& plan, const MoeData& data,
+                               int warmup = 1, int repetitions = 5,
+                               bool validate_result = true);
+MoeBenchmarkResult execute_moe(const MoeExecutablePlan& plan, const MoeData& data,
+                               const std::vector<float>& input, int warmup = 1,
+                               int repetitions = 5, bool validate_result = true);
 
 class MoeCompiler {
 public:

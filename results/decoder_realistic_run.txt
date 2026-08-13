@@ -1,0 +1,25 @@
+[Profile] tiny-prefill-s128 ... measured 3.753 ms, 34110.493 token/s, error 0.000
+[Profile] tiny-prefill-s512 ... compile-only weight=11075584 flops=3372220416
+[Profile] tiny-prefill-s2048 ... compile-only weight=11075584 flops=19931332608
+[Profile] tiny-decode-kv128 ... measured 1.238 ms, 807.691 token/s, error 0.000
+[Profile] tiny-decode-kv512 ... measured 1.443 ms, 692.980 token/s, error 0.000
+[Profile] tiny-decode-kv2048 ... measured 1.833 ms, 545.597 token/s, error 0.000
+[Profile] tiny-decode-kv4096 ... measured 2.404 ms, 415.918 token/s, error 0.000
+[Profile] medium-prefill-s128 ... compile-only weight=45088768 flops=2952790016
+[Profile] medium-prefill-s512 ... compile-only weight=45088768 flops=12616466432
+[Profile] medium-prefill-s2048 ... compile-only weight=45088768 flops=63350767616
+[Profile] medium-decode-kv128 ... measured 9.008 ms, 111.007 token/s, error 0.000
+[Profile] medium-decode-kv512 ... measured 11.718 ms, 85.342 token/s, error 0.000
+[Profile] medium-decode-kv2048 ... measured 10.055 ms, 99.456 token/s, error 0.000
+[Profile] medium-decode-kv4096 ... measured 12.817 ms, 78.024 token/s, error 0.000
+[Profile] large-prefill-s128 ... compile-only weight=708837376 flops=45634027520
+[Profile] large-prefill-s512 ... compile-only weight=708837376 flops=185757335552
+[Profile] large-prefill-s2048 ... compile-only weight=708837376 flops=794568949760
+[Profile] large-decode-kv128 ... compile-only weight=708837376 flops=356515840
+[Profile] large-decode-kv512 ... compile-only weight=708837376 flops=362807296
+[Profile] large-decode-kv2048 ... compile-only weight=708837376 flops=387973120
+[Profile] large-decode-kv4096 ... compile-only weight=708837376 flops=421527552
+[Profile] tiny-moe-uniform ... measured 8.509 ms, 3760.665 token/s, error 0.000
+[Profile] tiny-moe-moderate-skew ... measured 9.143 ms, 3500.083 token/s, error 0.000
+[Profile] tiny-moe-heavy-skew ... measured 13.445 ms, 2380.074 token/s, error 0.000
+[Summary] profiles=24 measured=12 compile-only=12 output=results/decoder_realistic.csv

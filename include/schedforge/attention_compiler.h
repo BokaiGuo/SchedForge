@@ -111,6 +111,7 @@ struct AttentionExecutablePlan {
     LoopIR pv_loop;
     std::string llvm_qk;
     std::string llvm_pv;
+    double llvm_compile_milliseconds = 0.0;
     std::string hardware;
     std::vector<std::string> guards;
     std::string dump() const;
@@ -169,7 +170,8 @@ std::vector<float> reference_attention(const AttentionConfig& config,
                                        const AttentionData& data);
 AttentionBenchmarkResult execute_attention(const AttentionExecutablePlan& plan,
                                            const AttentionData& data,
-                                           int warmup = 1, int repetitions = 5);
+                                           int warmup = 1, int repetitions = 5,
+                                           bool validate_result = true);
 AttentionBenchmarkResult execute_attention(const AttentionExecutablePlan& plan,
                                            const AttentionData& data,
                                            int runtime_sequence_query,
@@ -181,7 +183,8 @@ void append_kv(KVCache& cache, const std::vector<float>& keys,
 AttentionBenchmarkResult execute_decode_attention(const AttentionExecutablePlan& plan,
                                                   const std::vector<float>& query,
                                                   const KVCache& cache,
-                                                  int warmup = 1, int repetitions = 5);
+                                                  int warmup = 1, int repetitions = 5,
+                                                  bool validate_result = true);
 std::string attention_strategy_name(AttentionLoweringStrategy strategy);
 void write_attention_experiment_csv(const std::filesystem::path& path,
                                     const AttentionConfig& base,

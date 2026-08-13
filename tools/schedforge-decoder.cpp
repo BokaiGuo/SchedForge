@@ -66,12 +66,20 @@ int main(int argc, char** argv) {
         for (const auto& constant : plan.constants) std::cout << constant.dump() << '\n';
         std::cout << "\n[Memory]\nnaive: " << plan.memory.naive_bytes
                   << " bytes\nworkspace: " << plan.memory.workspace_bytes
-                  << " bytes\n\n[Runtime]\nFFN: "
+                  << " bytes\nmemory planning: " << plan.memory_planning_milliseconds
+                  << " ms\n\n[Plan Policy]\n" << plan.policy.dump()
+                  << "\n\n[Runtime]\nFFN: "
                   << schedforge::decoder_ffn_name(options.config.ffn)
                   << "\nexecution: " << std::fixed << std::setprecision(3)
                   << measured.milliseconds << " ms\nattention: "
-                  << measured.attention_milliseconds << " ms\nffn: "
-                  << measured.ffn_milliseconds << " ms\n\n[Validation]\nmax error: "
+                  << measured.attention_milliseconds << " ms\nprojections: "
+                  << measured.projection_milliseconds << " ms\nnorm+rope: "
+                  << measured.norm_rope_milliseconds << " ms\nffn: "
+                  << measured.ffn_milliseconds << " ms\ndispatch overhead: "
+                  << measured.dispatch_overhead_milliseconds << " ms\ntokens/s: "
+                  << measured.tokens_per_second << "\ncompile: " << plan.compile_milliseconds
+                  << " ms\nLLVM JIT: " << plan.llvm_compile_milliseconds
+                  << " ms\n\n[Validation]\nmax error: "
                   << measured.max_error << "\n\n[Hardware]\n" << plan.hardware << '\n';
         return measured.max_error <= 1.0e-3 ? 0 : 1;
     } catch (const std::exception& error) {

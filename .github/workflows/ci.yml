@@ -99,3 +99,18 @@ jobs:
             --experts=4 --top-k=2 --threads=2 --repetitions=1 \
             -o build/decoder_moe.sfe
           grep -q "moe.combine" build/decoder_moe.sfe
+
+      - name: Smoke test realistic decoder benchmark and planner
+        run: |
+          ./build/schedforge-decoder-bench --suite=realistic \
+            --filter=tiny-decode-kv128 --threads=2 --repetitions=1 \
+            --max-real-gflop=0.01 --max-weight-mib=32 \
+            --output=build/decoder_realistic.csv
+          grep -q "tokens_per_second" build/decoder_realistic.csv
+          grep -q "measured" build/decoder_realistic.csv
+          ./build/schedforge-decoder-bench --suite=optimizer \
+            --filter=tiny-decode-kv512 --threads=2 --repetitions=1 \
+            --max-real-gflop=0.01 --max-weight-mib=32 \
+            --output=build/decoder_optimizer.csv
+          grep -q "optimizer_baseline_ms" build/decoder_optimizer.csv
+          grep -q "analytical_score" build/decoder_optimizer_candidates.csv

@@ -1,0 +1,15 @@
+- [x] Add typed Decoder plan policy and stage metrics
+  - Acceptance: plan serializes layout, materialization, schedule, placement.
+  - Verify: unit test plan dump and metric accounting.
+- [x] Implement ExecutablePlanOptimizer
+  - Acceptance: enumerates candidates and selects by end-to-end measured latency.
+  - Verify: small-shape optimizer test beats or matches baseline.
+- [x] Implement realistic Decoder benchmark CLI
+  - Acceptance: Tiny/Medium/Large and prefill/decode rows with evidence labels.
+  - Verify: CSV schema test and CLI smoke.
+- [x] Run real feasible benchmark and optimizer study
+  - Acceptance: checked-in raw CSV/report with claim-safe status fields.
+  - Verify: rows marked measured have nonzero latency and zero validation error.
+- [ ] Complete v0.9 release validation
+  - Acceptance: Release, ASan/UBSan, install, CI, commit, push all pass.
+  - Verify: clean git status and green GitHub Actions.

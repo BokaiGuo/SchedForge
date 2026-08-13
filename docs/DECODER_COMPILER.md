@@ -1,6 +1,6 @@
 # Decoder Layer Compiler
 
-SchedForge 0.7 promotes the complete Transformer Decoder Layer to the primary
+SchedForge 0.9 promotes the complete Transformer Decoder Layer to the primary
 model-to-machine compilation unit. The public contract is deliberately larger
 than an operator benchmark: one StableHLO module is imported into one Tensor SSA
 graph, compiled into one `DecoderExecutablePlan`, and executed through one
@@ -66,6 +66,49 @@ merge, SwiGLU, and residual semantics in one call.
 scalar reference projections plus reference Attention/MoE. End-to-end tests
 compare the complete output rather than testing kernels in isolation.
 
+The MoE call boundary passes the second normalized activation separately from
+the immutable expert parameter object. This preserves explicit ownership while
+avoiding a 67-132 MiB expert-weight copy on every Decoder invocation in the
+realistic 8/16-expert profiles.
+
+## Whole-Graph Executable Planning
+
+`ExecutablePlanOptimizer` searches typed cross-dispatch policies rather than
+concatenating independently optimal kernels. A policy jointly controls:
+
+- Attention lowering strategy and intermediate layout;
+- Attention-output materialization;
+- latency- or throughput-oriented schedules;
+- workspace reuse;
+- thread count and compact/spread placement.
+
+Candidates are ranked analytically, but the winner is selected only by real
+end-to-end Decoder latency. All measured candidates receive equal warmup. If a
+candidate initially beats the explicit default plan, the optimizer performs
+three interleaved baseline/winner confirmations and compares their medians.
+Simulator output never selects the measured winner.
+
+The checked-in Tiny study retains the default Prefill plan at `S=128` and
+selects a one-thread, non-materializing Split-KV Decode plan at `KV=512`, with a
+confirmed 1.400x speedup over the default plan on the recorded host.
+
+## Realistic Benchmark Matrix
+
+`schedforge-decoder-bench` covers 24 architecture profiles:
+
+- Tiny `H=512, I=1376, D=64`;
+- Medium `H=1024, I=2816, D=64`;
+- Large `H=4096, I=11008, D=128`;
+- Prefill `S=128/512/2048`;
+- Decode `Sq=1`, `Sk=128/512/2048/4096`;
+- Top-2 MoE with 8/16 experts and uniform/moderate/heavy routing skew.
+
+Every row records an evidence class. `measured` rows contain real end-to-end and
+stage latency, tokens/s, validation error, workspace, compile time, LLVM JIT
+time, and memory-planning time. `compile-only` rows contain zero runtime latency
+and retain only feasibility evidence because they exceeded the configured FLOP
+or weight-memory budget.
+
 ## Command Line
 
 ```bash
@@ -79,6 +122,14 @@ compare the complete output rather than testing kernels in isolation.
   --q-heads=4 --kv-heads=2 --head-dim=4 \
   --experts=4 --top-k=2 --threads=2 \
   -o results/decoder_moe.sfe
+
+./build/schedforge-decoder-bench --suite=realistic --threads=8 \
+  --repetitions=7 --max-real-gflop=1.2 --max-weight-mib=256 \
+  --output=results/decoder_realistic.csv
+
+./build/schedforge-decoder-bench --suite=optimizer --threads=8 \
+  --repetitions=11 --filter=tiny --optimize \
+  --output=results/decoder_plan_optimizer.csv
 ```
 
 The CLI prints imported operation count, fusion decisions, specialized
@@ -88,11 +139,13 @@ fusion decisions remain inspectable.
 
 ## Current Boundaries
 
-- Execution is FP32; BF16/INT8 Decoder kernels are not claimed in v0.7.
+- Execution is FP32; BF16/INT8 Decoder kernels are not claimed in v0.9.
 - RoPE and RMSNorm semantics execute correctly but are not yet one monolithic
   LLVM function with adjacent projections.
 - Attention is exact CPU Flash-style online softmax, not GPU FlashAttention-2.
 - The MoE branch is single-host and does not implement distributed expert
   parallelism, NUMA placement, or P-core/E-core specialization.
-- Decoder measurements in the repository are tiny-shape integration results,
-  not production-model throughput or latency claims.
+- Large profiles and expensive Prefill rows are compile-only under the checked-in
+  resource budget; they are not production-model latency claims.
+- JIT time is process-local: repeated shapes may report zero LLVM compile time
+  after a cache hit.

@@ -155,12 +155,13 @@ void compute_task(const MoeExecutablePlan& plan, const MoeData& data,
 }
 
 MoeBenchmarkResult execute_once(const MoeExecutablePlan& plan, const MoeData& data,
+                                const std::vector<float>& input,
                                 const RoutingTrace& routing) {
     const auto total_begin = std::chrono::steady_clock::now();
     const auto router_begin = total_begin;
     const auto router_end = std::chrono::steady_clock::now();
     const auto dispatch_begin = router_end;
-    const auto dispatched = dispatch_tokens(plan.config, data, routing);
+    const auto dispatched = dispatch_tokens(plan.config, input, routing);
     const auto dispatch_end = std::chrono::steady_clock::now();
     const auto tasks = plan_moe_tasks(routing, plan.schedule);
     const std::size_t assignments = static_cast<std::size_t>(routing.tokens) * routing.top_k;
@@ -405,10 +406,15 @@ MoeData make_moe_data(const MoeConfig& config, std::uint32_t seed) {
 }
 
 RoutingTrace route_topk(const MoeConfig& config, const MoeData& data) {
+    return route_topk(config, data, data.input);
+}
+
+RoutingTrace route_topk(const MoeConfig& config, const MoeData& data,
+                        const std::vector<float>& input) {
     validate_config(config);
-    if (data.input.size() % static_cast<std::size_t>(config.hidden) != 0)
+    if (input.size() % static_cast<std::size_t>(config.hidden) != 0)
         throw std::invalid_argument("MoE input does not match hidden dimension");
-    const int tokens = static_cast<int>(data.input.size() / static_cast<std::size_t>(config.hidden));
+    const int tokens = static_cast<int>(input.size() / static_cast<std::size_t>(config.hidden));
     RoutingTrace routing;
     routing.tokens = tokens;
     routing.experts = config.experts;
@@ -424,7 +430,7 @@ RoutingTrace route_topk(const MoeConfig& config, const MoeData& data) {
         for (int expert = 0; expert < config.experts; ++expert) {
             float value = 0.0F;
             for (int feature = 0; feature < config.hidden; ++feature)
-                value += data.input[static_cast<std::size_t>(token) * config.hidden + feature] *
+                value += input[static_cast<std::size_t>(token) * config.hidden + feature] *
                          data.router_weight[static_cast<std::size_t>(feature) * config.experts + expert];
             logits[static_cast<std::size_t>(expert)] = value;
             maximum = std::max(maximum, value);
@@ -484,8 +490,15 @@ RoutingTrace make_routing_trace(const MoeConfig& config, RoutingDistribution dis
 
 SegmentedTensor dispatch_tokens(const MoeConfig& config, const MoeData& data,
                                 const RoutingTrace& routing) {
+    return dispatch_tokens(config, data.input, routing);
+}
+
+SegmentedTensor dispatch_tokens(const MoeConfig& config, const std::vector<float>& input,
+                                const RoutingTrace& routing) {
     if (routing.experts != config.experts || routing.top_k != config.top_k)
         throw std::invalid_argument("routing trace does not match MoE configuration");
+    if (input.size() < static_cast<std::size_t>(routing.tokens) * config.hidden)
+        throw std::invalid_argument("MoE input is smaller than routing trace");
     SegmentedTensor result;
     result.type = {config.experts, config.hidden, DataType::F32};
     result.offsets.resize(static_cast<std::size_t>(config.experts + 1), 0);
@@ -503,7 +516,7 @@ SegmentedTensor dispatch_tokens(const MoeConfig& config, const MoeData& data,
             const std::size_t route_index = static_cast<std::size_t>(token) * routing.top_k + slot;
             const int expert = routing.expert_ids[route_index];
             const int destination = cursor[static_cast<std::size_t>(expert)]++;
-            std::copy_n(data.input.begin() + static_cast<std::ptrdiff_t>(token) * config.hidden,
+            std::copy_n(input.begin() + static_cast<std::ptrdiff_t>(token) * config.hidden,
                         config.hidden,
                         result.values.begin() + static_cast<std::ptrdiff_t>(destination) * config.hidden);
             result.token_ids[static_cast<std::size_t>(destination)] = token;
@@ -626,6 +639,12 @@ std::string MoeSimulationResult::dump() const {
 
 std::vector<float> reference_moe(const MoeConfig& config, const MoeData& data,
                                  const RoutingTrace& routing) {
+    return reference_moe(config, data, data.input, routing);
+}
+
+std::vector<float> reference_moe(const MoeConfig& config, const MoeData& data,
+                                 const std::vector<float>& input,
+                                 const RoutingTrace& routing) {
     std::vector<float> output(static_cast<std::size_t>(routing.tokens) * config.hidden, 0.0F);
     std::vector<float> gate(static_cast<std::size_t>(config.intermediate));
     std::vector<float> up(static_cast<std::size_t>(config.intermediate));
@@ -638,11 +657,11 @@ std::vector<float> reference_moe(const MoeConfig& config, const MoeData& data,
                 float first = 0.0F;
                 float third = 0.0F;
                 for (int feature = 0; feature < config.hidden; ++feature) {
-                    const float input = data.input[static_cast<std::size_t>(token) * config.hidden + feature];
+                    const float input_value = input[static_cast<std::size_t>(token) * config.hidden + feature];
                     const std::size_t weight_index =
                         (static_cast<std::size_t>(expert) * config.hidden + feature) * config.intermediate + intermediate;
-                    first += input * data.w1[weight_index];
-                    third += input * data.w3[weight_index];
+                    first += input_value * data.w1[weight_index];
+                    third += input_value * data.w3[weight_index];
                 }
                 gate[static_cast<std::size_t>(intermediate)] = first;
                 up[static_cast<std::size_t>(intermediate)] = silu(third);
@@ -663,16 +682,25 @@ std::vector<float> reference_moe(const MoeConfig& config, const MoeData& data,
 }
 
 MoeBenchmarkResult execute_moe(const MoeExecutablePlan& plan, const MoeData& data,
-                               const RoutingTrace& routing, int warmup, int repetitions) {
+                               const RoutingTrace& routing, int warmup, int repetitions,
+                               bool validate_result) {
+    return execute_moe(plan, data, data.input, routing, warmup, repetitions,
+                       validate_result);
+}
+
+MoeBenchmarkResult execute_moe(const MoeExecutablePlan& plan, const MoeData& data,
+                               const std::vector<float>& input,
+                               const RoutingTrace& routing, int warmup, int repetitions,
+                               bool validate_result) {
     if (plan.kernels.empty()) throw std::invalid_argument("MoE plan has no expert kernels");
     if (routing.tokens > plan.config.tokens)
         throw std::invalid_argument("runtime token count exceeds compiled MoE guard");
     for (int iteration = 0; iteration < std::max(0, warmup); ++iteration)
-        (void)execute_once(plan, data, routing);
+        (void)execute_once(plan, data, input, routing);
     std::vector<MoeBenchmarkResult> measured;
     measured.reserve(static_cast<std::size_t>(std::max(1, repetitions)));
     for (int iteration = 0; iteration < std::max(1, repetitions); ++iteration)
-        measured.push_back(execute_once(plan, data, routing));
+        measured.push_back(execute_once(plan, data, input, routing));
     std::sort(measured.begin(), measured.end(), [](const auto& lhs, const auto& rhs) {
         return lhs.milliseconds < rhs.milliseconds;
     });
@@ -683,22 +711,30 @@ MoeBenchmarkResult execute_moe(const MoeExecutablePlan& plan, const MoeData& dat
     auto result = std::move(measured[p50_index]);
     result.p50_milliseconds = result.milliseconds;
     result.p95_milliseconds = p95;
-    result.max_error = max_abs_error(reference_moe(plan.config, data, routing), result.output);
+    if (validate_result)
+        result.max_error = max_abs_error(
+            reference_moe(plan.config, data, input, routing), result.output);
     return result;
 }
 
 MoeBenchmarkResult execute_moe(const MoeExecutablePlan& plan, const MoeData& data,
-                               int warmup, int repetitions) {
+                               int warmup, int repetitions, bool validate_result) {
+    return execute_moe(plan, data, data.input, warmup, repetitions, validate_result);
+}
+
+MoeBenchmarkResult execute_moe(const MoeExecutablePlan& plan, const MoeData& data,
+                               const std::vector<float>& input, int warmup,
+                               int repetitions, bool validate_result) {
     for (int iteration = 0; iteration < std::max(0, warmup); ++iteration) {
-        const auto routing = route_topk(plan.config, data);
-        (void)execute_once(plan, data, routing);
+        const auto routing = route_topk(plan.config, data, input);
+        (void)execute_once(plan, data, input, routing);
     }
     std::vector<MoeBenchmarkResult> measured;
     for (int iteration = 0; iteration < std::max(1, repetitions); ++iteration) {
         const auto router_begin = std::chrono::steady_clock::now();
-        const auto routing = route_topk(plan.config, data);
+        const auto routing = route_topk(plan.config, data, input);
         const auto router_end = std::chrono::steady_clock::now();
-        auto result = execute_once(plan, data, routing);
+        auto result = execute_once(plan, data, input, routing);
         result.router_milliseconds =
             std::chrono::duration<double, std::milli>(router_end - router_begin).count();
         result.milliseconds += result.router_milliseconds;
@@ -714,8 +750,10 @@ MoeBenchmarkResult execute_moe(const MoeExecutablePlan& plan, const MoeData& dat
     auto result = std::move(measured[p50_index]);
     result.p50_milliseconds = result.milliseconds;
     result.p95_milliseconds = p95;
-    const auto routing = route_topk(plan.config, data);
-    result.max_error = max_abs_error(reference_moe(plan.config, data, routing), result.output);
+    const auto routing = route_topk(plan.config, data, input);
+    if (validate_result)
+        result.max_error = max_abs_error(
+            reference_moe(plan.config, data, input, routing), result.output);
     return result;
 }
 
@@ -760,6 +798,8 @@ MoeExecutablePlan MoeCompiler::compile(const MoeConfig& config,
             w1_loop, make_data(w1_loop.problem, static_cast<std::uint32_t>(bucket)), 0, 1);
         const auto w2_compilation = LLVMJITBackend{}.benchmark(
             w2_loop, make_data(w2_loop.problem, static_cast<std::uint32_t>(bucket + 1)), 0, 1);
+        plan.llvm_compile_milliseconds += w1_compilation.compile_milliseconds +
+                                          w2_compilation.compile_milliseconds;
         plan.kernels.push_back({bucket, w1_loop, w1_loop, w2_loop,
                                 w1_compilation.llvm_ir, w2_compilation.llvm_ir});
     }

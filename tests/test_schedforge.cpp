@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <numeric>
 #include <stdexcept>
@@ -666,6 +667,47 @@ void test_decoder_compiler() {
     require(schedforge::execute_decoder_layer(
                 explicit_moe_plan, moe_data, 0, 1).max_error < 1.0e-3,
             "explicit decoder MoE graph execution");
+
+    auto decode_config = dense_config;
+    decode_config.sequence = 1;
+    decode_config.context_sequence = 16;
+    const auto decode_data = schedforge::make_decoder_data(decode_config, 87);
+    const auto decode_plan = schedforge::DecoderCompiler{}.compile(
+        imported, decode_config, decode_data, options);
+    const auto decode_result = schedforge::execute_decoder_layer(
+        decode_plan, decode_data, 0, 1);
+    require(decode_plan.policy.attention_strategy ==
+                schedforge::AttentionLoweringStrategy::SplitKVDecode &&
+            decode_result.max_error < 1.0e-3 && decode_result.tokens_per_second > 0.0,
+            "decoder KV-cache decode execution");
+
+    const auto optimized = schedforge::ExecutablePlanOptimizer{}.optimize(
+        imported, dense_config, dense_data, 2, 4, 1);
+    require(optimized.candidates.size() >= 16 && optimized.hardware_measurements >= 5 &&
+            optimized.winner.measured && optimized.speedup > 0.0 &&
+            optimized.plan.memory.workspace_bytes > 0,
+            "whole-graph decoder plan optimizer");
+
+    const auto profiles = schedforge::realistic_decoder_profiles();
+    require(profiles.size() == 24 && profiles.front().config.hidden == 512 &&
+            profiles[14].config.hidden == 4096,
+            "realistic decoder profile matrix");
+    const auto compile_only = schedforge::benchmark_decoder_profile(
+        profiles[14], imported, 2, 1, 1, false, 1);
+    require(compile_only.evidence == schedforge::DecoderEvidenceKind::CompileOnly &&
+            compile_only.measured.milliseconds == 0.0 &&
+            compile_only.profile.estimated_weight_bytes > 0,
+            "decoder compile-only evidence boundary");
+
+    const auto csv_path = std::filesystem::temp_directory_path() / "schedforge_decoder_test.csv";
+    schedforge::write_decoder_benchmark_csv(csv_path, {compile_only});
+    std::ifstream csv(csv_path);
+    const std::string csv_text((std::istreambuf_iterator<char>(csv)),
+                               std::istreambuf_iterator<char>());
+    require(csv_text.find("profile,evidence") != std::string::npos &&
+            csv_text.find("compile-only") != std::string::npos &&
+            csv_text.find("tokens_per_second") != std::string::npos,
+            "decoder benchmark CSV schema");
 }
 
 }  // namespace

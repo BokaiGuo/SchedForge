@@ -170,6 +170,42 @@ claims. The raw console records and plans are `results/decoder_dense_run.txt`,
 `results/decoder_dense.sfe`, `results/decoder_moe_run.txt`, and
 `results/decoder_moe.sfe`.
 
+## Realistic Decoder Matrix and Whole-Graph Planning
+
+SchedForge 0.8/0.9 adds a 24-profile architecture matrix spanning Tiny,
+Medium, and Large Decoder dimensions, Prefill lengths 128/512/2048, Decode KV
+lengths 128/512/2048/4096, and Top-2 MoE routing with 8/16 experts. The checked-
+in run uses a 1.2 GFLOP and 256 MiB weight budget: 12 rows execute on the real
+CPU and 12 remain explicitly `compile-only`. Compile-only rows report zero
+runtime latency and are not simulator estimates.
+
+Representative real CPU results on the recorded Intel Core i5-14600K are:
+
+- Tiny Prefill `S=128`: **3.753 ms**, **34,110 token/s**
+- Tiny Decode `KV=512`: **1.443 ms**, **693 token/s**
+- Medium Decode `KV=4096`: **12.817 ms**, **78 token/s**
+- Tiny 8-expert Top-2 MoE, uniform routing: **8.509 ms**, **3,761 token/s**
+- Tiny 16-expert Top-2 MoE, heavy skew: **13.445 ms**, **2,380 token/s**
+
+All measured matrix rows remain below `1e-3` maximum absolute error. The MoE
+Decoder path passes normalized activations separately from immutable expert
+parameters; removing the previous per-call expert-weight copy reduces the
+uniform 8-expert layer from roughly 32.6 ms to 8.5 ms in the recorded runs.
+
+`ExecutablePlanOptimizer` jointly searches Attention strategy, intermediate
+layout, materialization, workspace reuse, schedule family, thread count, and
+core placement. Analytical scores prioritize the measurement budget, but only
+full Decoder execution selects a winner. All candidates receive equal warmup;
+an apparent winner is checked in three interleaved baseline/winner rounds.
+
+- Tiny Prefill `S=128`: default plan retained, **1.000x**
+- Tiny Decode `KV=512`: one-thread non-materializing Split-KV plan selected,
+  confirmed **1.400x** over the default plan
+
+The raw matrix, winner summary, and complete candidate table are stored in
+`results/decoder_realistic.csv`, `results/decoder_plan_optimizer.csv`, and
+`results/decoder_plan_optimizer_candidates.csv`.
+
 ## MoE Compiler Validation
 
 SchedForge 0.4 adds a single-host FP32 Top-2 MoE MLP compiler/runtime path. MoE
@@ -266,6 +302,9 @@ only selection and are preserved in `results/top_resolution_*`.
   distributed attention, and one fused LLVM attention function are outside this release.
 - Decoder Layer execution is FP32. Compile-time weight concatenation is
   implemented, while portable AOT object caching and true BF16/INT8 Decoder
-  kernels remain outside v0.7.
+  kernels remain outside v0.9.
+- Large Decoder profiles and expensive Prefill profiles are compile-only under
+  the checked-in 1.2 GFLOP/256 MiB execution budget; no latency is claimed for
+  those rows.
 - Full fresh tuning is deliberately expensive because every deduplicated candidate
   is executed on hardware; cached runs are much faster and are labeled as cache hits.

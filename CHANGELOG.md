@@ -2,6 +2,49 @@
 
 All notable changes to SchedForge are documented here.
 
+## [0.9.0] - 2026-08-13
+
+### Added
+
+- `ExecutablePlanOptimizer` for cross-dispatch Decoder planning across
+  attention algorithms, intermediate layouts, materialization, workspace
+  reuse, schedule families, thread counts, and core placement.
+- Measurement-budgeted end-to-end candidate selection with an explicit default
+  plan baseline, equal candidate warmup, and three-round interleaved
+  baseline/winner confirmation.
+- Serializable Decoder plan policy and plan-cost metadata in `.sfe` artifacts.
+
+### Changed
+
+- Plan selection is evaluated by full Decoder latency rather than the sum of
+  independently selected kernel scores.
+- The checked-in optimizer study preserves the Tiny Prefill negative result and
+  records a confirmed 1.400x Tiny Decode improvement from a one-thread,
+  non-materializing Split-KV plan.
+- Decoder-to-MoE execution passes normalized activations separately from expert
+  parameters, eliminating per-invocation copies of 67-132 MiB expert weights.
+
+## [0.8.0] - 2026-08-13
+
+### Added
+
+- A 24-profile realistic Decoder suite spanning Tiny, Medium, and Large model
+  dimensions, Prefill lengths 128/512/2048, Decode KV lengths
+  128/512/2048/4096, and 8/16-expert Top-2 MoE routing skew.
+- Real KV-cache Decoder execution and per-stage timing for Attention,
+  projections, RMSNorm/RoPE, FFN/MoE, residuals, and dispatch overhead.
+- Peak workspace, compile time, LLVM JIT time, memory-planning time, stage
+  percentages, equivalent tokens/s, estimated FLOPs, and weight bytes.
+- `schedforge-decoder-bench` with explicit `measured`, `compile-only`, and
+  `skipped` evidence classes.
+
+### Changed
+
+- Nested Attention and MoE correctness references no longer contaminate
+  measured Decoder latency; end-to-end validation remains at the Decoder seam.
+- Large and expensive Prefill rows are retained as compile-feasibility evidence
+  instead of being reported as simulated or fabricated runtime latency.
+
 ## [0.7.0] - 2026-08-13
 
 ### Added
