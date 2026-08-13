@@ -2,7 +2,7 @@
 
 # SchedForge
 
-**SchedForge — A Target-Aware CPU Tensor Compiler**
+**SchedForge — A Model-to-Machine Target-Aware CPU AI Compiler**
 
 **调度锻造器：把张量计算逐层编译成高效的 CPU 代码。**
 
@@ -15,22 +15,26 @@
 
 </div>
 
-SchedForge 是一个使用 C++20 编写的 CPU 张量编译器原型，主要用于学习、
-实验和编译器研究。项目从张量计算出发，将程序转换成可调度的循环中间表示，
-再结合 Cache、TLB、寄存器压力和内存带宽模型筛选执行方案，最终交给原生
-AVX2 后端或 `LLVM ORC JIT` 生成并执行机器代码。
+SchedForge 是一个使用 C++20 编写的 model-to-machine CPU AI 编译器。它能够
+导入 StableHLO 子集，构建真正的多算子 Tensor SSA Graph，执行 Shape 推导、
+图正规化、融合、Dispatch 形成、Layout 传播、Bufferization 和 Workspace
+复用，再通过 Structured Tensor Compute、Transform IR、Loop IR、Tensorization
+和 LLVM 18 ORC JIT 或原生 AVX2 后端生成并执行 CPU 代码。
 
-项目没有追求“算子数量越多越好”，而是围绕融合的 FP32
-`MatMul + Bias + ReLU` 深入打通一条完整链路：
+当前第二条旗舰路径是 Transformer MLP：
+`Linear → Bias → GELU → Linear → Bias → Residual`。MatMul 继续作为 Kernel
+性能基准，MLP 则作为 Graph Compiler 基准，真实覆盖 use-def、融合边界、
+动态 Shape Guard、临时张量、布局、内存生命周期和 Dispatch。
 
 ```text
-张量计算
-  → SSA Tensor IR
-  → Loop IR
-  → 循环变换与调度搜索
-  → 硬件代价预测
-  → 原生 AVX2 / LLVM 即时编译
-  → 真机测量与模型校准
+StableHLO / AI Graph
+  → Tensor SSA + Shape Inference
+  → Fusion + Dispatch IR
+  → Layout + Bufferization
+  → Structured Compute + Transform IR
+  → Scheduled Loop IR + Tensorization
+  → LLVM IR / x86 Machine Code
+  → ExecutablePlan + AI Runtime
 ```
 
 同一份调度方案会同时交给循环变换、模拟器、原生后端、LLVM 后端和自动调优器，
@@ -59,18 +63,26 @@ flowchart LR
 
 - **编译器基础设施**：实现 SSA 类型系统、`Value`、use-def 关系、
   `Operation`、嵌套 `Block`、`Module`、`IRBuilder` 和分层 PassManager。
+- **Graph Compiler**：多算子 Tensor SSA、静态/动态/符号维度、Shape Constraint、
+  StableHLO 子集导入、图正规化、Fusion Legality/Profitability、Dispatch IR。
+- **内存与布局编译**：Layout 进入 Tensor Type；支持跨 Dispatch 布局传播、
+  Bufferization、生命周期分析、64 字节对齐 Workspace 复用和 Guarded Specialization。
+- **结构化 Kernel Compiler**：Iteration Domain、并行/归约 Iterator、Indexing Map、
+  Transform IR 序列化与回放，以及由实测 Schedule 生成的变换程序。
 - **Tensor IR 与 Loop IR 分层**：Tensor IR 描述“算什么”，Loop IR 描述
   “具体怎么执行”，调度策略独立于计算语义。
 - **CPU 循环优化**：支持多级分块、MR/NR 寄存器分块、K 维展开、A/B 矩阵
   数据打包、软件预取、SIMD 向量化、尾部处理、算子融合和多线程执行。
-- **两套可执行后端**：一套是原生 AVX2/FMA 微内核；另一套使用 LLVM 18
-  构造 IR、执行 O3 优化并通过 `ORC LLJIT` 运行，同时支持汇编导出与检查。
+- **生成式微内核后端**：原生 AVX2 与 LLVM ORC 都支持寄存器驻留 MR×NR
+  微内核；LLVM 路径真实生成 Vector FMA，并检查正确性与寄存器 Spill。
 - **硬件感知代价模型**：模拟组相联 L1/L2/L3 Cache、DTLB、软件预取、
   寄存器占用、潜在 Spill、数据打包开销和内存带宽。
-- **自动调优**：支持网格搜索、随机搜索、贪心搜索和进化搜索，并使用模拟器
-  先排序、再对少量候选进行真机测试。
-- **运行时支持**：包含动态尺寸分桶、编译产物缓存、布局传播、生命周期内存规划、
-  CPU 亲和性、NUMA 拓扑检测，以及 BF16、INT8 参考实现。
+- **真机优先自动调优**：所有去重后的合法候选都先在真实硬件运行，再对实测
+  前列随机交错复测；测量数据库可用于 analytical + learned 混合模型。
+- **AI Runtime**：可序列化 `.sfe` ExecutablePlan，包含常量、Buffer、Dispatch、
+  Shape Guard、Transform IR、LLVM Kernel Artifact 和 Workspace。
+- **Transformer/推理抽象**：可执行 MLP、Mini Attention Graph、量化 Tensor
+  元数据与传播、BF16/INT8 参考路径和动态多版本 Guard。
 
 ## 快速开始
 
@@ -128,6 +140,12 @@ cmake -S . -B build -G Ninja \
 # 校准硬件参数后执行自动调优
 ./build/schedforge-bench --M=192 --N=192 --K=192 \
   --threads=8 --autoschedule --top-k=12 --calibrate
+
+# 将 StableHLO Transformer MLP 编译成可执行计划
+./build/schedforge-compile examples/transformer_mlp.mlir \
+  --target=native-cpu --batch=1 --sequence=16 \
+  --hidden=64 --intermediate=128 --threads=4 \
+  -o results/transformer_mlp.sfe
 ```
 
 ## 调度描述语言
@@ -166,6 +184,23 @@ vector=8;unroll=4;threads=8;pack=ab;prefetch=4;fuse=true;pin=true
 | `schedforge-search` | 对比不同调度搜索算法 |
 | `schedforge-study` | 分析数据打包收益和预测误差 |
 | `schedforge-resolution` | 测量调优噪声与候选区分能力 |
+| `schedforge-compile` | 将 StableHLO Graph 编译为 `.sfe` ExecutablePlan |
+
+## Graph Compiler 实测 Demo
+
+仓库中的 `examples/transformer_mlp.mlir` 当前会生成：
+
+- 12 个正规化后的 Tensor SSA Operation
+- 2 个融合 Dispatch：`MatMul + Bias + GELU` 与 `MatMul + Bias + Residual`
+- 跨 Dispatch 的 `blocked<6x16>` Layout 传播
+- 朴素中间张量 32,768 字节，规划后 Workspace 8,192 字节
+- 2 个携带 Transform IR 与 AVX2 Tensor Intrinsic 的 LLVM Kernel Artifact
+- 每个 Dispatch 从 9,720 个生成候选中完成 2,295 次真机测量
+- 当前记录主机上的原生 Scheduled Loop Runtime 为 0.020 ms
+- 端到端 MLP 执行验证，最大误差低于 `1e-3`
+
+可复现输出见 `results/transformer_mlp_compile.txt` 和
+`results/transformer_mlp.sfe`。
 
 ## 实测结果
 
@@ -203,8 +238,10 @@ scripts/              性能计数器辅助脚本
 
 ## 当前边界
 
-- SchedForge 是用于学习和研究的 CPU 张量编译器原型，不是 BLIS、oneDNN
-  或生产级图编译器的替代品。
+- SchedForge 是研究型 CPU AI 编译器原型，不是 oneDNN、XLA、IREE、TVM
+  或生产级推理 Runtime 的替代品。
+- Transformer MLP 已端到端执行；Mini Attention、量化传播和 Learned Cost
+  Model 已有编译器抽象与测试，但还不是生产级高性能 Attention/INT8 后端。
 - 当前只在真实硬件上验证了 AVX2 后端。AVX-512 和 NEON 目前只有目标抽象，
   不能视为已经完成并验证的机器码后端。
 - 项目已经实现 NUMA 拓扑检测和任务划分，但实验机器只有一个 NUMA 节点，
@@ -217,6 +254,7 @@ scripts/              性能计数器辅助脚本
 ## 延伸阅读
 
 - [架构说明](docs/ARCHITECTURE.md)
+- [Graph Compiler 与 `.sfe` 格式](docs/GRAPH_COMPILER.md)
 - [实验方法](docs/EXPERIMENT.md)
 - [最终实验报告](results/FINAL_REPORT.md)
 - [架构决策记录](docs/decisions/)

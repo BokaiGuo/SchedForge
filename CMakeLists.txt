@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(SchedForge VERSION 0.1.0 LANGUAGES CXX)
+project(SchedForge VERSION 0.2.0 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -9,6 +9,15 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(SCHEDFORGE_NATIVE_ARCH "Enable native CPU instructions" ON)
+option(SCHEDFORGE_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+
+if(SCHEDFORGE_ENABLE_SANITIZERS)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        message(FATAL_ERROR "SchedForge sanitizers require Clang or GCC")
+    endif()
+    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=address,undefined)
+endif()
 
 find_package(LLVM REQUIRED CONFIG PATHS /usr/lib/llvm-18/lib/cmake/llvm /usr/lib/llvm-18/cmake)
 if(NOT LLVM_VERSION_MAJOR EQUAL 18)
@@ -21,6 +30,7 @@ add_library(schedforge
     src/ir.cpp
     src/target.cpp
     src/compiler.cpp
+    src/graph_compiler.cpp
     src/llvm_backend.cpp
     src/runtime.cpp
     src/simulator.cpp
@@ -56,6 +66,8 @@ add_executable(schedforge-search tools/schedforge-search.cpp)
 target_link_libraries(schedforge-search PRIVATE schedforge)
 add_executable(schedforge-resolution tools/schedforge-resolution.cpp)
 target_link_libraries(schedforge-resolution PRIVATE schedforge)
+add_executable(schedforge-compile tools/schedforge-compile.cpp)
+target_link_libraries(schedforge-compile PRIVATE schedforge)
 
 enable_testing()
 add_executable(schedforge-tests tests/test_schedforge.cpp)
@@ -77,6 +89,7 @@ install(TARGETS
     schedforge-calibrate
     schedforge-search
     schedforge-resolution
+    schedforge-compile
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 install(DIRECTORY include/schedforge DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})

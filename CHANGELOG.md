@@ -2,6 +2,26 @@
 
 All notable changes to SchedForge are documented here.
 
+## [0.2.0] - 2026-08-13
+
+### Added
+
+- StableHLO subset importer for tensor graph programs.
+- Multi-operation Tensor SSA graph, symbolic dimensions, shape inference, and guards.
+- Structured Tensor Compute, FusionPlanner, Dispatch IR, graph layout propagation,
+  bufferization, lifetime-based workspace reuse, and ExecutablePlan artifacts.
+- Transformer MLP compilation and runtime validation, plus a mini-attention graph path.
+- Transform IR serialization/replay and AVX2 tensor-intrinsic matching.
+- Quantized tensor metadata and graph-level quantization propagation.
+- Hardware measurement database and hybrid analytical/learned cost model.
+- `schedforge-compile` model-to-machine CLI and `.sfe` executable-plan output.
+- LLVM ORC register-resident MR×NR micro-kernel generation for legal static shapes.
+
+### Changed
+
+- Project positioning expands from a tensor kernel compiler to a target-aware CPU AI
+  compiler with separate graph, kernel, target, and runtime layers.
+
 ## [0.1.0] - 2026-08-12
 
 ### Added

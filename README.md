@@ -2,7 +2,7 @@
 
 # SchedForge
 
-**SchedForge — A Target-Aware CPU Tensor Compiler**
+**SchedForge — A Model-to-Machine Target-Aware CPU AI Compiler**
 
 **Forge tensor schedules into efficient CPU code.**
 
@@ -15,54 +15,65 @@
 
 </div>
 
-SchedForge is an educational and research-oriented CPU tensor compiler written
-in C++20. It lowers tensor computation into scheduled loop IR, evaluates
-candidate schedules with a cache/TLB/register cost model, and executes the
-selected plan through either native AVX2 micro-kernels or LLVM 18 ORC JIT.
+SchedForge is a C++20 model-to-machine CPU AI compiler. It imports a practical
+StableHLO subset into a multi-operation Tensor SSA graph, performs shape
+inference, graph canonicalization, fusion, dispatch formation, layout planning,
+bufferization, and workspace reuse, then lowers each dispatch through
+Structured Tensor Compute, Transform IR, scheduled Loop IR, tensorization, and
+LLVM 18 ORC JIT or native AVX2 execution.
 
-The project focuses on one deep path—fused FP32 `MatMul + Bias + ReLU`—instead
-of presenting a broad but shallow operator collection. The same schedule object
-is consumed by lowering, simulation, native execution, LLVM code generation,
-debugging tools, and auto-tuning.
+The flagship graph workload is a Transformer MLP block:
+`Linear → Bias → GELU → Linear → Bias → Residual`. MatMul remains the kernel
+benchmark and hardware auto-tuning laboratory; the MLP is the graph/compiler
+benchmark that exercises real use-def chains, fusion boundaries, dynamic shape
+guards, temporary tensors, layout propagation, memory lifetime, and dispatch.
 
 ```mermaid
-flowchart LR
-    A["Tensor Graph"] --> B["SSA Tensor IR"]
-    B --> C["Canonical Loop IR"]
-    C --> D["Schedule DSL"]
-    D --> E["Multi-level Tiling"]
-    D --> F["Packing / Micro-kernel"]
-    D --> G["Vector / Threads / Fusion"]
-    E --> H["Cache + TLB + Register Simulator"]
-    F --> H
-    G --> H
-    H --> I["Cost Model / AutoScheduler"]
-    I --> J["Native AVX2 Backend"]
-    I --> K["LLVM 18 ORC JIT"]
-    J --> L["Benchmark / perf"]
-    K --> L
-    L --> M["Calibration and Prediction Study"]
+flowchart TD
+    A["StableHLO / Tensor Graph"] --> B["Tensor SSA + Shape Inference"]
+    B --> C["Canonicalization + Fusion Planner"]
+    C --> D["Dispatch IR + Layout Planning"]
+    D --> E["Bufferization + ExecutablePlan"]
+    E --> F["Structured Tensor Compute"]
+    F --> G["Transform IR + AutoScheduler"]
+    G --> H["Scheduled Loop IR"]
+    H --> I["Tensorization / AVX2 Intrinsics"]
+    I --> J["LLVM Vector IR + ORC JIT"]
+    J --> K["SchedForge Runtime"]
+    K --> L["CPU + perf / PMU Feedback"]
 ```
 
 ## Highlights
 
 - **Compiler infrastructure:** SSA `Type`, `Value`, use-def chains,
   `Operation`, nested `Block`, `Module`, `IRBuilder`, and layered pass managers.
+- **Graph compiler:** multi-op Tensor SSA, symbolic/static/dynamic dimensions,
+  shape constraints, StableHLO subset import, canonicalization, fusion legality
+  and profitability, Dispatch IR, and Transformer MLP compilation.
+- **Memory and layout compiler:** layout is part of tensor type; graph layout
+  propagation, dispatch-boundary materialization, bufferization, lifetime
+  analysis, aligned workspace reuse, and guarded shape specialization.
+- **Structured kernel compiler:** iteration domains, parallel/reduction
+  iterators, indexing maps, Transform IR serialization/replay, and schedule
+  programs generated from measured winners.
 - **Tensor-to-loop lowering:** separate computation semantics from scheduling;
   both the simulator and code generators consume the same Loop IR.
 - **CPU scheduling:** multi-level tiling, MR/NR register blocks, K unrolling,
   PackA/PackB, prefetching, vectorization, fusion, affinity, and threading.
-- **Two executable backends:** native AVX2/FMA micro-kernels and real LLVM 18
-  `IRBuilder` + O3 + ORC `LLJIT`, including assembly emission and analysis.
+- **Generated micro-kernels:** native AVX2/FMA and LLVM 18 ORC paths both support
+  register-resident MR×NR kernels; LLVM emits vector FMA code and is checked for
+  correctness and vector spill patterns.
 - **Hardware-aware modeling:** set-associative L1/L2/L3 caches, DTLB,
   prefetch usefulness, register pressure, spill penalties, packing traffic,
   bandwidth calibration, and target-aware cost estimation.
-- **Auto-tuning and research tools:** grid, random, greedy, and evolutionary
-  search; simulator-guided top-k hardware measurement; Spearman correlation and
-  top-k recall analysis.
-- **Runtime features:** dynamic-shape buckets, persistent kernel artifacts,
-  layout propagation, lifetime-based memory planning, NUMA topology detection,
-  thread affinity, BF16, and INT8 reference paths.
+- **Measurement-first auto-tuning:** every deduplicated legal candidate is run
+  on real hardware before randomized finalist remeasurement; analytical and
+  learned cost-model APIs consume the resulting measurement database.
+- **AI runtime:** serializable `.sfe` ExecutablePlan with constants, buffers,
+  dispatches, shape guards, Transform IR, LLVM kernel artifacts, and workspace.
+- **Transformer and inference abstractions:** executable MLP, mini-attention
+  graph construction, quantized tensor metadata, per-axis quantization
+  propagation, BF16/INT8 reference paths, and adaptive specialization guards.
 
 ## Quick Start
 
@@ -120,7 +131,17 @@ cmake -S . -B build -G Ninja \
 # Run calibrated auto-scheduling
 ./build/schedforge-bench --M=192 --N=192 --K=192 \
   --threads=8 --autoschedule --top-k=12 --calibrate
+
+# Compile a StableHLO Transformer MLP into an executable plan
+./build/schedforge-compile examples/transformer_mlp.mlir \
+  --target=native-cpu --batch=1 --sequence=16 \
+  --hidden=64 --intermediate=128 --threads=4 \
+  -o results/transformer_mlp.sfe
 ```
+
+The model compiler reports imported operations, inferred shapes, fused dispatch
+boundaries, layout decisions, naive versus planned temporary memory, selected
+kernel schedules, generated LLVM kernels, runtime latency, and validation error.
 
 ## Schedule DSL
 
@@ -157,6 +178,24 @@ vector=8;unroll=4;threads=8;pack=ab;prefetch=4;fuse=true;pin=true
 | `schedforge-search` | Compare schedule-search strategies |
 | `schedforge-study` | Run packing crossover and prediction studies |
 | `schedforge-resolution` | Measure tuning noise and candidate-resolution limits |
+| `schedforge-compile` | Compile StableHLO graphs into `.sfe` ExecutablePlans |
+
+## Graph Compiler Demo
+
+The checked-in `examples/transformer_mlp.mlir` currently produces:
+
+- 12 canonical Tensor SSA operations
+- 2 fused dispatches: `MatMul + Bias + GELU` and `MatMul + Bias + Residual`
+- blocked `6×16` layout propagation across the dispatch boundary
+- naive intermediate tensors: 32,768 bytes
+- planned workspace: 8,192 bytes
+- 2 LLVM kernel artifacts with Transform IR and AVX2 tensor intrinsics
+- 2,295 hardware measurements per dispatch from 9,720 generated candidates
+- native scheduled-loop runtime: 0.020 ms on the recorded host
+- validated end-to-end MLP execution with maximum error below `1e-3`
+
+See `results/transformer_mlp_compile.txt` and
+`results/transformer_mlp.sfe` for the reproducible output.
 
 ## Recorded Results
 
@@ -184,9 +223,10 @@ negative results, raw artifact pointers, and claim boundaries.
 ## Project Layout
 
 ```text
-include/schedforge/   Public compiler, IR, runtime, and simulator APIs
-src/                   IR, lowering, LLVM, runtime, simulation, and scheduling
+include/schedforge/   Public graph, kernel, target, runtime, and simulator APIs
+src/                   Graph passes, IR, lowering, LLVM, runtime, and scheduling
 tools/                 Compiler command-line tools
+examples/              StableHLO model examples
 tests/                 Unit and end-to-end validation
 docs/                  Architecture and design decisions
 results/               Reproducible experiment snapshots and reports
@@ -195,8 +235,11 @@ scripts/               Hardware-counter helpers
 
 ## Scope and Limitations
 
-- SchedForge is a compiler prototype, not a replacement for BLIS, oneDNN, or
-  production graph compilers.
+- SchedForge is a research compiler prototype, not a replacement for oneDNN,
+  XLA, IREE, TVM, or production inference runtimes.
+- The Transformer MLP path is executable end to end. The mini-attention path,
+  quantization propagation, and learned model are implemented compiler
+  abstractions but are not yet production-optimized attention/INT8 backends.
 - AVX2 is the physically validated SIMD backend. AVX-512 and NEON are target
   abstractions but are not validated code-generation backends in this release.
 - NUMA-aware partitioning is implemented, but experiments were run on one NUMA
@@ -209,6 +252,7 @@ scripts/               Hardware-counter helpers
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md)
+- [Graph compiler and `.sfe` format](docs/GRAPH_COMPILER.md)
 - [Experiment design](docs/EXPERIMENT.md)
 - [Final experiment report](results/FINAL_REPORT.md)
 - [Architecture decisions](docs/decisions/)

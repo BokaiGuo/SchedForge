@@ -1,0 +1,38 @@
+[Import]
+StableHLO operations: 12
+
+[Shape Inference]
+input: tensor<16x64xf32, layout=row_major>
+
+[Graph Optimization]
+fused dispatch #0: bias+gelu
+fused dispatch #1: bias+residual
+
+[Layout Planning]
+removed layout conversions: 1
+
+[Memory Planning]
+naive temporary memory: 32768 bytes
+planned workspace: 8192 bytes
+
+[Kernel Compiler]
+dispatch #0: ikj-tile32x32x16-v8-mr4-fused micro=4x16 threads=1
+dispatch #1: ikj-tile32x64x16-v8-mr4-fused micro=4x16 threads=1
+
+[AutoScheduler]
+dispatch #0: candidates=9720 hardware measured=2295 cache=miss
+dispatch #1: candidates=9720 hardware measured=2295 cache=miss
+
+[LLVM]
+kernels generated: 2
+JIT compile: 120.991 ms
+
+[Runtime]
+backend: native scheduled-loop dispatch
+execution: 0.020 ms
+
+[Validation]
+max error: 0.000
+
+[Hardware]
+x86_64 AVX2 vector=8 registers=16 cpus=20

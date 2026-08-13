@@ -1,6 +1,6 @@
 cff-version: 1.2.0
 message: "If you use SchedForge in research or teaching, please cite this repository."
-title: "SchedForge: A Target-Aware CPU Tensor Compiler Prototype"
+title: "SchedForge: A Model-to-Machine Target-Aware CPU AI Compiler"
 type: software
 authors:
   - family-names: Guo
@@ -8,5 +8,5 @@ authors:
 repository-code: "https://github.com/BokaiGuo/SchedForge"
 url: "https://github.com/BokaiGuo/SchedForge"
 license: MIT
-version: 0.1.0
-date-released: 2026-08-12
+version: 0.2.0
+date-released: 2026-08-13

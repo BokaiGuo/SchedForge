@@ -50,7 +50,7 @@ std::mutex kernel_cache_mutex;
 std::unordered_map<std::string, std::shared_ptr<CachedKernel>> kernel_cache;
 
 std::string kernel_key(const GraphIR& graph, const Schedule& schedule) {
-    return std::to_string(graph.problem.m) + "x" + std::to_string(graph.problem.n) + "x" +
+    return "llvm-register-v2-" + std::to_string(graph.problem.m) + "x" + std::to_string(graph.problem.n) + "x" +
            std::to_string(graph.problem.k) + "-bias" + std::to_string(graph.problem.bias) +
            "-relu" + std::to_string(graph.problem.relu) + "-" + ScheduleDSL::print(schedule);
 }
@@ -157,6 +157,137 @@ void build_ijk_function(llvm::Module& module, const Problem& problem) {
     i->addIncoming(next_i, i_latch);
 
     builder.SetInsertPoint(exit);
+    builder.CreateRetVoid();
+}
+
+bool can_build_register_kernel(const Problem& problem, const Schedule& schedule) {
+    const int width = std::max(1, schedule.vector_width);
+    const int mr = std::max(1, schedule.mr);
+    const int nr = std::max(width, schedule.nr);
+    const int vectors = nr / width;
+    const std::size_t blocks = static_cast<std::size_t>(problem.m / mr) *
+                               static_cast<std::size_t>(problem.n / nr);
+    return width > 1 && nr % width == 0 && problem.m % mr == 0 && problem.n % nr == 0 &&
+           mr * vectors <= 12 && blocks <= 256;
+}
+
+void build_register_tiled_function(llvm::Module& module, const Problem& problem,
+                                   const Schedule& schedule) {
+    auto& context = module.getContext();
+    llvm::IRBuilder<> builder(context);
+    auto* float_type = builder.getFloatTy();
+    auto* i64_type = builder.getInt64Ty();
+    auto* pointer_type = builder.getPtrTy();
+    auto* function_type = llvm::FunctionType::get(
+        builder.getVoidTy(), {pointer_type, pointer_type, pointer_type, pointer_type,
+                              i64_type, i64_type, i64_type}, false);
+    auto* function = llvm::Function::Create(function_type, llvm::Function::ExternalLinkage,
+                                            "schedforge_matmul", module);
+    auto arguments = function->arg_begin();
+    llvm::Value* a = arguments++; a->setName("A");
+    llvm::Value* b = arguments++; b->setName("B");
+    llvm::Value* bias = arguments++; bias->setName("bias");
+    llvm::Value* c = arguments++; c->setName("C");
+    llvm::Value* m = arguments++; m->setName("M");
+    llvm::Value* n = arguments++; n->setName("N");
+    llvm::Value* k_size = arguments++; k_size->setName("K");
+    (void)m;
+
+    const int width = schedule.vector_width;
+    const int mr = schedule.mr;
+    const int nr = schedule.nr;
+    const int vector_count = nr / width;
+    auto* vector_type = llvm::FixedVectorType::get(float_type, static_cast<unsigned>(width));
+    auto* vector_fma = llvm::Intrinsic::getDeclaration(&module, llvm::Intrinsic::fma, {vector_type});
+    auto* entry = llvm::BasicBlock::Create(context, "entry", function);
+    builder.SetInsertPoint(entry);
+    llvm::BasicBlock* predecessor = entry;
+
+    int block_index = 0;
+    for (int row = 0; row < problem.m; row += mr) {
+        for (int column = 0; column < problem.n; column += nr) {
+            auto* k_header = llvm::BasicBlock::Create(context,
+                "micro." + std::to_string(block_index) + ".k", function);
+            auto* k_body = llvm::BasicBlock::Create(context,
+                "micro." + std::to_string(block_index) + ".body", function);
+            auto* store = llvm::BasicBlock::Create(context,
+                "micro." + std::to_string(block_index) + ".store", function);
+            builder.SetInsertPoint(predecessor);
+            builder.CreateBr(k_header);
+
+            builder.SetInsertPoint(k_header);
+            auto* k = builder.CreatePHI(i64_type, 2, "k");
+            k->addIncoming(builder.getInt64(0), predecessor);
+            std::vector<llvm::PHINode*> accumulators;
+            accumulators.reserve(static_cast<std::size_t>(mr * vector_count));
+            for (int index = 0; index < mr * vector_count; ++index) {
+                auto* accumulator = builder.CreatePHI(vector_type, 2, "acc");
+                accumulator->addIncoming(llvm::Constant::getNullValue(vector_type), predecessor);
+                accumulators.push_back(accumulator);
+            }
+            builder.CreateCondBr(builder.CreateICmpULT(k, k_size), k_body, store);
+
+            builder.SetInsertPoint(k_body);
+            std::vector<llvm::Value*> b_vectors;
+            for (int vector_index = 0; vector_index < vector_count; ++vector_index) {
+                auto* b_ptr = gep2d(builder, float_type, b, k, n,
+                    builder.getInt64(column + vector_index * width));
+                auto* load = builder.CreateLoad(vector_type, b_ptr);
+                load->setAlignment(llvm::Align(1));
+                b_vectors.push_back(load);
+            }
+            std::vector<llvm::Value*> updated;
+            updated.reserve(accumulators.size());
+            for (int row_index = 0; row_index < mr; ++row_index) {
+                auto* a_ptr = gep2d(builder, float_type, a, builder.getInt64(row + row_index),
+                                    k_size, k);
+                auto* a_value = builder.CreateLoad(float_type, a_ptr);
+                auto* inserted = builder.CreateInsertElement(
+                    llvm::PoisonValue::get(vector_type), a_value, builder.getInt64(0));
+                auto* splat = builder.CreateShuffleVector(inserted,
+                    llvm::PoisonValue::get(vector_type),
+                    llvm::SmallVector<int, 16>(static_cast<std::size_t>(width), 0));
+                for (int vector_index = 0; vector_index < vector_count; ++vector_index) {
+                    const int accumulator_index = row_index * vector_count + vector_index;
+                    updated.push_back(builder.CreateCall(vector_fma,
+                        {splat, b_vectors[static_cast<std::size_t>(vector_index)],
+                         accumulators[static_cast<std::size_t>(accumulator_index)]}));
+                }
+            }
+            auto* k_next = builder.CreateAdd(k, builder.getInt64(1));
+            builder.CreateBr(k_header);
+            k->addIncoming(k_next, k_body);
+            for (std::size_t index = 0; index < accumulators.size(); ++index)
+                accumulators[index]->addIncoming(updated[index], k_body);
+
+            builder.SetInsertPoint(store);
+            for (int row_index = 0; row_index < mr; ++row_index) {
+                for (int vector_index = 0; vector_index < vector_count; ++vector_index) {
+                    const int accumulator_index = row_index * vector_count + vector_index;
+                    llvm::Value* value = accumulators[static_cast<std::size_t>(accumulator_index)];
+                    if (problem.bias) {
+                        auto* bias_ptr = builder.CreateGEP(float_type, bias,
+                            builder.getInt64(column + vector_index * width));
+                        auto* bias_vector = builder.CreateLoad(vector_type, bias_ptr);
+                        bias_vector->setAlignment(llvm::Align(1));
+                        value = builder.CreateFAdd(value, bias_vector);
+                    }
+                    if (problem.relu) {
+                        auto* zero = llvm::Constant::getNullValue(vector_type);
+                        value = builder.CreateSelect(builder.CreateFCmpOGT(value, zero), value, zero);
+                    }
+                    auto* c_ptr = gep2d(builder, float_type, c,
+                        builder.getInt64(row + row_index), n,
+                        builder.getInt64(column + vector_index * width));
+                    auto* output = builder.CreateStore(value, c_ptr);
+                    output->setAlignment(llvm::Align(1));
+                }
+            }
+            predecessor = store;
+            ++block_index;
+        }
+    }
+    builder.SetInsertPoint(predecessor);
     builder.CreateRetVoid();
 }
 
@@ -404,7 +535,9 @@ LLVMJITResult LLVMJITBackend::benchmark(const GraphIR& graph, const TensorData& 
     if (!cached) {
         auto context = std::make_unique<llvm::LLVMContext>();
         auto module = std::make_unique<llvm::Module>("schedforge_jit", *context);
-        if (schedule.order == LoopOrder::IKJ) build_ikj_function(*module, graph.problem, schedule.vector_width);
+        if (schedule.order == LoopOrder::IKJ && can_build_register_kernel(graph.problem, schedule))
+            build_register_tiled_function(*module, graph.problem, schedule);
+        else if (schedule.order == LoopOrder::IKJ) build_ikj_function(*module, graph.problem, schedule.vector_width);
         else build_ijk_function(*module, graph.problem);
         if (llvm::verifyModule(*module, &llvm::errs())) throw std::runtime_error("LLVM module verification failed");
         optimize_module(*module);

@@ -8,6 +8,7 @@
 
 # SchedForge runtime artifacts
 /.schedforge-cache/
+/.schedforge-graph-cache/
 /.cache/
 
 # Local third-party package staging

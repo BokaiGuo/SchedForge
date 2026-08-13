@@ -40,3 +40,10 @@ jobs:
 
       - name: Smoke test LLVM backend
         run: ./build/schedforge-run --backend=llvm --M=32 --N=32 --K=32
+
+      - name: Smoke test StableHLO graph compiler
+        run: |
+          ./build/schedforge-compile examples/transformer_mlp.mlir \
+            --batch=1 --sequence=4 --hidden=64 --intermediate=128 \
+            --threads=2 -o build/transformer_mlp.sfe
+          test -s build/transformer_mlp.sfe

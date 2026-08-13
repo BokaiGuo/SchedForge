@@ -1,6 +1,7 @@
 #include "schedforge/schedforge.h"
 #include "schedforge/ir.h"
 #include "schedforge/compiler.h"
+#include "schedforge/graph_compiler.h"
 
 #include <cmath>
 #include <filesystem>
@@ -159,6 +160,19 @@ void test_compiler_architecture() {
     const auto jit_cached = schedforge::LLVMJITBackend{}.benchmark(jit_graph, jit_data, schedule, 0, 1);
     require(jit_cached.compile_milliseconds < jit_result.compile_milliseconds, "jit kernel cache");
 
+    schedforge::Schedule register_schedule;
+    register_schedule.mr = 4;
+    register_schedule.nr = 8;
+    register_schedule.vector_width = 8;
+    const schedforge::GraphIR register_graph{{8, 16, 8, true, false}};
+    const auto register_data = schedforge::make_data(register_graph.problem, 29);
+    const auto register_jit = schedforge::LLVMJITBackend{}.benchmark(
+        register_graph, register_data, register_schedule, 0, 1);
+    require(register_jit.max_error < 1.0e-3 &&
+            register_jit.assembly_report.fma_instructions > 0 &&
+            !register_jit.assembly_report.has_spill_pattern,
+            "llvm generated register microkernel");
+
     const std::vector<float> dtype_values{-1.25F, 0.0F, 0.75F, 3.5F};
     const auto bf16 = schedforge::convert_from_bf16(schedforge::convert_to_bf16(dtype_values));
     require(schedforge::max_abs_error(dtype_values, bf16) < 0.02, "bf16 conversion");
@@ -175,6 +189,101 @@ void test_compiler_architecture() {
     require(search.hardware_measurements == 2 && search.best_gflops > 0.0, "search strategies");
 }
 
+void test_graph_compiler() {
+    const schedforge::MLPConfig config{1, 4, 8, 16};
+    auto graph = schedforge::build_transformer_mlp_graph(config, true);
+    const auto constraints = schedforge::ShapeInferencePass{}.run(graph);
+    require(graph.operations().size() == 12, "multi-op tensor graph");
+    require(!constraints.empty() && constraints.front().runtime_guard, "symbolic shape constraint");
+
+    const auto structured = schedforge::StructuredComputeLowering{}.run(graph);
+    require(structured.size() >= 4 && structured.front().dump().find("reduction") != std::string::npos,
+            "structured tensor compute");
+
+    auto dispatches = schedforge::FusionPlanner{}.run(graph);
+    require(dispatches.size() == 2, "mlp dispatch formation");
+    require(dispatches.front().operations.size() == 3, "matmul bias gelu fusion");
+    require(dispatches.back().operations.size() == 3, "matmul bias residual fusion");
+
+    auto static_graph = schedforge::build_transformer_mlp_graph(config, false);
+    schedforge::ShapeInferencePass{}.run(static_graph);
+    auto static_dispatches = schedforge::FusionPlanner{}.run(static_graph);
+    const auto removed = schedforge::GraphLayoutPlanner{}.run(static_graph, static_dispatches);
+    const auto memory = schedforge::GraphBufferizer{}.run(static_graph, static_dispatches);
+    require(removed == 1, "layout propagation");
+    require(memory.workspace_bytes < memory.naive_bytes && memory.workspace_bytes > 0,
+            "dispatch boundary workspace reuse");
+    require(memory.buffers.size() < static_graph.values().size(), "fused values stay virtual");
+
+    const auto data = schedforge::make_mlp_data(config, 31);
+    schedforge::GraphCompileOptions options;
+    options.max_threads = 2;
+    const auto plan = schedforge::GraphCompiler{}.compile(graph, options, &config, &data);
+    require(plan.dispatches.size() == 2 && plan.llvm_ir.size() == 2 &&
+            plan.llvm_ir.front().find("llvm.fma") != std::string::npos,
+            "graph llvm kernel compilation");
+    require(plan.layout_conversions_removed == 1 &&
+            plan.llvm_compile_milliseconds >= 0.0 && !plan.hardware.empty(),
+            "graph compilation statistics");
+    require(plan.dump().find("shape_guards") != std::string::npos, "executable plan");
+    const auto measured = schedforge::execute_mlp(plan, config, data, 0, 1);
+    require(measured.max_error < 1.0e-3, "mlp runtime correctness");
+    require(!plan.dispatches.front().transforms.operations().empty() &&
+            plan.dispatches.front().intrinsic.has_value(), "transform ir tensorization");
+    const auto replayed = schedforge::TransformProgram::parse(
+        plan.dispatches.front().transforms.dump()).replay();
+    require(replayed.mr == plan.dispatches.front().schedule.mr &&
+            replayed.nr == plan.dispatches.front().schedule.nr,
+            "transform ir replay");
+
+    auto quantized = schedforge::build_transformer_mlp_graph(config);
+    quantized.values()[0].type.dtype = schedforge::DataType::I8;
+    quantized.values()[0].type.quant_scale = 0.03125F;
+    const auto quantized_ops = schedforge::QuantizationPropagationPass{}.run(quantized);
+    require(quantized_ops > 0, "quantization propagation");
+
+    auto attention = schedforge::build_mini_attention_graph(8, 16, true);
+    const auto attention_constraints = schedforge::ShapeInferencePass{}.run(attention);
+    require(attention.operations().size() >= 15 && !attention_constraints.empty(),
+            "mini attention graph");
+
+    schedforge::MeasurementDatabase database;
+    schedforge::Schedule learned_schedule;
+    learned_schedule.mr = 4;
+    learned_schedule.nr = 8;
+    learned_schedule.vector_width = 8;
+    const schedforge::LoopIR learned_loop{{8, 8, 8, true, true}, learned_schedule};
+    const auto simulated = schedforge::simulate(learned_loop);
+    database.add(schedforge::ScheduleMeasurement{
+        {8, 8, 8, true, true}, learned_schedule, simulated, 0.01});
+    database.add(schedforge::ScheduleMeasurement{
+        {16, 16, 16, true, true}, learned_schedule, simulated, 0.03});
+    database.saveCsv("build/test-measurements.csv");
+    const auto loaded = schedforge::MeasurementDatabase::loadCsv("build/test-measurements.csv");
+    schedforge::LearnedCostModel learned;
+    learned.fit(loaded);
+    require(learned.trained() && std::isfinite(learned.predictMilliseconds(
+        {8, 8, 8, true, true}, learned_schedule, simulated)), "learned cost model");
+
+    const auto imported = schedforge::StableHLOImporter{}.importText(
+        "func.func @main(%x: tensor<4x8xf32>, %w: tensor<8x16xf32>, %b: tensor<16xf32>) {\n"
+        "  %0 = stablehlo.dot_general %x, %w : tensor<4x16xf32>\n"
+        "  %1 = stablehlo.add %0, %b : tensor<4x16xf32>\n"
+        "  return %1\n}\n");
+    require(imported.operations().size() >= 6 && imported.returnValue() >= 0,
+            "stablehlo subset importer");
+    bool rejected_unsupported = false;
+    try {
+        schedforge::StableHLOImporter{}.importText(
+            "func.func @main(%x: tensor<4x8xf32>) {\n"
+            "  %0 = stablehlo.sine %x : tensor<4x8xf32>\n"
+            "  return %0\n}\n");
+    } catch (const std::invalid_argument&) {
+        rejected_unsupported = true;
+    }
+    require(rejected_unsupported, "reject unsupported stablehlo operations");
+}
+
 }  // namespace
 
 int main() {
@@ -184,6 +293,7 @@ int main() {
         test_correctness_non_multiple();
         test_simulator_and_search();
         test_compiler_architecture();
+        test_graph_compiler();
         std::cout << "all tests passed\n";
         return 0;
     } catch (const std::exception& error) {

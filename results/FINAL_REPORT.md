@@ -79,12 +79,40 @@ Raw result snapshots:
 
 ## LLVM and Data Types
 
-The existing LLVM ORC JIT result for fused 192³ remains 31.216 GFLOPS. It is a
-separate code-generation path and did not receive the native intrinsic
-micro-kernel rewrite in this increment.
+LLVM ORC now has a generated register-resident MR×NR path for legal static
+shapes. The backend builds vector accumulator PHIs across K, emits vector FMA,
+applies the fused epilogue before final stores, and retains the prior safe
+vector-plus-tail implementation for irregular shapes. Unit tests validate
+correctness, FMA presence, and the absence of vector stack-spill patterns.
 
 BF16 and INT8 paths remain correctness-oriented reference kernels rather than
 ISA-specialized AVX-512 BF16 or VNNI implementations.
+
+## Graph Compiler Validation
+
+SchedForge 0.2 adds a model-to-machine Transformer MLP path. The checked-in
+StableHLO example is canonicalized to 12 Tensor SSA operations and compiled into
+two dispatches: `MatMul + Bias + GELU` and `MatMul + Bias + Residual`.
+
+For the recorded `batch=1, sequence=16, hidden=64, intermediate=128` run:
+
+- imported/canonical operations: 12
+- fused dispatches: 2
+- propagated inter-dispatch layout: `blocked<6x16>`
+- naive intermediate memory: 32,768 bytes
+- planned workspace: 8,192 bytes
+- generated LLVM kernels: 2
+- generated schedule candidates per dispatch: 9,720
+- hardware measurements per dispatch: 2,295
+- LLVM JIT compilation time: recorded in `results/transformer_mlp_compile.txt`
+- native scheduled-loop end-to-end execution: 0.020 ms
+- maximum absolute error: below `1e-3`
+
+The `.sfe` artifact contains Tensor SSA, Structured Compute, Dispatch IR,
+Transform IR, tensor intrinsics, buffer plans, shape guards, and LLVM kernel IR.
+The recorded MLP runtime uses the native scheduled-loop dispatch path selected
+by hardware auto-tuning; LLVM ORC is compiled and validated separately and its
+IR is embedded as an executable-plan artifact.
 
 ## Simulator Boundary
 

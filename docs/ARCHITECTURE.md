@@ -1,62 +1,58 @@
 # SchedForge Architecture
 
-## Separation of Concerns
+SchedForge 0.2 is organized as a model-to-machine CPU AI compiler. The graph,
+kernel, target, and runtime layers have separate IR objects and explicit
+boundaries; the existing MatMul performance path remains the kernel laboratory,
+while Transformer MLP is the end-to-end graph workload.
 
-Tensor IR represents **what** is computed. `Schedule` represents **how** it
-should execute. Loop IR is the concrete scheduled execution plan. Both the
-simulator and code generators consume that same plan, preventing prediction and
-execution from silently referring to different schedules.
+<style>
+.sf-arch{font-family:Inter,ui-sans-serif,system-ui,sans-serif;background:#0b1220;color:#e5edf8;border:1px solid #26334a;border-radius:16px;padding:18px;margin:18px 0}.sf-title{text-align:center;font-size:22px;font-weight:800;margin-bottom:14px}.sf-layer{border-radius:12px;padding:12px;margin:10px 0;border:1px solid}.sf-layer-title{font-weight:800;margin-bottom:9px}.sf-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}.sf-box{background:#111c30;border:1px solid #334766;border-radius:9px;padding:9px;text-align:center;font-size:13px}.sf-box small{display:block;color:#a8b8cf;margin-top:4px}.sf-front{border-color:#4f8cff;background:#101b35}.sf-graph{border-color:#9b7cff;background:#191632}.sf-kernel{border-color:#35c59a;background:#102a29}.sf-target{border-color:#ffae57;background:#302115}.sf-runtime{border-color:#ef6f8f;background:#301621}.sf-arrow{text-align:center;color:#8fa8c9;font-size:20px;font-weight:700}@media(max-width:900px){.sf-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+</style>
+<div class="sf-arch"><div class="sf-title">SchedForge 0.2 — Model-to-Machine CPU AI Compiler</div><div class="sf-layer sf-front"><div class="sf-layer-title">Frontend</div><div class="sf-grid"><div class="sf-box">StableHLO Subset<small>dot_general, add, multiply, maximum, broadcast, reshape, transpose, reduce, exp, rsqrt, convert, Gelu custom_call</small></div><div class="sf-box">Tensor SSA Graph<small>multi-op use-def graph</small></div><div class="sf-box">Shape System<small>static, dynamic, symbolic</small></div><div class="sf-box">Canonicalization<small>MLP/GELU normalization</small></div></div></div><div class="sf-arrow">↓</div><div class="sf-layer sf-graph"><div class="sf-layer-title">Graph Compiler</div><div class="sf-grid"><div class="sf-box">Shape Inference<small>constraints and runtime guards</small></div><div class="sf-box">Fusion Planner<small>legality and profitability</small></div><div class="sf-box">Dispatch IR<small>kernel boundary formation</small></div><div class="sf-box">Layout Planner<small>blocked layout propagation</small></div><div class="sf-box">Bufferization<small>tensor to physical buffers</small></div><div class="sf-box">Memory Planner<small>lifetime and workspace reuse</small></div><div class="sf-box">Quantization Propagation<small>scale, zero-point, axis</small></div><div class="sf-box">ExecutablePlan<small>dispatches, buffers, guards, artifacts</small></div></div></div><div class="sf-arrow">↓</div><div class="sf-layer sf-kernel"><div class="sf-layer-title">Kernel Compiler</div><div class="sf-grid"><div class="sf-box">Structured Compute<small>iteration domain and indexing maps</small></div><div class="sf-box">Transform IR<small>serialize, replay, mutate</small></div><div class="sf-box">AutoScheduler<small>real hardware measurement</small></div><div class="sf-box">Scheduled Loop IR<small>tiling, packing, vectorization</small></div><div class="sf-box">Tensorization<small>AVX2 tensor intrinsic matching</small></div><div class="sf-box">Native Microkernel<small>register-resident MR×NR</small></div><div class="sf-box">Measurement Database<small>hardware labels</small></div><div class="sf-box">Hybrid Cost Model<small>analytical + learned</small></div></div></div><div class="sf-arrow">↓</div><div class="sf-layer sf-target"><div class="sf-layer-title">Target Compiler</div><div class="sf-grid"><div class="sf-box">LLVM Vector IR<small>vector FMA and register PHIs</small></div><div class="sf-box">LLVM O3<small>target-aware optimization</small></div><div class="sf-box">ORC LLJIT<small>process-local kernel cache</small></div><div class="sf-box">x86 Machine Code<small>AVX2/FMA validated</small></div></div></div><div class="sf-arrow">↓</div><div class="sf-layer sf-runtime"><div class="sf-layer-title">SchedForge Runtime</div><div class="sf-grid"><div class="sf-box">Executable Runtime<small>constants, buffers, dispatches</small></div><div class="sf-box">Shape Dispatch<small>guarded specialization</small></div><div class="sf-box">Worker Teams<small>topology-aware CPU affinity</small></div><div class="sf-box">Hardware Feedback<small>latency, perf/PMU, validation</small></div></div></div></div>
 
-## Compiler Pipeline
+## End-to-End Pipeline
 
-1. `IRBuilder` creates SSA Tensor IR with use-def tracking.
-2. Tensor passes infer shapes/layouts and describe fused epilogues.
-3. `TensorToLoopLowering` creates canonical `i-j-k` Loop IR.
-4. Loop passes apply schedule decisions without changing tensor semantics.
-5. The simulator interprets loop/memory behavior for candidate ranking.
-6. Native AVX2 or LLVM ORC lowers the selected plan to executable code.
-7. Runtime validation compares every candidate with the scalar reference.
-8. Hardware measurements and calibration feed back into schedule selection.
+1. `StableHLOImporter` imports the supported StableHLO subset into `TensorGraph`.
+2. `GraphCanonicalizationPass` normalizes framework-level patterns such as the
+   Transformer MLP GELU expansion.
+3. `ShapeInferencePass` propagates tensor shapes and emits runtime constraints.
+4. `FusionPlanner` evaluates use-def legality and materialization profitability,
+   then forms `Dispatch` regions.
+5. `GraphLayoutPlanner` propagates blocked layouts across compatible dispatches.
+6. `GraphBufferizer` materializes only dispatch-boundary tensors and reuses an
+   aligned workspace according to lifetime intervals.
+7. `StructuredComputeLowering` preserves iteration domains, indexing maps, and
+   reduction semantics before loop lowering.
+8. `TransformProgram` records tiling, interchange, register tiling,
+   vectorization, unrolling, packing, parallelization, and tensorization.
+9. Auto-tuning executes all deduplicated legal candidates on hardware and
+   remeasures finalists in randomized rounds.
+10. `TensorizationPass` maps structured contractions to target intrinsics such
+    as `avx2_f32_m4n8`.
+11. LLVM ORC generates register-resident MR×NR vector-FMA kernels for legal
+    static shapes; irregular shapes use the safe vector-plus-tail path.
+12. `ExecutablePlan` serializes graph IR, dispatches, memory plans, guards,
+    Transform IR, tensor intrinsics, and LLVM kernel artifacts into `.sfe`.
 
-## Native Execution Hierarchy
+## Flagship Workloads
 
-```text
-NC/MC/KC outer tiles
-  -> BN/BM/BK cache tiles
-    -> NR/MR register tiles
-      -> AVX2 FP32 vectors
-        -> scalar tails
-```
+- **Kernel benchmark:** fused FP32 MatMul epilogues for schedule and
+  microarchitecture research.
+- **Graph benchmark:** Transformer MLP
+  `Linear → Bias → GELU → Linear → Bias → Residual`, executed end to end.
+- **Next graph path:** mini attention with Q/K/V projections, transpose,
+  score MatMul, exponential/reduction normalization, and value MatMul. The graph
+  abstraction and shape analysis are implemented; optimized softmax/attention
+  execution remains future backend work.
 
-PackB uses NR-oriented panels and PackA uses MR-oriented panels. Packing is an
-explicit schedule decision because the copy cost can exceed its benefit.
+## Claim Boundaries
 
-## LLVM Backend
-
-The LLVM backend constructs a real LLVM `Module` with dynamic `M/N/K`, applies
-LLVM's O3 default pipeline, executes through ORC `LLJIT`, and emits assembly for
-inspection. Explicit `<8 x float>` operations use alignment 1 because runtime
-buffers are not guaranteed to be 32-byte aligned. This produces safe `vmovups`
-loads/stores and AVX2 FMA instructions.
-
-## Hardware Model
-
-The model includes:
-
-- Set-associative L1/L2/L3 caches with LRU replacement
-- DTLB entries and miss penalties
-- Software-prefetch issuance and usefulness
-- Register pressure and spill penalties
-- Packing traffic and compute cost
-- Thread parallelism and calibrated memory bandwidth
-
-It is designed for relative schedule ranking, not cycle-accurate reproduction
-of Intel out-of-order execution.
-
-## Runtime and Dynamic Shapes
-
-Dynamic dimensions are specialized into runtime buckets. Schedule and emitted
-IR artifacts are persisted by problem, target, and schedule key. ORC function
-pointers are cached in process. Thread affinity and NUMA topology detection are
-implemented; multi-node NUMA placement cannot be empirically compared on the
-current single-node workstation.
+- The MLP path is imported, compiled, executed, and validated end to end.
+- LLVM-generated register microkernels are validated for legal static shapes;
+  the native backend remains the highest-throughput path on the current host.
+- Attention, graph quantization propagation, and the learned cost model have
+  concrete APIs and tests but are not yet production-optimized inference paths.
+- StableHLO support is deliberately a subset, not a complete specification
+  implementation.
+- AVX2 is validated on one Intel CPU; AVX-512, NEON, and multi-node NUMA require
+  matching hardware validation.
