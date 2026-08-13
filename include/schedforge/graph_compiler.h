@@ -27,6 +27,14 @@ enum class GraphOpKind {
     Exp,
     Rsqrt,
     Convert,
+    Softmax,
+    TopK,
+    MoeHistogram,
+    MoePrefixSum,
+    MoeDispatch,
+    MoeGroupedMatMul,
+    SwiGLU,
+    MoeCombine,
     Return
 };
 

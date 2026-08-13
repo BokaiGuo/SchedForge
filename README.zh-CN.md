@@ -15,16 +15,19 @@
 
 </div>
 
-SchedForge 是一个使用 C++20 编写的 model-to-machine CPU AI 编译器。它能够
+SchedForge 是一个使用 C++20 编写、同时面向稠密与动态路由稀疏张量程序的
+model-to-machine CPU AI 编译器。它能够
 导入 StableHLO 子集，构建真正的多算子 Tensor SSA Graph，执行 Shape 推导、
 图正规化、融合、Dispatch 形成、Layout 传播、Bufferization 和 Workspace
 复用，再通过 Structured Tensor Compute、Transform IR、Loop IR、Tensorization
 和 LLVM 18 ORC JIT 或原生 AVX2 后端生成并执行 CPU 代码。
 
-当前第二条旗舰路径是 Transformer MLP：
+当前 Graph 级旗舰路径包括 Transformer MLP 与 Top-2 MoE MLP：
 `Linear → Bias → GELU → Linear → Bias → Residual`。MatMul 继续作为 Kernel
 性能基准，MLP 则作为 Graph Compiler 基准，真实覆盖 use-def、融合边界、
 动态 Shape Guard、临时张量、布局、内存生命周期和 Dispatch。
+
+`Router → Softmax → TopK → Segmented Dispatch → Grouped Expert SwiGLU → Weighted Combine`。
 
 ```text
 StableHLO / AI Graph
@@ -43,8 +46,12 @@ StableHLO / AI Graph
 ```mermaid
 flowchart LR
     A["张量计算图"] --> B["SSA Tensor IR"]
-    B --> C["标准 Loop IR"]
-    C --> D["调度描述"]
+    B --> C["Dense Dispatch"]
+    B --> R["MoE Router + TopK"]
+    R --> S["Segmented Tensor + Grouped Expert IR"]
+    S --> P["Routing-aware Strategy Planner"]
+    C --> D["显式 Scheduled LoopIR"]
+    P --> D
     D --> E["多级分块"]
     D --> F["数据打包与微内核"]
     D --> G["向量化、多线程与算子融合"]
@@ -65,6 +72,9 @@ flowchart LR
   `Operation`、嵌套 `Block`、`Module`、`IRBuilder` 和分层 PassManager。
 - **Graph Compiler**：多算子 Tensor SSA、静态/动态/符号维度、Shape Constraint、
   StableHLO 子集导入、图正规化、Fusion Legality/Profitability、Dispatch IR。
+- **MoE Compiler**：显式 Router/TopK/Histogram/Prefix/Dispatch/Combine IR、
+  Segmented Tensor、Variable-M Grouped Expert GEMM、SwiGLU、Token Bucket、
+  Routing Trace 与 Load-aware Expert Task Scheduler。
 - **内存与布局编译**：Layout 进入 Tensor Type；支持跨 Dispatch 布局传播、
   Bufferization、生命周期分析、64 字节对齐 Workspace 复用和 Guarded Specialization。
 - **结构化 Kernel Compiler**：Iteration Domain、并行/归约 Iterator、Indexing Map、
@@ -147,6 +157,16 @@ cmake -S . -B build -G Ninja \
   --target=native-cpu --batch=1 --sequence=16 \
   --hidden=64 --intermediate=128 --threads=4 \
   -o results/transformer_mlp.sfe
+
+# 编译并真实运行动态路由 Top-2 MoE MLP
+./build/schedforge-moe --tokens=128 --hidden=512 --intermediate=2048 \
+  --experts=8 --top-k=2 --threads=8 --router-data \
+  --strategy=auto -o results/moe_mlp.sfe
+
+# 运行 Routing Skew、Grouped Execution 与 Scheduler 对比实验
+./build/schedforge-moe --tokens=64 --hidden=64 --intermediate=128 \
+  --experts=8 --top-k=2 --threads=8 --routing=heavy \
+  --experiment-csv=results/moe_strategy_matrix.csv
 ```
 
 ## 调度描述语言
@@ -189,6 +209,25 @@ vector=8;unroll=4;threads=8;pack=ab;prefetch=4;fuse=true;pin=true
 | `schedforge-study` | 分析数据打包收益和预测误差 |
 | `schedforge-resolution` | 测量调优噪声与候选区分能力 |
 | `schedforge-compile` | 将 StableHLO Graph 编译为 `.sfe` ExecutablePlan |
+| `schedforge-moe` | 编译、模拟、执行并对比 MoE Execution Plan |
+
+## MoE Compiler 实测 Demo
+
+SchedForge 0.4 将 MoE Lower 为 18 个 Tensor SSA Operation 和 11 个
+Routing/Expert Operation。生成的 `.sfe` 包含 Segmented Tensor 元数据、动态
+Token Guard、Execution Strategy IR、按 Token Bucket 专门化的 W1/W3/W2
+LoopIR 与经过 LLVM ORC 编译验证的 Kernel Artifact。
+
+附件指定的完整 FP32 MVP：`T=128, H=512, I=2048, E=8, TopK=2`，已在当前
+Intel Core i5-14600K 上真实运行，P50 延迟 **35.843 ms**、P95 延迟
+**37.789 ms**，验证误差为 0。多行 AVX2 专家微内核会在多个路由 Token 之间
+复用已加载的专家权重向量。这是单机 correctness-first 实现，不宣称已经达到
+生产级 MoE 吞吐。
+
+在仓库记录的完整尺寸实验 `T=128, H=512, I=2048` 中，Heavy Skew 下固定
+Grouped 执行的模拟不均衡度为 2.0；Load-aware splitting 将其降为 0，并把实测
+Grouped P50 从 **26.780 ms** 降至 **20.113 ms**。完整 27 组结果见
+`results/moe_strategy_matrix.csv`。
 
 ## Graph Compiler 实测 Demo
 
@@ -245,12 +284,12 @@ scripts/              性能计数器辅助脚本
 
 - SchedForge 是研究型 CPU AI 编译器原型，不是 oneDNN、XLA、IREE、TVM
   或生产级推理 Runtime 的替代品。
-- Transformer MLP 已端到端执行；Mini Attention、量化传播和 Learned Cost
-  Model 已有编译器抽象与测试，但还不是生产级高性能 Attention/INT8 后端。
+- Transformer MLP 与 FP32 Top-2 MoE MLP 已端到端执行并验证；Mini Attention、
+  量化传播和 Learned Cost Model 已有抽象与测试，但还不是生产级后端。
 - 当前只在真实硬件上验证了 AVX2 后端。AVX-512 和 NEON 目前只有目标抽象，
   不能视为已经完成并验证的机器码后端。
-- 项目已经实现 NUMA 拓扑检测和任务划分，但实验机器只有一个 NUMA 节点，
-  因此不对跨处理器插槽的性能作出结论。
+- MoE 的 P-core/E-core 放置、NUMA-aware 执行、量化 Expert、Block-sparse
+  Lowering 与分布式 Expert Parallelism 尚未实现。
 - 模拟器只提供诊断信息，既不是性能选择裁判，也不会逐周期复现 Intel
   处理器的乱序执行。
 - 性能会受到 CPU 型号、频率策略、编译器版本、输入规模和后台负载影响，
@@ -261,6 +300,7 @@ scripts/              性能计数器辅助脚本
 - [架构说明](docs/ARCHITECTURE.md)
 - [Graph Compiler 与 `.sfe` 格式](docs/GRAPH_COMPILER.md)
 - [显式 Scheduled LoopIR](docs/LOOP_IR.md)
+- [MoE Compiler Pipeline](docs/MOE_COMPILER.md)
 - [实验方法](docs/EXPERIMENT.md)
 - [最终实验报告](results/FINAL_REPORT.md)
 - [架构决策记录](docs/decisions/)

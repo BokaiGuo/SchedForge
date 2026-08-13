@@ -2,6 +2,26 @@
 
 All notable changes to SchedForge are documented here.
 
+## [0.4.0] - 2026-08-13
+
+### Added
+
+- Decomposed FP32 MoE Tensor SSA and Routing IR for Router, Softmax, TopK,
+  Histogram, Prefix Sum, Dispatch, Grouped GEMM, SwiGLU, and Weighted Combine.
+- Segmented Tensor IR for runtime-variable expert batches.
+- Token-bucketed variable-M expert LoopIR and LLVM artifacts.
+- Independent, grouped, and bucketed-grouped execution strategies.
+- Fixed, work-stealing, and load-aware split expert task schedulers.
+- Routing-trace and target-aware automatic execution-strategy selection.
+- Routing-trace simulator and uniform/moderate/heavy skew workloads.
+- `schedforge-moe` compiler/runtime CLI and 27-case strategy experiment matrix.
+
+### Changed
+
+- SchedForge now supports dense and dynamically routed sparse tensor programs.
+- Runtime plans can guard dynamic token counts and specialize LoopIR by expert
+  token bucket without reconstructing Schedule objects.
+
 ## [0.3.0] - 2026-08-13
 
 ### Added

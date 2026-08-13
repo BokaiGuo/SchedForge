@@ -134,6 +134,7 @@ struct LoopIR {
     const std::vector<LoopOperation>& operations() const;
     void appendOperation(LoopOperation operation);
     void insertEpilogueBeforeStores(LoopOperation operation);
+    LoopIR specialize(Problem specialized_problem) const;
     std::string dump() const;
 private:
     std::vector<LoopOperation> operations_;

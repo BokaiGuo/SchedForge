@@ -15,24 +15,32 @@
 
 </div>
 
-SchedForge is a C++20 model-to-machine CPU AI compiler. It imports a practical
+SchedForge is a C++20 model-to-machine CPU AI compiler for dense and dynamically
+routed sparse tensor programs. It imports a practical
 StableHLO subset into a multi-operation Tensor SSA graph, performs shape
 inference, graph canonicalization, fusion, dispatch formation, layout planning,
 bufferization, and workspace reuse, then lowers each dispatch through
 Structured Tensor Compute, Transform IR, scheduled Loop IR, tensorization, and
 LLVM 18 ORC JIT or native AVX2 execution.
 
-The flagship graph workload is a Transformer MLP block:
+The flagship graph workloads are a Transformer MLP block and a Top-2 MoE MLP:
 `Linear → Bias → GELU → Linear → Bias → Residual`. MatMul remains the kernel
 benchmark and hardware auto-tuning laboratory; the MLP is the graph/compiler
 benchmark that exercises real use-def chains, fusion boundaries, dynamic shape
 guards, temporary tensors, layout propagation, memory lifetime, and dispatch.
 
+`Router → Softmax → TopK → Segmented Dispatch → Grouped Expert SwiGLU → Weighted Combine`.
+
 ```mermaid
 flowchart TD
     A["StableHLO / Tensor Graph"] --> B["Tensor SSA + Shape Inference"]
     B --> C["Canonicalization + Fusion Planner"]
-    C --> D["Dispatch IR + Layout Planning"]
+    C --> D["Dense Dispatch IR + Layout Planning"]
+    C --> M1["MoE Router + TopK"]
+    M1 --> M2["Histogram + Prefix Sum + Dispatch"]
+    M2 --> M3["Segmented Tensor + Grouped Expert IR"]
+    M3 --> M4["Routing-Aware Strategy Planner"]
+    M4 --> D
     D --> E["Bufferization + ExecutablePlan"]
     E --> F["Structured Tensor Compute"]
     F --> G["Transform IR + AutoScheduler"]
@@ -50,6 +58,9 @@ flowchart TD
 - **Graph compiler:** multi-op Tensor SSA, symbolic/static/dynamic dimensions,
   shape constraints, StableHLO subset import, canonicalization, fusion legality
   and profitability, Dispatch IR, and Transformer MLP compilation.
+- **MoE compiler:** decomposed Router/TopK/Histogram/Prefix/Dispatch/Combine IR,
+  segmented tensors, variable-M grouped expert GEMM, SwiGLU, token buckets,
+  routing traces, and load-aware expert task scheduling.
 - **Memory and layout compiler:** layout is part of tensor type; graph layout
   propagation, dispatch-boundary materialization, bufferization, lifetime
   analysis, aligned workspace reuse, and guarded shape specialization.
@@ -139,6 +150,16 @@ cmake -S . -B build -G Ninja \
   --target=native-cpu --batch=1 --sequence=16 \
   --hidden=64 --intermediate=128 --threads=4 \
   -o results/transformer_mlp.sfe
+
+# Compile and run a dynamically routed Top-2 MoE MLP
+./build/schedforge-moe --tokens=128 --hidden=512 --intermediate=2048 \
+  --experts=8 --top-k=2 --threads=8 --router-data \
+  --strategy=auto -o results/moe_mlp.sfe
+
+# Run routing-skew, grouped-execution, and scheduler experiments
+./build/schedforge-moe --tokens=64 --hidden=64 --intermediate=128 \
+  --experts=8 --top-k=2 --threads=8 --routing=heavy \
+  --experiment-csv=results/moe_strategy_matrix.csv
 ```
 
 The model compiler reports imported operations, inferred shapes, fused dispatch
@@ -187,6 +208,27 @@ inspectable and verifiable before target lowering.
 | `schedforge-study` | Run packing crossover and prediction studies |
 | `schedforge-resolution` | Measure tuning noise and candidate-resolution limits |
 | `schedforge-compile` | Compile StableHLO graphs into `.sfe` ExecutablePlans |
+| `schedforge-moe` | Compile, simulate, execute, and compare MoE execution plans |
+
+## MoE Compiler Demo
+
+SchedForge 0.4 lowers MoE into 18 Tensor SSA operations and an 11-operation
+Routing/Expert program. The `.sfe` artifact embeds segmented tensor metadata,
+dynamic token guards, execution strategy IR, token-bucketed W1/W3/W2 LoopIR,
+and LLVM ORC-compiled kernel artifacts.
+
+The requested full FP32 MVP, `T=128, H=512, I=2048, E=8, TopK=2`, executes on
+the recorded Intel Core i5-14600K with **35.843 ms P50** and **37.789 ms P95**
+latency with zero observed validation error. The multi-row AVX2 expert
+microkernel reuses each loaded expert-weight vector across multiple routed
+tokens. This is a correctness-first single-host implementation, not a claim of
+production MoE throughput.
+
+For the checked-in full-shape study (`T=128, H=512, I=2048`), heavy routing skew
+raises fixed grouped simulated imbalance to 2.0. Load-aware splitting reduces
+it to 0 and improves grouped P50 latency from **26.780 ms** to **20.113 ms** on
+the recorded run. The complete 27-case matrix is stored in
+`results/moe_strategy_matrix.csv`.
 
 ## Graph Compiler Demo
 
@@ -246,13 +288,13 @@ scripts/               Hardware-counter helpers
 
 - SchedForge is a research compiler prototype, not a replacement for oneDNN,
   XLA, IREE, TVM, or production inference runtimes.
-- The Transformer MLP path is executable end to end. The mini-attention path,
-  quantization propagation, and learned model are implemented compiler
-  abstractions but are not yet production-optimized attention/INT8 backends.
+- The Transformer MLP and FP32 Top-2 MoE MLP paths execute and validate end to
+  end. Mini-attention, quantization propagation, and the learned model are
+  implemented abstractions but are not production-optimized backends.
 - AVX2 is the physically validated SIMD backend. AVX-512 and NEON are target
   abstractions but are not validated code-generation backends in this release.
-- NUMA-aware partitioning is implemented, but experiments were run on one NUMA
-  node; cross-socket claims are intentionally excluded.
+- MoE P-core/E-core placement, NUMA-aware execution, quantized experts,
+  block-sparse lowering, and distributed expert parallelism are not implemented.
 - The simulator is a diagnostic model, not a performance-selection oracle or a
   cycle-accurate Intel out-of-order simulator.
 - Performance numbers depend on CPU, frequency policy, compiler, workload, and
@@ -263,6 +305,7 @@ scripts/               Hardware-counter helpers
 - [Architecture](docs/ARCHITECTURE.md)
 - [Graph compiler and `.sfe` format](docs/GRAPH_COMPILER.md)
 - [Explicit Scheduled LoopIR](docs/LOOP_IR.md)
+- [MoE compiler pipeline](docs/MOE_COMPILER.md)
 - [Experiment design](docs/EXPERIMENT.md)
 - [Final experiment report](results/FINAL_REPORT.md)
 - [Architecture decisions](docs/decisions/)

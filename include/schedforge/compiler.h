@@ -12,7 +12,7 @@ namespace schedforge {
 
 class Compiler;
 
-enum class DataType { F32, BF16, I8 };
+enum class DataType { F32, BF16, I8, I32 };
 enum class Layout { RowMajor, ColumnMajor, PackedA, PackedB };
 
 struct TensorSpec {

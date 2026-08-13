@@ -398,6 +398,7 @@ const TargetInfo& Compiler::target() const { return target_; }
 std::string data_type_name(DataType dtype) {
     if (dtype == DataType::BF16) return "bf16";
     if (dtype == DataType::I8) return "i8";
+    if (dtype == DataType::I32) return "i32";
     return "f32";
 }
 std::string layout_name(Layout layout) {

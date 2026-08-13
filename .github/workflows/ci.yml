@@ -57,3 +57,15 @@ jobs:
           grep -q "scheduled_loop @dispatch_0" build/transformer_mlp.sfe
           grep -q "epilogue.gelu" build/transformer_mlp.sfe
           grep -q "epilogue.add_residual" build/transformer_mlp.sfe
+
+      - name: Smoke test MoE compiler and runtime
+        run: |
+          ./build/schedforge-moe \
+            --tokens=16 --hidden=16 --intermediate=32 \
+            --experts=4 --top-k=2 --threads=2 \
+            --routing=heavy --strategy=auto \
+            --repetitions=2 -o build/moe_mlp.sfe
+          grep -q "moe.histogram" build/moe_mlp.sfe
+          grep -q "!sfg.segmented_tensor" build/moe_mlp.sfe
+          grep -q "moe.schedule" build/moe_mlp.sfe
+          grep -q "vector.fma" build/moe_mlp.sfe

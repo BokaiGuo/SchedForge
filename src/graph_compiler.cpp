@@ -29,6 +29,14 @@ std::string op_name(GraphOpKind kind) {
         case GraphOpKind::Exp: return "tensor.exp";
         case GraphOpKind::Rsqrt: return "tensor.rsqrt";
         case GraphOpKind::Convert: return "tensor.convert";
+        case GraphOpKind::Softmax: return "tensor.softmax";
+        case GraphOpKind::TopK: return "tensor.topk";
+        case GraphOpKind::MoeHistogram: return "moe.histogram";
+        case GraphOpKind::MoePrefixSum: return "moe.prefix_sum";
+        case GraphOpKind::MoeDispatch: return "moe.dispatch";
+        case GraphOpKind::MoeGroupedMatMul: return "moe.grouped_matmul";
+        case GraphOpKind::SwiGLU: return "tensor.swiglu";
+        case GraphOpKind::MoeCombine: return "moe.combine";
         case GraphOpKind::Return: return "func.return";
     }
     return "tensor.unknown";
@@ -206,7 +214,8 @@ std::vector<ShapeConstraint> ShapeInferencePass::run(TensorGraph& graph) const {
             output = lhs.shape.size() >= rhs.shape.size() ? lhs : rhs;
         } else if (operation.kind == GraphOpKind::Gelu || operation.kind == GraphOpKind::Exp ||
                    operation.kind == GraphOpKind::Rsqrt || operation.kind == GraphOpKind::Convert ||
-                   operation.kind == GraphOpKind::Broadcast) {
+                   operation.kind == GraphOpKind::Broadcast || operation.kind == GraphOpKind::Softmax ||
+                   operation.kind == GraphOpKind::SwiGLU || operation.kind == GraphOpKind::MoeCombine) {
             if (output.shape.empty())
                 output = graph.values().at(static_cast<std::size_t>(operation.inputs[0])).type;
         }
@@ -306,10 +315,18 @@ std::vector<StructuredCompute> StructuredComputeLowering::run(const TensorGraph&
             computes.push_back({operation.name, {"i", "j", "k"},
                 {IteratorKind::Parallel, IteratorKind::Parallel, IteratorKind::Reduction},
                 {"A(i,k)", "B(k,j)", "C(i,j)"}, "C(i,j) += A(i,k) * B(k,j)"});
-        } else if (operation.kind == GraphOpKind::Add || operation.kind == GraphOpKind::Gelu) {
+        } else if (operation.kind == GraphOpKind::Add || operation.kind == GraphOpKind::Gelu ||
+                   operation.kind == GraphOpKind::Softmax || operation.kind == GraphOpKind::SwiGLU ||
+                   operation.kind == GraphOpKind::MoeCombine) {
             computes.push_back({operation.name, {"i", "j"},
                 {IteratorKind::Parallel, IteratorKind::Parallel},
                 {"input(i,j)", "output(i,j)"}, op_name(operation.kind)});
+        } else if (operation.kind == GraphOpKind::MoeGroupedMatMul) {
+            computes.push_back({operation.name, {"e", "i", "j", "k"},
+                {IteratorKind::Parallel, IteratorKind::Parallel,
+                 IteratorKind::Parallel, IteratorKind::Reduction},
+                {"X(offset[e]+i,k)", "W(e,k,j)", "Y(offset[e]+i,j)"},
+                "Y_e(i,j) += X_e(i,k) * W_e(k,j)"});
         }
     }
     return computes;

@@ -97,7 +97,7 @@ ISA-specialized AVX-512 BF16 or VNNI implementations.
 
 ## Graph Compiler Validation
 
-SchedForge 0.3 adds an explicit executable-IR backbone to the model-to-machine
+SchedForge 0.4 retains the explicit executable-IR backbone for the model-to-machine
 Transformer MLP path. The checked-in
 StableHLO example is canonicalized to 12 Tensor SSA operations and compiled into
 two dispatches: `MatMul + Bias + GELU` and `MatMul + Bias + Residual`.
@@ -124,6 +124,38 @@ The recorded MLP runtime uses the native scheduled-loop dispatch path selected
 by hardware auto-tuning; LLVM ORC is compiled and validated separately and its
 IR is embedded as an executable-plan artifact.
 
+## MoE Compiler Validation
+
+SchedForge 0.4 adds a single-host FP32 Top-2 MoE MLP compiler/runtime path. MoE
+is decomposed into Router MatMul, Softmax, TopK, Histogram, Prefix Sum, stable
+token dispatch, Segmented Tensor IR, variable-M grouped W1/W3 GEMM, SwiGLU,
+variable-M W2 GEMM, and weighted combine.
+
+The requested full MVP configuration, `T=128, H=512, I=2048, E=8, TopK=2`,
+ran on the recorded Intel Core i5-14600K with:
+
+- Tensor SSA operations: 18
+- MoE Routing/Expert IR operations: 11
+- routed assignments: 256
+- compiled token buckets: `M <= 4`, `M <= 16`, `M <= 64`, `M <= 128`
+- P50 end-to-end execution: **35.843 ms**
+- P95 end-to-end execution: **37.789 ms**
+- maximum absolute error: **0.000** at printed precision
+
+The checked-in 27-case full-shape experiment covers three routing
+distributions, three expert execution strategies, and three task schedulers.
+For `T=128, H=512, I=2048` under heavy skew:
+
+- fixed grouped simulated imbalance: 2.0
+- load-aware split simulated imbalance: 0.0
+- fixed grouped P50: 26.780 ms
+- load-aware grouped P50: 20.113 ms
+
+This is a host-specific systems result, not a universal speedup claim. The full
+matrix is stored in `results/moe_strategy_matrix.csv`; the executable artifact
+and representative run are `results/moe_mlp.sfe` and
+`results/moe_mlp_run.txt`.
+
 ## Simulator Boundary
 
 The simulator now consumes explicit LoopIR and traverses the full problem by
@@ -146,5 +178,7 @@ only selection and are preserved in `results/top_resolution_*`.
 - SchedForge is a compiler prototype, not a replacement for BLIS or oneDNN.
 - AVX2 is validated; AVX-512 and NEON remain target abstractions on this host.
 - The machine has one NUMA node, so cross-node performance is not validated.
+- MoE quantization, heterogeneous-core placement, NUMA scheduling, block-sparse
+  lowering, and distributed expert parallelism are outside this release.
 - Full fresh tuning is deliberately expensive because every deduplicated candidate
   is executed on hardware; cached runs are much faster and are labeled as cache hits.

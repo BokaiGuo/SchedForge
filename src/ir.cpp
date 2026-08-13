@@ -137,6 +137,13 @@ void LoopIR::insertEpilogueBeforeStores(LoopOperation operation) {
     execution_plan_.reset();
 }
 
+LoopIR LoopIR::specialize(Problem specialized_problem) const {
+    LoopIR specialized = *this;
+    specialized.problem = specialized_problem;
+    specialized.execution_plan_.reset();
+    return specialized;
+}
+
 LoopIR::LoopIR(Problem input_problem, const Schedule& schedule) {
     *this = apply_schedule(input_problem, schedule);
 }

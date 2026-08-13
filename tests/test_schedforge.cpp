@@ -2,10 +2,13 @@
 #include "schedforge/ir.h"
 #include "schedforge/compiler.h"
 #include "schedforge/graph_compiler.h"
+#include "schedforge/moe_compiler.h"
 
+#include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <iostream>
+#include <numeric>
 #include <stdexcept>
 
 namespace {
@@ -337,6 +340,78 @@ void test_graph_compiler() {
     require(rejected_unsupported, "reject unsupported stablehlo operations");
 }
 
+void test_moe_compiler() {
+    const schedforge::MoeConfig config{7, 8, 12, 4, 2};
+    const auto graph = schedforge::build_moe_mlp_graph(config, true);
+    require(graph.operations().size() >= 17 &&
+            graph.dump().find("moe.grouped_matmul") != std::string::npos &&
+            graph.dump().find("moe.combine") != std::string::npos,
+            "moe tensor graph decomposition");
+    const auto program = schedforge::lower_moe_program(config);
+    require(program.operations.size() == 11 &&
+            program.dump().find("moe.histogram") != std::string::npos &&
+            program.dump().find("tensor.swiglu") != std::string::npos,
+            "moe routing program lowering");
+
+    const auto data = schedforge::make_moe_data(config, 41);
+    const auto routing = schedforge::route_topk(config, data);
+    require(std::accumulate(routing.counts.begin(), routing.counts.end(), 0) ==
+                config.tokens * config.top_k,
+            "top-k routing assignment count");
+    for (int token = 0; token < config.tokens; ++token) {
+        float weight_sum = 0.0F;
+        for (int slot = 0; slot < config.top_k; ++slot)
+            weight_sum += routing.expert_weights[
+                static_cast<std::size_t>(token) * config.top_k + slot];
+        require(std::abs(weight_sum - 1.0F) < 1.0e-5F, "top-k normalized weights");
+    }
+    const auto segmented = schedforge::dispatch_tokens(config, data, routing);
+    require(segmented.offsets.size() == static_cast<std::size_t>(config.experts + 1) &&
+            segmented.offsets.back() == config.tokens * config.top_k &&
+            segmented.values.size() == static_cast<std::size_t>(config.tokens * config.top_k * config.hidden),
+            "segmented token dispatch");
+
+    schedforge::MoeExecutionSchedule schedule;
+    schedule.threads = 3;
+    schedule.split_threshold = 2;
+    schedule.token_buckets = {2, 4, 8};
+    const auto tasks = schedforge::plan_moe_tasks(routing, schedule);
+    require(tasks.size() >= static_cast<std::size_t>(config.experts) &&
+            std::all_of(tasks.begin(), tasks.end(), [](const auto& task) {
+                return task.end > task.begin && task.end - task.begin <= 2;
+            }), "load-aware expert splitting");
+
+    const auto uniform = schedforge::make_routing_trace(
+        {64, 8, 16, 8, 2}, schedforge::RoutingDistribution::Uniform, 5);
+    const auto skewed = schedforge::make_routing_trace(
+        {64, 8, 16, 8, 2}, schedforge::RoutingDistribution::HeavySkew, 5);
+    const auto uniform_simulation = schedforge::simulate_moe(
+        {64, 8, 16, 8, 2}, uniform, schedule);
+    const auto skewed_simulation = schedforge::simulate_moe(
+        {64, 8, 16, 8, 2}, skewed, schedule);
+    require(skewed_simulation.expert_counts.front() > uniform_simulation.expert_counts.front() &&
+            skewed_simulation.dispatch_bytes > 0.0 && skewed_simulation.weight_bytes > 0.0,
+            "routing skew simulation");
+    const auto selected = schedforge::select_moe_schedule(
+        {64, 8, 16, 8, 2}, skewed, schedforge::TargetInfo::detect(), 4);
+    require(selected.threads == 4 &&
+            selected.strategy != schedforge::MoeExecutionStrategy::IndependentExperts,
+            "routing-aware moe strategy selection");
+
+    const auto plan = schedforge::MoeCompiler{}.compile(config, schedule);
+    require(plan.kernels.size() == 3 &&
+            plan.dump().find("!sfg.segmented_tensor") != std::string::npos &&
+            plan.dump().find("moe.schedule") != std::string::npos &&
+            plan.dump().find("T <= 7") != std::string::npos &&
+            plan.memory.workspace_bytes < plan.memory.naive_bytes,
+            "moe executable plan");
+    const auto measured = schedforge::execute_moe(plan, data, routing, 0, 1);
+    require(measured.max_error < 1.0e-3 &&
+            measured.p95_milliseconds >= measured.p50_milliseconds &&
+            measured.output.size() == static_cast<std::size_t>(config.tokens * config.hidden),
+            "moe end-to-end execution");
+}
+
 }  // namespace
 
 int main() {
@@ -347,6 +422,7 @@ int main() {
         test_simulator_and_search();
         test_compiler_architecture();
         test_graph_compiler();
+        test_moe_compiler();
         std::cout << "all tests passed\n";
         return 0;
     } catch (const std::exception& error) {

@@ -1,0 +1,40 @@
+[MoE Graph]
+operations: 18
+program operations: 11
+segmented type: !sfg.segmented_tensor<values=tensor<?x512xf32>, segments=8>
+
+[Routing]
+mode: router-data
+routing.trace tokens=128 experts=8 top_k=2 counts=[29,29,33,24,35,45,32,29]
+
+[Execution Strategy]
+moe.schedule {
+  strategy grouped
+  task_scheduling load-aware-split
+  bucket_m [4,16,64,128]
+  split_threshold 16
+  threads 8
+  router.fuse_topk true
+  dispatch.histogram_prefix true
+  combine.fuse_weight true
+}
+
+[Memory]
+moe.memory naive=7605284 workspace=5508132 routing=3108 segmented=524288
+
+[Simulation]
+moe.simulation tasks=19 imbalance=0.15625 utilization=0.864865 dispatch_bytes=527360 weight_bytes=1.00663e+08 counts=[29,29,33,24,35,45,32,29]
+
+[Runtime]
+P50 execution: 35.843 ms
+P95 execution: 37.789 ms
+dispatch: 0.054 ms
+experts: 35.114 ms
+combine: 0.066 ms
+worker imbalance: 0.244
+
+[Validation]
+max error: 0.000
+
+[Hardware]
+x86_64 AVX2 vector=8 registers=16 cpus=20
