@@ -10,6 +10,6 @@
 - [x] Run v0.10 hardware studies
   - Acceptance: checked-in raw results preserve measured gaps or gains without extrapolation.
   - Verify: CSV rows have nonzero latency and validation error below threshold.
-- [ ] Complete v0.10 release validation
+- [x] Complete v0.10 release validation
   - Acceptance: Release, ASan/UBSan, install, CI, commit, and push pass.
   - Verify: clean git status and green GitHub Actions.
