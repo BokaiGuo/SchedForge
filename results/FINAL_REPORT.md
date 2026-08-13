@@ -144,6 +144,32 @@ The recorded MLP runtime uses the native scheduled-loop dispatch path selected
 by hardware auto-tuning; LLVM ORC is compiled and validated separately and its
 IR is embedded as an executable-plan artifact.
 
+## Full Decoder Layer Validation
+
+SchedForge 0.7 validates a complete Llama/Mistral-style Decoder Layer rather
+than invoking Attention, Dense MLP, and MoE as disconnected demos. One
+StableHLO file is imported, structural QKV/Gate-Up/RoPE patterns are recognized,
+one `DecoderExecutablePlan` is serialized, and one runtime call evaluates the
+full residual graph.
+
+The checked-in Dense and MoE integration runs use
+`B=1, S=4, H=16, I=32, Hq=4, Hkv=2, D=4` on the recorded Intel Core i5-14600K:
+
+- imported StableHLO operations: 25 Dense, 21 MoE
+- compile-time packed QKV constant: 2,048 bytes
+- compile-time packed Dense Gate-Up constant: 4,096 bytes
+- Dense naive activation bytes / planned workspace: 4,096 / 1,536
+- MoE naive activation bytes / planned workspace: 7,028 / 3,444
+- Dense end-to-end execution: **0.025 ms**
+- MoE end-to-end execution: **0.099 ms**
+- maximum printed end-to-end error: **0.000** for both branches
+
+These are real executions, not simulator estimates. They are intentionally
+small CI/integration shapes and therefore are not production-model throughput
+claims. The raw console records and plans are `results/decoder_dense_run.txt`,
+`results/decoder_dense.sfe`, `results/decoder_moe_run.txt`, and
+`results/decoder_moe.sfe`.
+
 ## MoE Compiler Validation
 
 SchedForge 0.4 adds a single-host FP32 Top-2 MoE MLP compiler/runtime path. MoE
@@ -238,5 +264,8 @@ only selection and are preserved in `results/top_resolution_*`.
 - Attention is a CPU cache-hierarchy Flash-style lowering, not GPU
   FlashAttention-2. Paged KV, reduced-precision attention, backward/dropout,
   distributed attention, and one fused LLVM attention function are outside this release.
+- Decoder Layer execution is FP32. Compile-time weight concatenation is
+  implemented, while portable AOT object caching and true BF16/INT8 Decoder
+  kernels remain outside v0.7.
 - Full fresh tuning is deliberately expensive because every deduplicated candidate
   is executed on hardware; cached runs are much faster and are labeled as cache hits.

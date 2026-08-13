@@ -82,3 +82,20 @@ jobs:
           grep -q "tile.pipeline @attention" build/attention.sfe
           grep -q "attention.online_softmax" build/attention.sfe
           grep -q "llvm.fma" build/attention.sfe
+
+      - name: Smoke test full decoder layer compiler
+        run: |
+          ./build/schedforge-decoder examples/decoder_layer.mlir \
+            --batch=1 --sequence=4 --hidden=16 --intermediate=32 \
+            --q-heads=4 --kv-heads=2 --head-dim=4 --threads=2 \
+            --repetitions=1 -o build/decoder.sfe
+          grep -q "tensor.fused_qkv" build/decoder.sfe
+          grep -q "tensor.fused_gate_up" build/decoder.sfe
+          grep -q "attention.online_softmax" build/decoder.sfe
+          grep -q "constant @packed_qkv_weight" build/decoder.sfe
+          ./build/schedforge-decoder examples/decoder_layer_moe.mlir --moe \
+            --batch=1 --sequence=4 --hidden=16 --intermediate=32 \
+            --q-heads=4 --kv-heads=2 --head-dim=4 \
+            --experts=4 --top-k=2 --threads=2 --repetitions=1 \
+            -o build/decoder_moe.sfe
+          grep -q "moe.combine" build/decoder_moe.sfe

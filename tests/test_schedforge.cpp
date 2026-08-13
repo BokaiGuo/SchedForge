@@ -4,6 +4,7 @@
 #include "schedforge/graph_compiler.h"
 #include "schedforge/moe_compiler.h"
 #include "schedforge/attention_compiler.h"
+#include "schedforge/decoder_compiler.h"
 
 #include <algorithm>
 #include <cmath>
@@ -614,6 +615,59 @@ void test_attention_compiler() {
     require(mqa_result.max_error < 1.0e-4, "mqa attention execution");
 }
 
+void test_decoder_compiler() {
+    const schedforge::DecoderConfig dense_config{
+        1, 4, 16, 32, 4, 2, 4, 1.0e-5F, 10000.0F, true,
+        schedforge::DecoderFFNKind::Dense, 4, 2};
+    const auto imported = schedforge::StableHLOImporter{}.importFile(
+        std::filesystem::path(SCHEDFORGE_SOURCE_DIR) / "examples/decoder_layer.mlir");
+    require(imported.operations().size() >= 20 &&
+            imported.dump().find("tensor.rms_norm") != std::string::npos &&
+            imported.dump().find("tensor.rope") != std::string::npos,
+            "decoder StableHLO import");
+    const auto dense_data = schedforge::make_decoder_data(dense_config, 81);
+    schedforge::DecoderCompileOptions options;
+    options.max_threads = 2;
+    const auto dense_plan = schedforge::DecoderCompiler{}.compile(
+        imported, dense_config, dense_data, options);
+    require(dense_plan.fusion.fused_qkv && dense_plan.fusion.fused_gate_up &&
+            dense_plan.fusion.fused_rope && dense_plan.constants.size() == 2 &&
+            dense_plan.llvm_ir.size() == 4 &&
+            dense_plan.dump().find("tensor.fused_qkv") != std::string::npos &&
+            dense_plan.dump().find("tensor.fused_gate_up") != std::string::npos &&
+            dense_plan.dump().find("attention.online_softmax") != std::string::npos,
+            "dense decoder compilation");
+    const auto dense_result = schedforge::execute_decoder_layer(
+        dense_plan, dense_data, 0, 1);
+    require(dense_result.max_error < 1.0e-3 &&
+            dense_result.output.size() == dense_data.input.size(),
+            "dense decoder execution");
+
+    auto moe_config = dense_config;
+    moe_config.ffn = schedforge::DecoderFFNKind::MoE;
+    const auto moe_data = schedforge::make_decoder_data(moe_config, 83);
+    const auto moe_plan = schedforge::DecoderCompiler{}.compile(
+        imported, moe_config, moe_data, options);
+    require(moe_plan.moe.has_value() && moe_plan.constants.size() == 1 &&
+            moe_plan.dump().find("moe.histogram") != std::string::npos,
+            "moe decoder compilation");
+    const auto moe_result = schedforge::execute_decoder_layer(
+        moe_plan, moe_data, 0, 1);
+    require(moe_result.max_error < 1.0e-3 &&
+            moe_result.output.size() == moe_data.input.size(),
+            "moe decoder execution");
+
+    const auto imported_moe = schedforge::StableHLOImporter{}.importFile(
+        std::filesystem::path(SCHEDFORGE_SOURCE_DIR) / "examples/decoder_layer_moe.mlir");
+    require(imported_moe.dump().find("moe.combine") != std::string::npos,
+            "decoder MoE StableHLO import");
+    const auto explicit_moe_plan = schedforge::DecoderCompiler{}.compile(
+        imported_moe, moe_config, moe_data, options);
+    require(schedforge::execute_decoder_layer(
+                explicit_moe_plan, moe_data, 0, 1).max_error < 1.0e-3,
+            "explicit decoder MoE graph execution");
+}
+
 }  // namespace
 
 int main() {
@@ -626,6 +680,7 @@ int main() {
         test_graph_compiler();
         test_moe_compiler();
         test_attention_compiler();
+        test_decoder_compiler();
         std::cout << "all tests passed\n";
         return 0;
     } catch (const std::exception& error) {

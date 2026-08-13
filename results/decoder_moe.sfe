@@ -1,0 +1,2346 @@
+sfe.decoder_executable version=0.7.0 ffn=moe hardware="x86_64 AVX2 vector=8 registers=16 cpus=20" {
+imported {
+graph @model {
+  %v0 = tensor.input : tensor<4x16xf32, layout=row_major>
+  %v1 = tensor.input : tensor<16xf32, layout=row_major>
+  %v2 = tensor.input : tensor<16x16xf32, layout=row_major>
+  %v3 = tensor.input : tensor<16x8xf32, layout=row_major>
+  %v4 = tensor.input : tensor<16x8xf32, layout=row_major>
+  %v5 = tensor.input : tensor<16x16xf32, layout=row_major>
+  %v6 = tensor.input : tensor<16xf32, layout=row_major>
+  %v7 = tensor.input : tensor<16x4xf32, layout=row_major>
+  %v8 = tensor.rms_norm %v0 %v1 : tensor<4x16xf32, layout=row_major>
+  %v9 = tensor.matmul %v8 %v2 : tensor<4x16xf32, layout=row_major>
+  %v10 = tensor.matmul %v8 %v3 : tensor<4x8xf32, layout=row_major>
+  %v11 = tensor.matmul %v8 %v4 : tensor<4x8xf32, layout=row_major>
+  %v12 = tensor.rope %v9 : tensor<4x16xf32, layout=row_major>
+  %v13 = tensor.rope %v10 : tensor<4x8xf32, layout=row_major>
+  %v14 = tensor.matmul %v12 %v5 : tensor<4x16xf32, layout=row_major>
+  %v15 = tensor.add %v14 %v0 : tensor<4x16xf32, layout=row_major>
+  %v16 = tensor.rms_norm %v15 %v6 : tensor<4x16xf32, layout=row_major>
+  %v17 = tensor.matmul %v16 %v7 : tensor<4x4xf32, layout=row_major>
+  %v18 = moe.combine %v16 %v17 : tensor<4x16xf32, layout=row_major>
+  %v19 = tensor.add %v18 %v15 : tensor<4x16xf32, layout=row_major>
+  func.return %v19
+}
+}
+canonical {
+graph @model {
+  %v0 = tensor.input : tensor<4x16xf32, layout=row_major>
+  %v1 = tensor.constant : tensor<16xf32, layout=row_major>
+  %v2 = tensor.rms_norm %v0 %v1 : tensor<4x16xf32, layout=row_major>
+  %v3 = tensor.constant : tensor<16x32xf32, layout=row_major>
+  %v4 = tensor.fused_qkv %v2 %v3 : tensor<4x32xf32, layout=row_major>
+  %v5 = tensor.split %v4 : tensor<1x4x4x4xf32, layout=row_major>
+  %v6 = tensor.split %v4 : tensor<1x2x4x4xf32, layout=row_major>
+  %v7 = tensor.split %v4 : tensor<1x2x4x4xf32, layout=row_major>
+  %v8 = tensor.rope %v5 : tensor<1x4x4x4xf32, layout=row_major>
+  %v9 = tensor.rope %v6 : tensor<1x2x4x4xf32, layout=row_major>
+  %v10 = attention.sdpa %v8 %v9 %v7 : tensor<1x4x4x4xf32, layout=row_major>
+  %v11 = tensor.concat %v10 : tensor<4x16xf32, layout=row_major>
+  %v12 = tensor.constant : tensor<16x16xf32, layout=row_major>
+  %v13 = tensor.matmul %v11 %v12 : tensor<4x16xf32, layout=row_major>
+  %v14 = tensor.add %v13 %v0 : tensor<4x16xf32, layout=row_major>
+  %v15 = tensor.constant : tensor<16xf32, layout=row_major>
+  %v16 = tensor.rms_norm %v14 %v15 : tensor<4x16xf32, layout=row_major>
+  %v17 = tensor.constant : tensor<16x4xf32, layout=row_major>
+  %v18 = tensor.matmul %v16 %v17 : tensor<4x4xf32, layout=row_major>
+  %v19 = tensor.topk %v18 : tensor<f32, layout=row_major>
+  %v20 = moe.dispatch %v16 %v19 : tensor<f32, layout=row_major>
+  %v21 = moe.grouped_matmul %v20 : tensor<f32, layout=row_major>
+  %v22 = moe.combine %v21 %v19 : tensor<4x16xf32, layout=row_major>
+  %v23 = tensor.add %v22 %v14 : tensor<4x16xf32, layout=row_major>
+  func.return %v23
+}
+}
+decoder.fusion qkv=1 gate_up=0 rope=1
+constants {
+  constant @packed_qkv_weight logical=[16,16,8,8] packed=[16,32] layout=qkv_interleaved_nr bytes=2048
+}
+decoder.memory naive=7028 workspace=3444
+kernels {
+  qkv {
+func @matmul(%A, %B, %bias, %C) {
+  scf.parallel %ii = 0 to M step 16 threads=2 pinned=1 {
+    scf.for %jj = 0 to N step 64 {
+      scf.for %i = 0 to min(ii+16,M) step 4 {
+        scf.for %j = 0 to min(jj+64,N) step 8 {
+          %acc = vector.accumulator.init : vector<8xf32>
+          scf.for %kk = 0 to K step 32 {
+            scf.for %k = 0 to min(kk+32,K) step 1 {
+              %a = memref.load %A[%i,%k]
+              %b = vector.load %B[%k,%j] : vector<8xf32>
+              %a_vec = vector.broadcast %a : vector<8xf32>
+              %acc = vector.fma %a_vec,%b,%acc : vector<8xf32>
+            }
+          }
+          vector.store %acc -> %C[%i,%j] : vector<8xf32>
+        }
+      }
+    }
+  }
+}
+  }
+  attention {
+sfe.attention_executable version=0.5.0 strategy=materialized
+hardware=x86_64 AVX2 vector=8 registers=16 cpus=20
+config B=1 Hq=4 Hkv=2 Sq<=4 Sk<=4 D=4 Dv=4 causal=true
+graph @model {
+  %v0 = tensor.input : tensor<1x4xSqx4xf32, layout=row_major>
+  %v1 = tensor.input : tensor<1x2xSkx4xf32, layout=row_major>
+  %v2 = tensor.input : tensor<1x2xSkx4xf32, layout=row_major>
+  %v3 = attention.sdpa %v0 %v1 %v2 {causal=true, semantic=scaled_dot_product_attention} : tensor<1x4xSqx4xf32, layout=row_major>
+  func.return %v3
+}
+attention.schedule {
+  qtile 4
+  kvtile 4
+  qk_micro 4x8
+  pv_micro 4x8
+  softmax_vector 8
+  pack_k true
+  pack_v false
+  prefetch_k 2
+  prefetch_v 2
+  threads 2
+}
+tile.pipeline @attention {
+  %scores = attention.qk %Q_tile, %K_tile
+  %scaled = attention.scale %scores
+  %masked = attention.causal_mask %scaled
+  %row_max = reduce.max %masked
+  %new_max = vector.max %running_max, %row_max
+  %probability = vector.exp %masked - %new_max
+  %block_sum = reduce.sum %probability
+  %rescaled = attention.rescale %running_state, %new_max
+  %online = attention.online_softmax %probability, %block_sum
+  %output = attention.pv %probability, %V_tile
+  %normalized = vector.div %output, %denominator
+  tile.yield %output
+}
+guards {
+  0 < Sq
+  Sq <= 4
+  0 < Sk
+  Sk <= 4
+  Hq % Hkv == 0
+}
+attention.memory temporary=512 score=256 probability=256 online_state=0
+attention.simulation flops=640 bytes_read=1024 bytes_written=768 arithmetic_intensity=0.357143 temporary=512 qk_tiles=4 skipped_causal_tiles=0 score_evaluations=40 exp_evaluations=56 reduction_operations=80 l2_traffic=2304 llc_traffic=1792 l2_hit_rate=0.222222 llc_hit_rate=0
+qk_loop {
+func @matmul(%A, %B, %bias, %C) {
+  %packed_b = buffer.alloc -> %packedB
+  buffer.pack %B -> %packedB
+  scf.for %ii = 0 to M step 4 {
+    scf.for %jj = 0 to N step 4 {
+      scf.for %i = 0 to min(ii+4,M) step 4 {
+        scf.for %j = 0 to min(jj+4,N) step 8 {
+          %acc = vector.accumulator.init : vector<8xf32>
+          scf.for %kk = 0 to K step 4 {
+            scf.for %k = 0 to min(kk+4,K) step 1 {
+              memref.prefetch %packedB[%k,%j] distance=2
+              %a = memref.load %A[%i,%k]
+              %b = vector.load %packedB[%k,%j] : vector<8xf32>
+              %a_vec = vector.broadcast %a : vector<8xf32>
+              %acc = vector.fma %a_vec,%b,%acc : vector<8xf32>
+            }
+          }
+          vector.store %acc -> %C[%i,%j] : vector<8xf32>
+        }
+      }
+    }
+  }
+}
+}
+pv_loop {
+func @matmul(%A, %B, %bias, %C) {
+  scf.for %ii = 0 to M step 4 {
+    scf.for %jj = 0 to N step 4 {
+      scf.for %i = 0 to min(ii+4,M) step 4 {
+        scf.for %j = 0 to min(jj+4,N) step 8 {
+          %acc = vector.accumulator.init : vector<8xf32>
+          scf.for %kk = 0 to K step 4 {
+            scf.for %k = 0 to min(kk+4,K) step 1 {
+              memref.prefetch %B[%k,%j] distance=2
+              %a = memref.load %A[%i,%k]
+              %b = vector.load %B[%k,%j] : vector<8xf32>
+              %a_vec = vector.broadcast %a : vector<8xf32>
+              %acc = vector.fma %a_vec,%b,%acc : vector<8xf32>
+            }
+          }
+          vector.store %acc -> %C[%i,%j] : vector<8xf32>
+        }
+      }
+    }
+  }
+}
+}
+llvm.qk {
+; ModuleID = 'schedforge_jit'
+source_filename = "schedforge_jit"
+
+; Function Attrs: nofree norecurse nosync nounwind memory(argmem: readwrite)
+define void @schedforge_matmul(ptr nocapture readonly %A, ptr nocapture readonly %B, ptr nocapture readnone %bias, ptr nocapture readnone %residual, ptr nocapture %C, i64 %M, i64 %N, i64 %K) local_unnamed_addr #0 {
+entry:
+  %.not19 = icmp eq i64 %N, 0
+  br i1 %.not19, label %epilogue.i.preheader, label %compute.i.preheader
+
+compute.i.preheader:                              ; preds = %entry
+  %umax = tail call i64 @llvm.umax.i64(i64 %M, i64 1)
+  %0 = mul i64 %umax, %N
+  %1 = shl i64 %0, 2
+  tail call void @llvm.memset.p0.i64(ptr align 4 %C, i8 0, i64 %1, i1 false)
+  %.not510 = icmp ult i64 %N, 8
+  br i1 %.not510, label %compute.i.us.us, label %compute.i
+
+compute.i.us.us:                                  ; preds = %compute.i.preheader, %compute.i.latch.split.us.split.us.us.us
+  %i.us.us = phi i64 [ %18, %compute.i.latch.split.us.split.us.us.us ], [ 0, %compute.i.preheader ]
+  %2 = mul i64 %i.us.us, %K
+  %3 = getelementptr float, ptr %A, i64 %2
+  %4 = mul i64 %i.us.us, %N
+  %5 = getelementptr float, ptr %C, i64 %4
+  br label %compute.k.us.us.us.us
+
+compute.k.us.us.us.us:                            ; preds = %scalar.j.compute.k.latch_crit_edge.us.us.us.us, %compute.i.us.us
+  %k.us.us.us.us = phi i64 [ 0, %compute.i.us.us ], [ %17, %scalar.j.compute.k.latch_crit_edge.us.us.us.us ]
+  %6 = getelementptr float, ptr %3, i64 %k.us.us.us.us
+  %7 = load float, ptr %6, align 4
+  %8 = mul i64 %k.us.us.us.us, %N
+  %9 = getelementptr float, ptr %B, i64 %8
+  br label %scalar.j.body.us.us.us.us
+
+scalar.j.body.us.us.us.us:                        ; preds = %scalar.j.body.us.us.us.us, %compute.k.us.us.us.us
+  %j.scalar12.us.us.us.us = phi i64 [ 0, %compute.k.us.us.us.us ], [ %15, %scalar.j.body.us.us.us.us ]
+  %10 = getelementptr float, ptr %9, i64 %j.scalar12.us.us.us.us
+  %11 = getelementptr float, ptr %5, i64 %j.scalar12.us.us.us.us
+  %12 = load float, ptr %10, align 4
+  %13 = load float, ptr %11, align 4
+  %14 = tail call float @llvm.fma.f32(float %7, float %12, float %13)
+  store float %14, ptr %11, align 4
+  %15 = add nuw i64 %j.scalar12.us.us.us.us, 1
+  %16 = icmp ult i64 %15, %N
+  br i1 %16, label %scalar.j.body.us.us.us.us, label %scalar.j.compute.k.latch_crit_edge.us.us.us.us
+
+scalar.j.compute.k.latch_crit_edge.us.us.us.us:   ; preds = %scalar.j.body.us.us.us.us
+  %17 = add nuw i64 %k.us.us.us.us, 1
+  %.not6.us.us.us.us = icmp ult i64 %17, %K
+  br i1 %.not6.us.us.us.us, label %compute.k.us.us.us.us, label %compute.i.latch.split.us.split.us.us.us
+
+compute.i.latch.split.us.split.us.us.us:          ; preds = %scalar.j.compute.k.latch_crit_edge.us.us.us.us
+  %18 = add nuw i64 %i.us.us, 1
+  %.not7.us.us = icmp ult i64 %18, %M
+  br i1 %.not7.us.us, label %compute.i.us.us, label %epilogue.i.preheader
+
+compute.i:                                        ; preds = %compute.i.preheader, %compute.i.latch.split
+  %i = phi i64 [ %44, %compute.i.latch.split ], [ 0, %compute.i.preheader ]
+  %19 = mul i64 %i, %K
+  %20 = getelementptr float, ptr %A, i64 %19
+  %21 = mul i64 %i, %N
+  %22 = getelementptr float, ptr %C, i64 %21
+  br label %compute.k
+
+compute.k:                                        ; preds = %compute.k.latch, %compute.i
+  %k = phi i64 [ 0, %compute.i ], [ %45, %compute.k.latch ]
+  %23 = getelementptr float, ptr %20, i64 %k
+  %24 = load float, ptr %23, align 4
+  %25 = mul i64 %k, %N
+  %26 = getelementptr float, ptr %B, i64 %25
+  %27 = insertelement <8 x float> poison, float %24, i64 0
+  %28 = shufflevector <8 x float> %27, <8 x float> poison, <8 x i32> zeroinitializer
+  br label %vector.j.body
+
+vector.j.scalar.j.preheader_crit_edge:            ; preds = %vector.j.body
+  %29 = icmp ult i64 %30, %N
+  br i1 %29, label %scalar.j.body, label %compute.k.latch
+
+vector.j.body:                                    ; preds = %compute.k, %vector.j.body
+  %30 = phi i64 [ 8, %compute.k ], [ %36, %vector.j.body ]
+  %j.vec11 = phi i64 [ 0, %compute.k ], [ %30, %vector.j.body ]
+  %31 = getelementptr float, ptr %26, i64 %j.vec11
+  %32 = getelementptr float, ptr %22, i64 %j.vec11
+  %33 = load <8 x float>, ptr %31, align 1
+  %34 = load <8 x float>, ptr %32, align 1
+  %35 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %28, <8 x float> %33, <8 x float> %34)
+  store <8 x float> %35, ptr %32, align 1
+  %36 = add i64 %30, 8
+  %.not5 = icmp ugt i64 %36, %N
+  br i1 %.not5, label %vector.j.scalar.j.preheader_crit_edge, label %vector.j.body
+
+scalar.j.body:                                    ; preds = %vector.j.scalar.j.preheader_crit_edge, %scalar.j.body
+  %j.scalar12 = phi i64 [ %42, %scalar.j.body ], [ %30, %vector.j.scalar.j.preheader_crit_edge ]
+  %37 = getelementptr float, ptr %26, i64 %j.scalar12
+  %38 = getelementptr float, ptr %22, i64 %j.scalar12
+  %39 = load float, ptr %37, align 4
+  %40 = load float, ptr %38, align 4
+  %41 = tail call float @llvm.fma.f32(float %24, float %39, float %40)
+  store float %41, ptr %38, align 4
+  %42 = add nuw i64 %j.scalar12, 1
+  %43 = icmp ult i64 %42, %N
+  br i1 %43, label %scalar.j.body, label %compute.k.latch
+
+compute.i.latch.split:                            ; preds = %compute.k.latch
+  %44 = add nuw i64 %i, 1
+  %.not7 = icmp ult i64 %44, %M
+  br i1 %.not7, label %compute.i, label %epilogue.i.preheader
+
+epilogue.i.preheader:                             ; preds = %compute.i.latch.split, %compute.i.latch.split.us.split.us.us.us, %entry
+  ret void
+
+compute.k.latch:                                  ; preds = %scalar.j.body, %vector.j.scalar.j.preheader_crit_edge
+  %45 = add nuw i64 %k, 1
+  %.not6 = icmp ult i64 %45, %K
+  br i1 %.not6, label %compute.k, label %compute.i.latch.split
+}
+
+; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare <8 x float> @llvm.fma.v8f32(<8 x float>, <8 x float>, <8 x float>) #1
+
+; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare float @llvm.fma.f32(float, float, float) #1
+
+; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: write)
+declare void @llvm.memset.p0.i64(ptr nocapture writeonly, i8, i64, i1 immarg) #2
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare i64 @llvm.umax.i64(i64, i64) #3
+
+attributes #0 = { nofree norecurse nosync nounwind memory(argmem: readwrite) }
+attributes #1 = { mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+attributes #2 = { nocallback nofree nounwind willreturn memory(argmem: write) }
+attributes #3 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+}
+llvm.pv {
+; ModuleID = 'schedforge_jit'
+source_filename = "schedforge_jit"
+
+; Function Attrs: nofree norecurse nosync nounwind memory(argmem: readwrite)
+define void @schedforge_matmul(ptr nocapture readonly %A, ptr nocapture readonly %B, ptr nocapture readnone %bias, ptr nocapture readnone %residual, ptr nocapture %C, i64 %M, i64 %N, i64 %K) local_unnamed_addr #0 {
+entry:
+  %.not19 = icmp eq i64 %N, 0
+  br i1 %.not19, label %epilogue.i.preheader, label %compute.i.preheader
+
+compute.i.preheader:                              ; preds = %entry
+  %umax = tail call i64 @llvm.umax.i64(i64 %M, i64 1)
+  %0 = mul i64 %umax, %N
+  %1 = shl i64 %0, 2
+  tail call void @llvm.memset.p0.i64(ptr align 4 %C, i8 0, i64 %1, i1 false)
+  %.not510 = icmp ult i64 %N, 8
+  br i1 %.not510, label %compute.i.us.us, label %compute.i
+
+compute.i.us.us:                                  ; preds = %compute.i.preheader, %compute.i.latch.split.us.split.us.us.us
+  %i.us.us = phi i64 [ %18, %compute.i.latch.split.us.split.us.us.us ], [ 0, %compute.i.preheader ]
+  %2 = mul i64 %i.us.us, %K
+  %3 = getelementptr float, ptr %A, i64 %2
+  %4 = mul i64 %i.us.us, %N
+  %5 = getelementptr float, ptr %C, i64 %4
+  br label %compute.k.us.us.us.us
+
+compute.k.us.us.us.us:                            ; preds = %scalar.j.compute.k.latch_crit_edge.us.us.us.us, %compute.i.us.us
+  %k.us.us.us.us = phi i64 [ 0, %compute.i.us.us ], [ %17, %scalar.j.compute.k.latch_crit_edge.us.us.us.us ]
+  %6 = getelementptr float, ptr %3, i64 %k.us.us.us.us
+  %7 = load float, ptr %6, align 4
+  %8 = mul i64 %k.us.us.us.us, %N
+  %9 = getelementptr float, ptr %B, i64 %8
+  br label %scalar.j.body.us.us.us.us
+
+scalar.j.body.us.us.us.us:                        ; preds = %scalar.j.body.us.us.us.us, %compute.k.us.us.us.us
+  %j.scalar12.us.us.us.us = phi i64 [ 0, %compute.k.us.us.us.us ], [ %15, %scalar.j.body.us.us.us.us ]
+  %10 = getelementptr float, ptr %9, i64 %j.scalar12.us.us.us.us
+  %11 = getelementptr float, ptr %5, i64 %j.scalar12.us.us.us.us
+  %12 = load float, ptr %10, align 4
+  %13 = load float, ptr %11, align 4
+  %14 = tail call float @llvm.fma.f32(float %7, float %12, float %13)
+  store float %14, ptr %11, align 4
+  %15 = add nuw i64 %j.scalar12.us.us.us.us, 1
+  %16 = icmp ult i64 %15, %N
+  br i1 %16, label %scalar.j.body.us.us.us.us, label %scalar.j.compute.k.latch_crit_edge.us.us.us.us
+
+scalar.j.compute.k.latch_crit_edge.us.us.us.us:   ; preds = %scalar.j.body.us.us.us.us
+  %17 = add nuw i64 %k.us.us.us.us, 1
+  %.not6.us.us.us.us = icmp ult i64 %17, %K
+  br i1 %.not6.us.us.us.us, label %compute.k.us.us.us.us, label %compute.i.latch.split.us.split.us.us.us
+
+compute.i.latch.split.us.split.us.us.us:          ; preds = %scalar.j.compute.k.latch_crit_edge.us.us.us.us
+  %18 = add nuw i64 %i.us.us, 1
+  %.not7.us.us = icmp ult i64 %18, %M
+  br i1 %.not7.us.us, label %compute.i.us.us, label %epilogue.i.preheader
+
+compute.i:                                        ; preds = %compute.i.preheader, %compute.i.latch.split
+  %i = phi i64 [ %44, %compute.i.latch.split ], [ 0, %compute.i.preheader ]
+  %19 = mul i64 %i, %K
+  %20 = getelementptr float, ptr %A, i64 %19
+  %21 = mul i64 %i, %N
+  %22 = getelementptr float, ptr %C, i64 %21
+  br label %compute.k
+
+compute.k:                                        ; preds = %compute.k.latch, %compute.i
+  %k = phi i64 [ 0, %compute.i ], [ %45, %compute.k.latch ]
+  %23 = getelementptr float, ptr %20, i64 %k
+  %24 = load float, ptr %23, align 4
+  %25 = mul i64 %k, %N
+  %26 = getelementptr float, ptr %B, i64 %25
+  %27 = insertelement <8 x float> poison, float %24, i64 0
+  %28 = shufflevector <8 x float> %27, <8 x float> poison, <8 x i32> zeroinitializer
+  br label %vector.j.body
+
+vector.j.scalar.j.preheader_crit_edge:            ; preds = %vector.j.body
+  %29 = icmp ult i64 %30, %N
+  br i1 %29, label %scalar.j.body, label %compute.k.latch
+
+vector.j.body:                                    ; preds = %compute.k, %vector.j.body
+  %30 = phi i64 [ 8, %compute.k ], [ %36, %vector.j.body ]
+  %j.vec11 = phi i64 [ 0, %compute.k ], [ %30, %vector.j.body ]
+  %31 = getelementptr float, ptr %26, i64 %j.vec11
+  %32 = getelementptr float, ptr %22, i64 %j.vec11
+  %33 = load <8 x float>, ptr %31, align 1
+  %34 = load <8 x float>, ptr %32, align 1
+  %35 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %28, <8 x float> %33, <8 x float> %34)
+  store <8 x float> %35, ptr %32, align 1
+  %36 = add i64 %30, 8
+  %.not5 = icmp ugt i64 %36, %N
+  br i1 %.not5, label %vector.j.scalar.j.preheader_crit_edge, label %vector.j.body
+
+scalar.j.body:                                    ; preds = %vector.j.scalar.j.preheader_crit_edge, %scalar.j.body
+  %j.scalar12 = phi i64 [ %42, %scalar.j.body ], [ %30, %vector.j.scalar.j.preheader_crit_edge ]
+  %37 = getelementptr float, ptr %26, i64 %j.scalar12
+  %38 = getelementptr float, ptr %22, i64 %j.scalar12
+  %39 = load float, ptr %37, align 4
+  %40 = load float, ptr %38, align 4
+  %41 = tail call float @llvm.fma.f32(float %24, float %39, float %40)
+  store float %41, ptr %38, align 4
+  %42 = add nuw i64 %j.scalar12, 1
+  %43 = icmp ult i64 %42, %N
+  br i1 %43, label %scalar.j.body, label %compute.k.latch
+
+compute.i.latch.split:                            ; preds = %compute.k.latch
+  %44 = add nuw i64 %i, 1
+  %.not7 = icmp ult i64 %44, %M
+  br i1 %.not7, label %compute.i, label %epilogue.i.preheader
+
+epilogue.i.preheader:                             ; preds = %compute.i.latch.split, %compute.i.latch.split.us.split.us.us.us, %entry
+  ret void
+
+compute.k.latch:                                  ; preds = %scalar.j.body, %vector.j.scalar.j.preheader_crit_edge
+  %45 = add nuw i64 %k, 1
+  %.not6 = icmp ult i64 %45, %K
+  br i1 %.not6, label %compute.k, label %compute.i.latch.split
+}
+
+; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare <8 x float> @llvm.fma.v8f32(<8 x float>, <8 x float>, <8 x float>) #1
+
+; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare float @llvm.fma.f32(float, float, float) #1
+
+; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: write)
+declare void @llvm.memset.p0.i64(ptr nocapture writeonly, i8, i64, i1 immarg) #2
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare i64 @llvm.umax.i64(i64, i64) #3
+
+attributes #0 = { nofree norecurse nosync nounwind memory(argmem: readwrite) }
+attributes #1 = { mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+attributes #2 = { nocallback nofree nounwind willreturn memory(argmem: write) }
+attributes #3 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+}
+  }
+  output_projection {
+func @matmul(%A, %B, %bias, %C) {
+  scf.parallel %ii = 0 to M step 16 threads=2 pinned=1 {
+    scf.for %jj = 0 to N step 64 {
+      scf.for %i = 0 to min(ii+16,M) step 4 {
+        scf.for %j = 0 to min(jj+64,N) step 8 {
+          %acc = vector.accumulator.init : vector<8xf32>
+          scf.for %kk = 0 to K step 32 {
+            scf.for %k = 0 to min(kk+32,K) step 1 {
+              %a = memref.load %A[%i,%k]
+              %b = vector.load %B[%k,%j] : vector<8xf32>
+              %a_vec = vector.broadcast %a : vector<8xf32>
+              %acc = vector.fma %a_vec,%b,%acc : vector<8xf32>
+            }
+          }
+          vector.store %acc -> %C[%i,%j] : vector<8xf32>
+        }
+      }
+    }
+  }
+}
+  }
+  moe {
+sfe.moe_executable version=0.4.0 target=native-cpu
+hardware=x86_64 AVX2 vector=8 registers=16 cpus=20
+config tokens<= 4 hidden=16 intermediate=32 experts=4 top_k=2
+graph @model {
+  %v0 = tensor.input : tensor<Tx16xf32, layout=row_major>
+  %v1 = tensor.constant : tensor<16x4xf32, layout=row_major>
+  %v2 = tensor.constant : tensor<4x16x32xf32, layout=row_major>
+  %v3 = tensor.constant : tensor<4x16x32xf32, layout=row_major>
+  %v4 = tensor.constant : tensor<4x32x16xf32, layout=row_major>
+  %v5 = tensor.matmul %v0 %v1 : tensor<Tx4xf32, layout=row_major>
+  %v6 = tensor.softmax %v5 : tensor<Tx4xf32, layout=row_major>
+  %v7 = tensor.topk %v6 {k=2} : tensor<Tx2xi32, layout=row_major>
+  %v8 = tensor.topk %v6 {k=2} : tensor<Tx2xf32, layout=row_major>
+  %v9 = moe.histogram %v7 : tensor<4xi32, layout=row_major>
+  %v10 = moe.prefix_sum %v9 : tensor<5xi32, layout=row_major>
+  %v11 = moe.dispatch %v0 %v7 %v8 %v10 : tensor<assignmentsx16xf32, layout=row_major>
+  %v12 = moe.grouped_matmul %v11 %v10 %v2 : tensor<assignmentsx32xf32, layout=row_major>
+  %v13 = moe.grouped_matmul %v11 %v10 %v3 : tensor<assignmentsx32xf32, layout=row_major>
+  %v14 = tensor.swiglu %v12 %v13 : tensor<assignmentsx32xf32, layout=row_major>
+  %v15 = moe.grouped_matmul %v14 %v10 %v4 : tensor<assignmentsx16xf32, layout=row_major>
+  %v16 = moe.combine %v15 %v7 %v8 : tensor<Tx16xf32, layout=row_major>
+  func.return %v16
+}
+moe.program {
+  %logits = tensor.matmul %x %router_weight {shape=TxE}
+  %scores = tensor.softmax %logits {axis=experts}
+  %expert_ids,%expert_weights = tensor.topk %scores {k=2}
+  %counts = moe.histogram %expert_ids {experts=4}
+  %offsets = moe.prefix_sum %counts {exclusive=true}
+  %permuted,%token_ids = moe.dispatch %x %expert_ids %offsets {stable=true}
+  %h = moe.grouped_matmul.w1 %permuted %offsets %W1 {variable_m=true}
+  %g = moe.grouped_matmul.w3 %permuted %offsets %W3 {variable_m=true}
+  %a = tensor.swiglu %h %g {in_place=%h}
+  %expert_result = moe.grouped_matmul.w2 %a %offsets %W2 {variable_m=true}
+  %y = moe.weighted_combine %expert_result %token_ids %expert_weights {topk_reduce=true}
+}
+segmented_type !sfg.segmented_tensor<values=tensor<?x16xf32>, segments=4>
+moe.schedule {
+  strategy bucketed-grouped
+  task_scheduling load-aware-split
+  bucket_m [4,16,64]
+  split_threshold 32
+  threads 2
+  router.fuse_topk true
+  dispatch.histogram_prefix true
+  combine.fuse_weight true
+}
+guards {
+  0 < T
+  T <= 4
+  assignments == T * 2
+}
+moe.memory naive=4468 workspace=3444 routing=116 segmented=512
+expert_kernels {
+  bucket M<=4 {
+func @matmul(%A, %B, %bias, %C) {
+  scf.for %ii = 0 to M step 16 {
+    scf.for %jj = 0 to N step 64 {
+      scf.for %i = 0 to min(ii+16,M) step 1 {
+        scf.for %j = 0 to min(jj+64,N) step 16 {
+          %acc = vector.accumulator.init : vector<8xf32>
+          scf.for %kk = 0 to K step 16 {
+            scf.for %k = 0 to min(kk+16,K) step 1 {
+              %a = memref.load %A[%i,%k]
+              %b = vector.load %B[%k,%j] : vector<8xf32>
+              %a_vec = vector.broadcast %a : vector<8xf32>
+              %acc = vector.fma %a_vec,%b,%acc : vector<8xf32>
+            }
+          }
+          vector.store %acc -> %C[%i,%j] : vector<8xf32>
+        }
+      }
+    }
+  }
+}
+func @matmul(%A, %B, %bias, %C) {
+  scf.for %ii = 0 to M step 16 {
+    scf.for %jj = 0 to N step 64 {
+      scf.for %i = 0 to min(ii+16,M) step 1 {
+        scf.for %j = 0 to min(jj+64,N) step 16 {
+          %acc = vector.accumulator.init : vector<8xf32>
+          scf.for %kk = 0 to K step 16 {
+            scf.for %k = 0 to min(kk+16,K) step 1 {
+              %a = memref.load %A[%i,%k]
+              %b = vector.load %B[%k,%j] : vector<8xf32>
+              %a_vec = vector.broadcast %a : vector<8xf32>
+              %acc = vector.fma %a_vec,%b,%acc : vector<8xf32>
+            }
+          }
+          vector.store %acc -> %C[%i,%j] : vector<8xf32>
+        }
+      }
+    }
+  }
+}
+  llvm.w1 {
+; ModuleID = 'schedforge_jit'
+source_filename = "schedforge_jit"
+
+; Function Attrs: nofree norecurse nosync nounwind memory(write, argmem: readwrite, inaccessiblemem: none)
+define void @schedforge_matmul(ptr nocapture readonly %A, ptr nocapture readonly %B, ptr nocapture readnone %bias, ptr nocapture readnone %residual, ptr nocapture writeonly %C, i64 %M, i64 %N, i64 %K) local_unnamed_addr #0 {
+entry:
+  %.not = icmp eq i64 %K, 0
+  br i1 %.not, label %micro.6.store.thread, label %micro.0.body
+
+micro.6.store.thread:                             ; preds = %entry
+  %0 = getelementptr float, ptr %C, i64 %N
+  tail call void @llvm.memset.p0.i64(ptr noundef nonnull align 1 dereferenceable(128) %C, i8 0, i64 128, i1 false)
+  %1 = shl i64 %N, 1
+  %2 = getelementptr float, ptr %C, i64 %1
+  tail call void @llvm.memset.p0.i64(ptr noundef nonnull align 1 dereferenceable(128) %0, i8 0, i64 128, i1 false)
+  %3 = mul i64 %N, 3
+  %4 = getelementptr float, ptr %C, i64 %3
+  tail call void @llvm.memset.p0.i64(ptr noundef nonnull align 1 dereferenceable(128) %2, i8 0, i64 128, i1 false)
+  tail call void @llvm.memset.p0.i64(ptr noundef nonnull align 1 dereferenceable(64) %4, i8 0, i64 64, i1 false)
+  br label %micro.7.store
+
+micro.0.body:                                     ; preds = %entry, %micro.0.body
+  %acc125 = phi <8 x float> [ %15, %micro.0.body ], [ zeroinitializer, %entry ]
+  %acc24 = phi <8 x float> [ %14, %micro.0.body ], [ zeroinitializer, %entry ]
+  %k23 = phi i64 [ %16, %micro.0.body ], [ 0, %entry ]
+  %5 = mul i64 %k23, %N
+  %6 = getelementptr float, ptr %B, i64 %5
+  %7 = load <8 x float>, ptr %6, align 1
+  %8 = getelementptr float, ptr %6, i64 8
+  %9 = load <8 x float>, ptr %8, align 1
+  %10 = getelementptr float, ptr %A, i64 %k23
+  %11 = load float, ptr %10, align 4
+  %12 = insertelement <8 x float> poison, float %11, i64 0
+  %13 = shufflevector <8 x float> %12, <8 x float> poison, <8 x i32> zeroinitializer
+  %14 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %13, <8 x float> %7, <8 x float> %acc24)
+  %15 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %13, <8 x float> %9, <8 x float> %acc125)
+  %16 = add nuw i64 %k23, 1
+  %17 = icmp ult i64 %16, %K
+  br i1 %17, label %micro.0.body, label %micro.1.body.preheader
+
+micro.1.body.preheader:                           ; preds = %micro.0.body
+  store <8 x float> %14, ptr %C, align 1
+  %18 = getelementptr float, ptr %C, i64 8
+  store <8 x float> %15, ptr %18, align 1
+  br label %micro.1.body
+
+micro.1.body:                                     ; preds = %micro.1.body.preheader, %micro.1.body
+  %acc429 = phi <8 x float> [ %30, %micro.1.body ], [ zeroinitializer, %micro.1.body.preheader ]
+  %acc328 = phi <8 x float> [ %29, %micro.1.body ], [ zeroinitializer, %micro.1.body.preheader ]
+  %k227 = phi i64 [ %31, %micro.1.body ], [ 0, %micro.1.body.preheader ]
+  %19 = mul i64 %k227, %N
+  %20 = getelementptr float, ptr %B, i64 %19
+  %21 = getelementptr float, ptr %20, i64 16
+  %22 = load <8 x float>, ptr %21, align 1
+  %23 = getelementptr float, ptr %20, i64 24
+  %24 = load <8 x float>, ptr %23, align 1
+  %25 = getelementptr float, ptr %A, i64 %k227
+  %26 = load float, ptr %25, align 4
+  %27 = insertelement <8 x float> poison, float %26, i64 0
+  %28 = shufflevector <8 x float> %27, <8 x float> poison, <8 x i32> zeroinitializer
+  %29 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %28, <8 x float> %22, <8 x float> %acc328)
+  %30 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %28, <8 x float> %24, <8 x float> %acc429)
+  %31 = add nuw i64 %k227, 1
+  %32 = icmp ult i64 %31, %K
+  br i1 %32, label %micro.1.body, label %micro.2.body.preheader
+
+micro.2.body.preheader:                           ; preds = %micro.1.body
+  %33 = getelementptr float, ptr %C, i64 16
+  store <8 x float> %29, ptr %33, align 1
+  %34 = getelementptr float, ptr %C, i64 24
+  store <8 x float> %30, ptr %34, align 1
+  %invariant.gep = getelementptr float, ptr %A, i64 %K
+  br label %micro.2.body
+
+micro.2.body:                                     ; preds = %micro.2.body.preheader, %micro.2.body
+  %acc734 = phi <8 x float> [ %44, %micro.2.body ], [ zeroinitializer, %micro.2.body.preheader ]
+  %acc633 = phi <8 x float> [ %43, %micro.2.body ], [ zeroinitializer, %micro.2.body.preheader ]
+  %k532 = phi i64 [ %45, %micro.2.body ], [ 0, %micro.2.body.preheader ]
+  %35 = mul i64 %k532, %N
+  %36 = getelementptr float, ptr %B, i64 %35
+  %37 = load <8 x float>, ptr %36, align 1
+  %38 = getelementptr float, ptr %36, i64 8
+  %39 = load <8 x float>, ptr %38, align 1
+  %gep = getelementptr float, ptr %invariant.gep, i64 %k532
+  %40 = load float, ptr %gep, align 4
+  %41 = insertelement <8 x float> poison, float %40, i64 0
+  %42 = shufflevector <8 x float> %41, <8 x float> poison, <8 x i32> zeroinitializer
+  %43 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %42, <8 x float> %37, <8 x float> %acc633)
+  %44 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %42, <8 x float> %39, <8 x float> %acc734)
+  %45 = add nuw i64 %k532, 1
+  %46 = icmp ult i64 %45, %K
+  br i1 %46, label %micro.2.body, label %micro.3.body.preheader
+
+micro.3.body.preheader:                           ; preds = %micro.2.body
+  %47 = getelementptr float, ptr %C, i64 %N
+  store <8 x float> %43, ptr %47, align 1
+  %48 = getelementptr float, ptr %47, i64 8
+  store <8 x float> %44, ptr %48, align 1
+  br label %micro.3.body
+
+micro.3.body:                                     ; preds = %micro.3.body.preheader, %micro.3.body
+  %acc1041 = phi <8 x float> [ %59, %micro.3.body ], [ zeroinitializer, %micro.3.body.preheader ]
+  %acc940 = phi <8 x float> [ %58, %micro.3.body ], [ zeroinitializer, %micro.3.body.preheader ]
+  %k839 = phi i64 [ %60, %micro.3.body ], [ 0, %micro.3.body.preheader ]
+  %49 = mul i64 %k839, %N
+  %50 = getelementptr float, ptr %B, i64 %49
+  %51 = getelementptr float, ptr %50, i64 16
+  %52 = load <8 x float>, ptr %51, align 1
+  %53 = getelementptr float, ptr %50, i64 24
+  %54 = load <8 x float>, ptr %53, align 1
+  %gep38 = getelementptr float, ptr %invariant.gep, i64 %k839
+  %55 = load float, ptr %gep38, align 4
+  %56 = insertelement <8 x float> poison, float %55, i64 0
+  %57 = shufflevector <8 x float> %56, <8 x float> poison, <8 x i32> zeroinitializer
+  %58 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %57, <8 x float> %52, <8 x float> %acc940)
+  %59 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %57, <8 x float> %54, <8 x float> %acc1041)
+  %60 = add nuw i64 %k839, 1
+  %61 = icmp ult i64 %60, %K
+  br i1 %61, label %micro.3.body, label %micro.4.body.lr.ph
+
+micro.4.body.lr.ph:                               ; preds = %micro.3.body
+  %62 = getelementptr float, ptr %47, i64 16
+  store <8 x float> %58, ptr %62, align 1
+  %63 = getelementptr float, ptr %47, i64 24
+  store <8 x float> %59, ptr %63, align 1
+  %64 = shl i64 %K, 1
+  %65 = getelementptr float, ptr %A, i64 %64
+  br label %micro.4.body
+
+micro.4.body:                                     ; preds = %micro.4.body.lr.ph, %micro.4.body
+  %acc1346 = phi <8 x float> [ zeroinitializer, %micro.4.body.lr.ph ], [ %76, %micro.4.body ]
+  %acc1245 = phi <8 x float> [ zeroinitializer, %micro.4.body.lr.ph ], [ %75, %micro.4.body ]
+  %k1144 = phi i64 [ 0, %micro.4.body.lr.ph ], [ %77, %micro.4.body ]
+  %66 = mul i64 %k1144, %N
+  %67 = getelementptr float, ptr %B, i64 %66
+  %68 = load <8 x float>, ptr %67, align 1
+  %69 = getelementptr float, ptr %67, i64 8
+  %70 = load <8 x float>, ptr %69, align 1
+  %71 = getelementptr float, ptr %65, i64 %k1144
+  %72 = load float, ptr %71, align 4
+  %73 = insertelement <8 x float> poison, float %72, i64 0
+  %74 = shufflevector <8 x float> %73, <8 x float> poison, <8 x i32> zeroinitializer
+  %75 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %74, <8 x float> %68, <8 x float> %acc1245)
+  %76 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %74, <8 x float> %70, <8 x float> %acc1346)
+  %77 = add nuw i64 %k1144, 1
+  %78 = icmp ult i64 %77, %K
+  br i1 %78, label %micro.4.body, label %micro.5.body.lr.ph
+
+micro.5.body.lr.ph:                               ; preds = %micro.4.body
+  %79 = shl i64 %N, 1
+  %80 = getelementptr float, ptr %C, i64 %79
+  store <8 x float> %75, ptr %80, align 1
+  %81 = getelementptr float, ptr %80, i64 8
+  store <8 x float> %76, ptr %81, align 1
+  %82 = shl i64 %K, 1
+  %83 = getelementptr float, ptr %A, i64 %82
+  br label %micro.5.body
+
+micro.5.body:                                     ; preds = %micro.5.body.lr.ph, %micro.5.body
+  %acc1651 = phi <8 x float> [ zeroinitializer, %micro.5.body.lr.ph ], [ %95, %micro.5.body ]
+  %acc1550 = phi <8 x float> [ zeroinitializer, %micro.5.body.lr.ph ], [ %94, %micro.5.body ]
+  %k1449 = phi i64 [ 0, %micro.5.body.lr.ph ], [ %96, %micro.5.body ]
+  %84 = mul i64 %k1449, %N
+  %85 = getelementptr float, ptr %B, i64 %84
+  %86 = getelementptr float, ptr %85, i64 16
+  %87 = load <8 x float>, ptr %86, align 1
+  %88 = getelementptr float, ptr %85, i64 24
+  %89 = load <8 x float>, ptr %88, align 1
+  %90 = getelementptr float, ptr %83, i64 %k1449
+  %91 = load float, ptr %90, align 4
+  %92 = insertelement <8 x float> poison, float %91, i64 0
+  %93 = shufflevector <8 x float> %92, <8 x float> poison, <8 x i32> zeroinitializer
+  %94 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %93, <8 x float> %87, <8 x float> %acc1550)
+  %95 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %93, <8 x float> %89, <8 x float> %acc1651)
+  %96 = add nuw i64 %k1449, 1
+  %97 = icmp ult i64 %96, %K
+  br i1 %97, label %micro.5.body, label %micro.6.body.lr.ph
+
+micro.6.body.lr.ph:                               ; preds = %micro.5.body
+  %98 = getelementptr float, ptr %80, i64 16
+  store <8 x float> %94, ptr %98, align 1
+  %99 = getelementptr float, ptr %80, i64 24
+  store <8 x float> %95, ptr %99, align 1
+  %100 = mul i64 %K, 3
+  %101 = getelementptr float, ptr %A, i64 %100
+  br label %micro.6.body
+
+micro.6.body:                                     ; preds = %micro.6.body.lr.ph, %micro.6.body
+  %acc1956 = phi <8 x float> [ zeroinitializer, %micro.6.body.lr.ph ], [ %112, %micro.6.body ]
+  %acc1855 = phi <8 x float> [ zeroinitializer, %micro.6.body.lr.ph ], [ %111, %micro.6.body ]
+  %k1754 = phi i64 [ 0, %micro.6.body.lr.ph ], [ %113, %micro.6.body ]
+  %102 = mul i64 %k1754, %N
+  %103 = getelementptr float, ptr %B, i64 %102
+  %104 = load <8 x float>, ptr %103, align 1
+  %105 = getelementptr float, ptr %103, i64 8
+  %106 = load <8 x float>, ptr %105, align 1
+  %107 = getelementptr float, ptr %101, i64 %k1754
+  %108 = load float, ptr %107, align 4
+  %109 = insertelement <8 x float> poison, float %108, i64 0
+  %110 = shufflevector <8 x float> %109, <8 x float> poison, <8 x i32> zeroinitializer
+  %111 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %110, <8 x float> %104, <8 x float> %acc1855)
+  %112 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %110, <8 x float> %106, <8 x float> %acc1956)
+  %113 = add nuw i64 %k1754, 1
+  %114 = icmp ult i64 %113, %K
+  br i1 %114, label %micro.6.body, label %micro.7.body.lr.ph
+
+micro.7.body.lr.ph:                               ; preds = %micro.6.body
+  %115 = mul i64 %N, 3
+  %116 = getelementptr float, ptr %C, i64 %115
+  store <8 x float> %111, ptr %116, align 1
+  %117 = getelementptr float, ptr %116, i64 8
+  store <8 x float> %112, ptr %117, align 1
+  %118 = mul i64 %K, 3
+  %119 = getelementptr float, ptr %A, i64 %118
+  br label %micro.7.body
+
+micro.7.body:                                     ; preds = %micro.7.body.lr.ph, %micro.7.body
+  %acc2261 = phi <8 x float> [ zeroinitializer, %micro.7.body.lr.ph ], [ %131, %micro.7.body ]
+  %acc2160 = phi <8 x float> [ zeroinitializer, %micro.7.body.lr.ph ], [ %130, %micro.7.body ]
+  %k2059 = phi i64 [ 0, %micro.7.body.lr.ph ], [ %132, %micro.7.body ]
+  %120 = mul i64 %k2059, %N
+  %121 = getelementptr float, ptr %B, i64 %120
+  %122 = getelementptr float, ptr %121, i64 16
+  %123 = load <8 x float>, ptr %122, align 1
+  %124 = getelementptr float, ptr %121, i64 24
+  %125 = load <8 x float>, ptr %124, align 1
+  %126 = getelementptr float, ptr %119, i64 %k2059
+  %127 = load float, ptr %126, align 4
+  %128 = insertelement <8 x float> poison, float %127, i64 0
+  %129 = shufflevector <8 x float> %128, <8 x float> poison, <8 x i32> zeroinitializer
+  %130 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %129, <8 x float> %123, <8 x float> %acc2160)
+  %131 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %129, <8 x float> %125, <8 x float> %acc2261)
+  %132 = add nuw i64 %k2059, 1
+  %133 = icmp ult i64 %132, %K
+  br i1 %133, label %micro.7.body, label %micro.7.store
+
+micro.7.store:                                    ; preds = %micro.7.body, %micro.6.store.thread
+  %134 = phi ptr [ %4, %micro.6.store.thread ], [ %116, %micro.7.body ]
+  %acc21.lcssa = phi <8 x float> [ zeroinitializer, %micro.6.store.thread ], [ %130, %micro.7.body ]
+  %acc22.lcssa = phi <8 x float> [ zeroinitializer, %micro.6.store.thread ], [ %131, %micro.7.body ]
+  %135 = getelementptr float, ptr %134, i64 16
+  store <8 x float> %acc21.lcssa, ptr %135, align 1
+  %136 = getelementptr float, ptr %134, i64 24
+  store <8 x float> %acc22.lcssa, ptr %136, align 1
+  ret void
+}
+
+; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare <8 x float> @llvm.fma.v8f32(<8 x float>, <8 x float>, <8 x float>) #1
+
+; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: write)
+declare void @llvm.memset.p0.i64(ptr nocapture writeonly, i8, i64, i1 immarg) #2
+
+attributes #0 = { nofree norecurse nosync nounwind memory(write, argmem: readwrite, inaccessiblemem: none) }
+attributes #1 = { mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+attributes #2 = { nocallback nofree nounwind willreturn memory(argmem: write) }
+  }
+  llvm.w2 {
+; ModuleID = 'schedforge_jit'
+source_filename = "schedforge_jit"
+
+; Function Attrs: nofree norecurse nosync nounwind memory(argmem: readwrite)
+define void @schedforge_matmul(ptr nocapture readonly %A, ptr nocapture readonly %B, ptr nocapture readnone %bias, ptr nocapture readnone %residual, ptr nocapture writeonly %C, i64 %M, i64 %N, i64 %K) local_unnamed_addr #0 {
+entry:
+  %.not = icmp eq i64 %K, 0
+  br i1 %.not, label %micro.2.store.thread, label %micro.0.body
+
+micro.2.store.thread:                             ; preds = %entry
+  %0 = getelementptr float, ptr %C, i64 %N
+  tail call void @llvm.memset.p0.i64(ptr noundef nonnull align 1 dereferenceable(64) %C, i8 0, i64 64, i1 false)
+  %1 = shl i64 %N, 1
+  %2 = getelementptr float, ptr %C, i64 %1
+  tail call void @llvm.memset.p0.i64(ptr noundef nonnull align 1 dereferenceable(64) %0, i8 0, i64 64, i1 false)
+  tail call void @llvm.memset.p0.i64(ptr noundef nonnull align 1 dereferenceable(64) %2, i8 0, i64 64, i1 false)
+  br label %micro.3.store
+
+micro.0.body:                                     ; preds = %entry, %micro.0.body
+  %acc113 = phi <8 x float> [ %13, %micro.0.body ], [ zeroinitializer, %entry ]
+  %acc12 = phi <8 x float> [ %12, %micro.0.body ], [ zeroinitializer, %entry ]
+  %k11 = phi i64 [ %14, %micro.0.body ], [ 0, %entry ]
+  %3 = mul i64 %k11, %N
+  %4 = getelementptr float, ptr %B, i64 %3
+  %5 = load <8 x float>, ptr %4, align 1
+  %6 = getelementptr float, ptr %4, i64 8
+  %7 = load <8 x float>, ptr %6, align 1
+  %8 = getelementptr float, ptr %A, i64 %k11
+  %9 = load float, ptr %8, align 4
+  %10 = insertelement <8 x float> poison, float %9, i64 0
+  %11 = shufflevector <8 x float> %10, <8 x float> poison, <8 x i32> zeroinitializer
+  %12 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %11, <8 x float> %5, <8 x float> %acc12)
+  %13 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %11, <8 x float> %7, <8 x float> %acc113)
+  %14 = add nuw i64 %k11, 1
+  %15 = icmp ult i64 %14, %K
+  br i1 %15, label %micro.0.body, label %micro.1.body.preheader
+
+micro.1.body.preheader:                           ; preds = %micro.0.body
+  store <8 x float> %12, ptr %C, align 1
+  %16 = getelementptr float, ptr %C, i64 8
+  store <8 x float> %13, ptr %16, align 1
+  %invariant.gep = getelementptr float, ptr %A, i64 %K
+  br label %micro.1.body
+
+micro.1.body:                                     ; preds = %micro.1.body.preheader, %micro.1.body
+  %acc417 = phi <8 x float> [ %26, %micro.1.body ], [ zeroinitializer, %micro.1.body.preheader ]
+  %acc316 = phi <8 x float> [ %25, %micro.1.body ], [ zeroinitializer, %micro.1.body.preheader ]
+  %k215 = phi i64 [ %27, %micro.1.body ], [ 0, %micro.1.body.preheader ]
+  %17 = mul i64 %k215, %N
+  %18 = getelementptr float, ptr %B, i64 %17
+  %19 = load <8 x float>, ptr %18, align 1
+  %20 = getelementptr float, ptr %18, i64 8
+  %21 = load <8 x float>, ptr %20, align 1
+  %gep = getelementptr float, ptr %invariant.gep, i64 %k215
+  %22 = load float, ptr %gep, align 4
+  %23 = insertelement <8 x float> poison, float %22, i64 0
+  %24 = shufflevector <8 x float> %23, <8 x float> poison, <8 x i32> zeroinitializer
+  %25 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %24, <8 x float> %19, <8 x float> %acc316)
+  %26 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %24, <8 x float> %21, <8 x float> %acc417)
+  %27 = add nuw i64 %k215, 1
+  %28 = icmp ult i64 %27, %K
+  br i1 %28, label %micro.1.body, label %micro.2.body.lr.ph
+
+micro.2.body.lr.ph:                               ; preds = %micro.1.body
+  %29 = getelementptr float, ptr %C, i64 %N
+  store <8 x float> %25, ptr %29, align 1
+  %30 = getelementptr float, ptr %29, i64 8
+  store <8 x float> %26, ptr %30, align 1
+  %31 = shl i64 %K, 1
+  %32 = getelementptr float, ptr %A, i64 %31
+  br label %micro.2.body
+
+micro.2.body:                                     ; preds = %micro.2.body.lr.ph, %micro.2.body
+  %acc722 = phi <8 x float> [ zeroinitializer, %micro.2.body.lr.ph ], [ %43, %micro.2.body ]
+  %acc621 = phi <8 x float> [ zeroinitializer, %micro.2.body.lr.ph ], [ %42, %micro.2.body ]
+  %k520 = phi i64 [ 0, %micro.2.body.lr.ph ], [ %44, %micro.2.body ]
+  %33 = mul i64 %k520, %N
+  %34 = getelementptr float, ptr %B, i64 %33
+  %35 = load <8 x float>, ptr %34, align 1
+  %36 = getelementptr float, ptr %34, i64 8
+  %37 = load <8 x float>, ptr %36, align 1
+  %38 = getelementptr float, ptr %32, i64 %k520
+  %39 = load float, ptr %38, align 4
+  %40 = insertelement <8 x float> poison, float %39, i64 0
+  %41 = shufflevector <8 x float> %40, <8 x float> poison, <8 x i32> zeroinitializer
+  %42 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %41, <8 x float> %35, <8 x float> %acc621)
+  %43 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %41, <8 x float> %37, <8 x float> %acc722)
+  %44 = add nuw i64 %k520, 1
+  %45 = icmp ult i64 %44, %K
+  br i1 %45, label %micro.2.body, label %micro.3.body.lr.ph
+
+micro.3.body.lr.ph:                               ; preds = %micro.2.body
+  %46 = shl i64 %N, 1
+  %47 = getelementptr float, ptr %C, i64 %46
+  store <8 x float> %42, ptr %47, align 1
+  %48 = getelementptr float, ptr %47, i64 8
+  store <8 x float> %43, ptr %48, align 1
+  %49 = mul i64 %K, 3
+  %50 = getelementptr float, ptr %A, i64 %49
+  br label %micro.3.body
+
+micro.3.body:                                     ; preds = %micro.3.body.lr.ph, %micro.3.body
+  %acc1027 = phi <8 x float> [ zeroinitializer, %micro.3.body.lr.ph ], [ %61, %micro.3.body ]
+  %acc926 = phi <8 x float> [ zeroinitializer, %micro.3.body.lr.ph ], [ %60, %micro.3.body ]
+  %k825 = phi i64 [ 0, %micro.3.body.lr.ph ], [ %62, %micro.3.body ]
+  %51 = mul i64 %k825, %N
+  %52 = getelementptr float, ptr %B, i64 %51
+  %53 = load <8 x float>, ptr %52, align 1
+  %54 = getelementptr float, ptr %52, i64 8
+  %55 = load <8 x float>, ptr %54, align 1
+  %56 = getelementptr float, ptr %50, i64 %k825
+  %57 = load float, ptr %56, align 4
+  %58 = insertelement <8 x float> poison, float %57, i64 0
+  %59 = shufflevector <8 x float> %58, <8 x float> poison, <8 x i32> zeroinitializer
+  %60 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %59, <8 x float> %53, <8 x float> %acc926)
+  %61 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %59, <8 x float> %55, <8 x float> %acc1027)
+  %62 = add nuw i64 %k825, 1
+  %63 = icmp ult i64 %62, %K
+  br i1 %63, label %micro.3.body, label %micro.3.store
+
+micro.3.store:                                    ; preds = %micro.3.body, %micro.2.store.thread
+  %acc9.lcssa = phi <8 x float> [ zeroinitializer, %micro.2.store.thread ], [ %60, %micro.3.body ]
+  %acc10.lcssa = phi <8 x float> [ zeroinitializer, %micro.2.store.thread ], [ %61, %micro.3.body ]
+  %64 = mul i64 %N, 3
+  %65 = getelementptr float, ptr %C, i64 %64
+  store <8 x float> %acc9.lcssa, ptr %65, align 1
+  %66 = getelementptr float, ptr %65, i64 8
+  store <8 x float> %acc10.lcssa, ptr %66, align 1
+  ret void
+}
+
+; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare <8 x float> @llvm.fma.v8f32(<8 x float>, <8 x float>, <8 x float>) #1
+
+; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: write)
+declare void @llvm.memset.p0.i64(ptr nocapture writeonly, i8, i64, i1 immarg) #2
+
+attributes #0 = { nofree norecurse nosync nounwind memory(argmem: readwrite) }
+attributes #1 = { mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+attributes #2 = { nocallback nofree nounwind willreturn memory(argmem: write) }
+  }
+  }
+  bucket M<=16 {
+func @matmul(%A, %B, %bias, %C) {
+  scf.for %ii = 0 to M step 16 {
+    scf.for %jj = 0 to N step 64 {
+      scf.for %i = 0 to min(ii+16,M) step 4 {
+        scf.for %j = 0 to min(jj+64,N) step 16 {
+          %acc = vector.accumulator.init : vector<8xf32>
+          scf.for %kk = 0 to K step 16 {
+            scf.for %k = 0 to min(kk+16,K) step 2 {
+              %a = memref.load %A[%i,%k]
+              %b = vector.load %B[%k,%j] : vector<8xf32>
+              %a_vec = vector.broadcast %a : vector<8xf32>
+              %acc = vector.fma %a_vec,%b,%acc : vector<8xf32>
+            }
+          }
+          vector.store %acc -> %C[%i,%j] : vector<8xf32>
+        }
+      }
+    }
+  }
+}
+func @matmul(%A, %B, %bias, %C) {
+  scf.for %ii = 0 to M step 16 {
+    scf.for %jj = 0 to N step 64 {
+      scf.for %i = 0 to min(ii+16,M) step 4 {
+        scf.for %j = 0 to min(jj+64,N) step 16 {
+          %acc = vector.accumulator.init : vector<8xf32>
+          scf.for %kk = 0 to K step 16 {
+            scf.for %k = 0 to min(kk+16,K) step 2 {
+              %a = memref.load %A[%i,%k]
+              %b = vector.load %B[%k,%j] : vector<8xf32>
+              %a_vec = vector.broadcast %a : vector<8xf32>
+              %acc = vector.fma %a_vec,%b,%acc : vector<8xf32>
+            }
+          }
+          vector.store %acc -> %C[%i,%j] : vector<8xf32>
+        }
+      }
+    }
+  }
+}
+  llvm.w1 {
+; ModuleID = 'schedforge_jit'
+source_filename = "schedforge_jit"
+
+; Function Attrs: nofree norecurse nosync nounwind memory(argmem: readwrite)
+define void @schedforge_matmul(ptr nocapture readonly %A, ptr nocapture readonly %B, ptr nocapture readnone %bias, ptr nocapture readnone %residual, ptr writeonly %C, i64 %M, i64 %N, i64 %K) local_unnamed_addr #0 {
+entry:
+  %.not = icmp eq i64 %K, 0
+  br i1 %.not, label %micro.0.store, label %micro.0.body.lr.ph
+
+micro.0.body.lr.ph:                               ; preds = %entry
+  %0 = shl i64 %K, 1
+  %1 = getelementptr float, ptr %A, i64 %0
+  %2 = mul i64 %K, 3
+  %3 = getelementptr float, ptr %A, i64 %2
+  br label %micro.0.body
+
+micro.0.body:                                     ; preds = %micro.0.body.lr.ph, %micro.0.body
+  %acc779 = phi <8 x float> [ zeroinitializer, %micro.0.body.lr.ph ], [ %32, %micro.0.body ]
+  %acc678 = phi <8 x float> [ zeroinitializer, %micro.0.body.lr.ph ], [ %31, %micro.0.body ]
+  %acc577 = phi <8 x float> [ zeroinitializer, %micro.0.body.lr.ph ], [ %26, %micro.0.body ]
+  %acc476 = phi <8 x float> [ zeroinitializer, %micro.0.body.lr.ph ], [ %25, %micro.0.body ]
+  %acc375 = phi <8 x float> [ zeroinitializer, %micro.0.body.lr.ph ], [ %20, %micro.0.body ]
+  %acc274 = phi <8 x float> [ zeroinitializer, %micro.0.body.lr.ph ], [ %19, %micro.0.body ]
+  %acc173 = phi <8 x float> [ zeroinitializer, %micro.0.body.lr.ph ], [ %14, %micro.0.body ]
+  %acc72 = phi <8 x float> [ zeroinitializer, %micro.0.body.lr.ph ], [ %13, %micro.0.body ]
+  %k71 = phi i64 [ 0, %micro.0.body.lr.ph ], [ %33, %micro.0.body ]
+  %4 = mul i64 %k71, %N
+  %5 = getelementptr float, ptr %B, i64 %4
+  %6 = load <8 x float>, ptr %5, align 1
+  %7 = getelementptr float, ptr %5, i64 8
+  %8 = load <8 x float>, ptr %7, align 1
+  %9 = getelementptr float, ptr %A, i64 %k71
+  %10 = load float, ptr %9, align 4
+  %11 = insertelement <8 x float> poison, float %10, i64 0
+  %12 = shufflevector <8 x float> %11, <8 x float> poison, <8 x i32> zeroinitializer
+  %13 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %12, <8 x float> %6, <8 x float> %acc72)
+  %14 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %12, <8 x float> %8, <8 x float> %acc173)
+  %15 = getelementptr float, ptr %9, i64 %K
+  %16 = load float, ptr %15, align 4
+  %17 = insertelement <8 x float> poison, float %16, i64 0
+  %18 = shufflevector <8 x float> %17, <8 x float> poison, <8 x i32> zeroinitializer
+  %19 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %18, <8 x float> %6, <8 x float> %acc274)
+  %20 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %18, <8 x float> %8, <8 x float> %acc375)
+  %21 = getelementptr float, ptr %1, i64 %k71
+  %22 = load float, ptr %21, align 4
+  %23 = insertelement <8 x float> poison, float %22, i64 0
+  %24 = shufflevector <8 x float> %23, <8 x float> poison, <8 x i32> zeroinitializer
+  %25 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %24, <8 x float> %6, <8 x float> %acc476)
+  %26 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %24, <8 x float> %8, <8 x float> %acc577)
+  %27 = getelementptr float, ptr %3, i64 %k71
+  %28 = load float, ptr %27, align 4
+  %29 = insertelement <8 x float> poison, float %28, i64 0
+  %30 = shufflevector <8 x float> %29, <8 x float> poison, <8 x i32> zeroinitializer
+  %31 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %30, <8 x float> %6, <8 x float> %acc678)
+  %32 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %30, <8 x float> %8, <8 x float> %acc779)
+  %33 = add nuw i64 %k71, 1
+  %34 = icmp ult i64 %33, %K
+  br i1 %34, label %micro.0.body, label %micro.0.store
+
+micro.0.store:                                    ; preds = %micro.0.body, %entry
+  %acc.lcssa = phi <8 x float> [ zeroinitializer, %entry ], [ %13, %micro.0.body ]
+  %acc1.lcssa = phi <8 x float> [ zeroinitializer, %entry ], [ %14, %micro.0.body ]
+  %acc2.lcssa = phi <8 x float> [ zeroinitializer, %entry ], [ %19, %micro.0.body ]
+  %acc3.lcssa = phi <8 x float> [ zeroinitializer, %entry ], [ %20, %micro.0.body ]
+  %acc4.lcssa = phi <8 x float> [ zeroinitializer, %entry ], [ %25, %micro.0.body ]
+  %acc5.lcssa = phi <8 x float> [ zeroinitializer, %entry ], [ %26, %micro.0.body ]
+  %acc6.lcssa = phi <8 x float> [ zeroinitializer, %entry ], [ %31, %micro.0.body ]
+  %acc7.lcssa = phi <8 x float> [ zeroinitializer, %entry ], [ %32, %micro.0.body ]
+  store <8 x float> %acc.lcssa, ptr %C, align 1
+  %35 = getelementptr float, ptr %C, i64 8
+  store <8 x float> %acc1.lcssa, ptr %35, align 1
+  %36 = getelementptr float, ptr %C, i64 %N
+  store <8 x float> %acc2.lcssa, ptr %36, align 1
+  %37 = getelementptr float, ptr %36, i64 8
+  store <8 x float> %acc3.lcssa, ptr %37, align 1
+  %38 = shl i64 %N, 1
+  %39 = getelementptr float, ptr %C, i64 %38
+  store <8 x float> %acc4.lcssa, ptr %39, align 1
+  %40 = getelementptr float, ptr %39, i64 8
+  store <8 x float> %acc5.lcssa, ptr %40, align 1
+  %41 = mul i64 %N, 3
+  %42 = getelementptr float, ptr %C, i64 %41
+  store <8 x float> %acc6.lcssa, ptr %42, align 1
+  %43 = getelementptr float, ptr %42, i64 8
+  store <8 x float> %acc7.lcssa, ptr %43, align 1
+  br i1 %.not, label %micro.1.store, label %micro.1.body.lr.ph
+
+micro.1.body.lr.ph:                               ; preds = %micro.0.store
+  %44 = shl i64 %K, 1
+  %45 = getelementptr float, ptr %A, i64 %44
+  %46 = mul i64 %K, 3
+  %47 = getelementptr float, ptr %A, i64 %46
+  br label %micro.1.body
+
+micro.1.body:                                     ; preds = %micro.1.body.lr.ph, %micro.1.body
+  %acc1695 = phi <8 x float> [ zeroinitializer, %micro.1.body.lr.ph ], [ %77, %micro.1.body ]
+  %acc1594 = phi <8 x float> [ zeroinitializer, %micro.1.body.lr.ph ], [ %76, %micro.1.body ]
+  %acc1493 = phi <8 x float> [ zeroinitializer, %micro.1.body.lr.ph ], [ %71, %micro.1.body ]
+  %acc1392 = phi <8 x float> [ zeroinitializer, %micro.1.body.lr.ph ], [ %70, %micro.1.body ]
+  %acc1291 = phi <8 x float> [ zeroinitializer, %micro.1.body.lr.ph ], [ %65, %micro.1.body ]
+  %acc1190 = phi <8 x float> [ zeroinitializer, %micro.1.body.lr.ph ], [ %64, %micro.1.body ]
+  %acc1089 = phi <8 x float> [ zeroinitializer, %micro.1.body.lr.ph ], [ %59, %micro.1.body ]
+  %acc988 = phi <8 x float> [ zeroinitializer, %micro.1.body.lr.ph ], [ %58, %micro.1.body ]
+  %k887 = phi i64 [ 0, %micro.1.body.lr.ph ], [ %78, %micro.1.body ]
+  %48 = mul i64 %k887, %N
+  %49 = getelementptr float, ptr %B, i64 %48
+  %50 = getelementptr float, ptr %49, i64 16
+  %51 = load <8 x float>, ptr %50, align 1
+  %52 = getelementptr float, ptr %49, i64 24
+  %53 = load <8 x float>, ptr %52, align 1
+  %54 = getelementptr float, ptr %A, i64 %k887
+  %55 = load float, ptr %54, align 4
+  %56 = insertelement <8 x float> poison, float %55, i64 0
+  %57 = shufflevector <8 x float> %56, <8 x float> poison, <8 x i32> zeroinitializer
+  %58 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %57, <8 x float> %51, <8 x float> %acc988)
+  %59 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %57, <8 x float> %53, <8 x float> %acc1089)
+  %60 = getelementptr float, ptr %54, i64 %K
+  %61 = load float, ptr %60, align 4
+  %62 = insertelement <8 x float> poison, float %61, i64 0
+  %63 = shufflevector <8 x float> %62, <8 x float> poison, <8 x i32> zeroinitializer
+  %64 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %63, <8 x float> %51, <8 x float> %acc1190)
+  %65 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %63, <8 x float> %53, <8 x float> %acc1291)
+  %66 = getelementptr float, ptr %45, i64 %k887
+  %67 = load float, ptr %66, align 4
+  %68 = insertelement <8 x float> poison, float %67, i64 0
+  %69 = shufflevector <8 x float> %68, <8 x float> poison, <8 x i32> zeroinitializer
+  %70 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %69, <8 x float> %51, <8 x float> %acc1392)
+  %71 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %69, <8 x float> %53, <8 x float> %acc1493)
+  %72 = getelementptr float, ptr %47, i64 %k887
+  %73 = load float, ptr %72, align 4
+  %74 = insertelement <8 x float> poison, float %73, i64 0
+  %75 = shufflevector <8 x float> %74, <8 x float> poison, <8 x i32> zeroinitializer
+  %76 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %75, <8 x float> %51, <8 x float> %acc1594)
+  %77 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %75, <8 x float> %53, <8 x float> %acc1695)
+  %78 = add nuw i64 %k887, 1
+  %79 = icmp ult i64 %78, %K
+  br i1 %79, label %micro.1.body, label %micro.1.store
+
+micro.1.store:                                    ; preds = %micro.1.body, %micro.0.store
+  %acc9.lcssa = phi <8 x float> [ zeroinitializer, %micro.0.store ], [ %58, %micro.1.body ]
+  %acc10.lcssa = phi <8 x float> [ zeroinitializer, %micro.0.store ], [ %59, %micro.1.body ]
+  %acc11.lcssa = phi <8 x float> [ zeroinitializer, %micro.0.store ], [ %64, %micro.1.body ]
+  %acc12.lcssa = phi <8 x float> [ zeroinitializer, %micro.0.store ], [ %65, %micro.1.body ]
+  %acc13.lcssa = phi <8 x float> [ zeroinitializer, %micro.0.store ], [ %70, %micro.1.body ]
+  %acc14.lcssa = phi <8 x float> [ zeroinitializer, %micro.0.store ], [ %71, %micro.1.body ]
+  %acc15.lcssa = phi <8 x float> [ zeroinitializer, %micro.0.store ], [ %76, %micro.1.body ]
+  %acc16.lcssa = phi <8 x float> [ zeroinitializer, %micro.0.store ], [ %77, %micro.1.body ]
+  %80 = getelementptr float, ptr %C, i64 16
+  store <8 x float> %acc9.lcssa, ptr %80, align 1
+  %81 = getelementptr float, ptr %C, i64 24
+  store <8 x float> %acc10.lcssa, ptr %81, align 1
+  %82 = getelementptr float, ptr %36, i64 16
+  store <8 x float> %acc11.lcssa, ptr %82, align 1
+  %83 = getelementptr float, ptr %36, i64 24
+  store <8 x float> %acc12.lcssa, ptr %83, align 1
+  %84 = getelementptr float, ptr %39, i64 16
+  store <8 x float> %acc13.lcssa, ptr %84, align 1
+  %85 = getelementptr float, ptr %39, i64 24
+  store <8 x float> %acc14.lcssa, ptr %85, align 1
+  %86 = getelementptr float, ptr %42, i64 16
+  store <8 x float> %acc15.lcssa, ptr %86, align 1
+  %87 = getelementptr float, ptr %42, i64 24
+  store <8 x float> %acc16.lcssa, ptr %87, align 1
+  br i1 %.not, label %micro.2.store, label %micro.2.body.lr.ph
+
+micro.2.body.lr.ph:                               ; preds = %micro.1.store
+  %88 = shl i64 %K, 2
+  %89 = getelementptr float, ptr %A, i64 %88
+  %90 = mul i64 %K, 5
+  %91 = getelementptr float, ptr %A, i64 %90
+  %92 = mul i64 %K, 6
+  %93 = getelementptr float, ptr %A, i64 %92
+  %94 = mul i64 %K, 7
+  %95 = getelementptr float, ptr %A, i64 %94
+  br label %micro.2.body
+
+micro.2.body:                                     ; preds = %micro.2.body.lr.ph, %micro.2.body
+  %acc25112 = phi <8 x float> [ zeroinitializer, %micro.2.body.lr.ph ], [ %124, %micro.2.body ]
+  %acc24111 = phi <8 x float> [ zeroinitializer, %micro.2.body.lr.ph ], [ %123, %micro.2.body ]
+  %acc23110 = phi <8 x float> [ zeroinitializer, %micro.2.body.lr.ph ], [ %118, %micro.2.body ]
+  %acc22109 = phi <8 x float> [ zeroinitializer, %micro.2.body.lr.ph ], [ %117, %micro.2.body ]
+  %acc21108 = phi <8 x float> [ zeroinitializer, %micro.2.body.lr.ph ], [ %112, %micro.2.body ]
+  %acc20107 = phi <8 x float> [ zeroinitializer, %micro.2.body.lr.ph ], [ %111, %micro.2.body ]
+  %acc19106 = phi <8 x float> [ zeroinitializer, %micro.2.body.lr.ph ], [ %106, %micro.2.body ]
+  %acc18105 = phi <8 x float> [ zeroinitializer, %micro.2.body.lr.ph ], [ %105, %micro.2.body ]
+  %k17104 = phi i64 [ 0, %micro.2.body.lr.ph ], [ %125, %micro.2.body ]
+  %96 = mul i64 %k17104, %N
+  %97 = getelementptr float, ptr %B, i64 %96
+  %98 = load <8 x float>, ptr %97, align 1
+  %99 = getelementptr float, ptr %97, i64 8
+  %100 = load <8 x float>, ptr %99, align 1
+  %101 = getelementptr float, ptr %89, i64 %k17104
+  %102 = load float, ptr %101, align 4
+  %103 = insertelement <8 x float> poison, float %102, i64 0
+  %104 = shufflevector <8 x float> %103, <8 x float> poison, <8 x i32> zeroinitializer
+  %105 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %104, <8 x float> %98, <8 x float> %acc18105)
+  %106 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %104, <8 x float> %100, <8 x float> %acc19106)
+  %107 = getelementptr float, ptr %91, i64 %k17104
+  %108 = load float, ptr %107, align 4
+  %109 = insertelement <8 x float> poison, float %108, i64 0
+  %110 = shufflevector <8 x float> %109, <8 x float> poison, <8 x i32> zeroinitializer
+  %111 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %110, <8 x float> %98, <8 x float> %acc20107)
+  %112 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %110, <8 x float> %100, <8 x float> %acc21108)
+  %113 = getelementptr float, ptr %93, i64 %k17104
+  %114 = load float, ptr %113, align 4
+  %115 = insertelement <8 x float> poison, float %114, i64 0
+  %116 = shufflevector <8 x float> %115, <8 x float> poison, <8 x i32> zeroinitializer
+  %117 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %116, <8 x float> %98, <8 x float> %acc22109)
+  %118 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %116, <8 x float> %100, <8 x float> %acc23110)
+  %119 = getelementptr float, ptr %95, i64 %k17104
+  %120 = load float, ptr %119, align 4
+  %121 = insertelement <8 x float> poison, float %120, i64 0
+  %122 = shufflevector <8 x float> %121, <8 x float> poison, <8 x i32> zeroinitializer
+  %123 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %122, <8 x float> %98, <8 x float> %acc24111)
+  %124 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %122, <8 x float> %100, <8 x float> %acc25112)
+  %125 = add nuw i64 %k17104, 1
+  %126 = icmp ult i64 %125, %K
+  br i1 %126, label %micro.2.body, label %micro.2.store
+
+micro.2.store:                                    ; preds = %micro.2.body, %micro.1.store
+  %acc18.lcssa = phi <8 x float> [ zeroinitializer, %micro.1.store ], [ %105, %micro.2.body ]
+  %acc19.lcssa = phi <8 x float> [ zeroinitializer, %micro.1.store ], [ %106, %micro.2.body ]
+  %acc20.lcssa = phi <8 x float> [ zeroinitializer, %micro.1.store ], [ %111, %micro.2.body ]
+  %acc21.lcssa = phi <8 x float> [ zeroinitializer, %micro.1.store ], [ %112, %micro.2.body ]
+  %acc22.lcssa = phi <8 x float> [ zeroinitializer, %micro.1.store ], [ %117, %micro.2.body ]
+  %acc23.lcssa = phi <8 x float> [ zeroinitializer, %micro.1.store ], [ %118, %micro.2.body ]
+  %acc24.lcssa = phi <8 x float> [ zeroinitializer, %micro.1.store ], [ %123, %micro.2.body ]
+  %acc25.lcssa = phi <8 x float> [ zeroinitializer, %micro.1.store ], [ %124, %micro.2.body ]
+  %127 = shl i64 %N, 2
+  %128 = getelementptr float, ptr %C, i64 %127
+  store <8 x float> %acc18.lcssa, ptr %128, align 1
+  %129 = getelementptr float, ptr %128, i64 8
+  store <8 x float> %acc19.lcssa, ptr %129, align 1
+  %130 = mul i64 %N, 5
+  %131 = getelementptr float, ptr %C, i64 %130
+  store <8 x float> %acc20.lcssa, ptr %131, align 1
+  %132 = getelementptr float, ptr %131, i64 8
+  store <8 x float> %acc21.lcssa, ptr %132, align 1
+  %133 = mul i64 %N, 6
+  %134 = getelementptr float, ptr %C, i64 %133
+  store <8 x float> %acc22.lcssa, ptr %134, align 1
+  %135 = getelementptr float, ptr %134, i64 8
+  store <8 x float> %acc23.lcssa, ptr %135, align 1
+  %136 = mul i64 %N, 7
+  %137 = getelementptr float, ptr %C, i64 %136
+  store <8 x float> %acc24.lcssa, ptr %137, align 1
+  %138 = getelementptr float, ptr %137, i64 8
+  store <8 x float> %acc25.lcssa, ptr %138, align 1
+  br i1 %.not, label %micro.3.store, label %micro.3.body.lr.ph
+
+micro.3.body.lr.ph:                               ; preds = %micro.2.store
+  %139 = shl i64 %K, 2
+  %140 = getelementptr float, ptr %A, i64 %139
+  %141 = mul i64 %K, 5
+  %142 = getelementptr float, ptr %A, i64 %141
+  %143 = mul i64 %K, 6
+  %144 = getelementptr float, ptr %A, i64 %143
+  %145 = mul i64 %K, 7
+  %146 = getelementptr float, ptr %A, i64 %145
+  br label %micro.3.body
+
+micro.3.body:                                     ; preds = %micro.3.body.lr.ph, %micro.3.body
+  %acc34129 = phi <8 x float> [ zeroinitializer, %micro.3.body.lr.ph ], [ %176, %micro.3.body ]
+  %acc33128 = phi <8 x float> [ zeroinitializer, %micro.3.body.lr.ph ], [ %175, %micro.3.body ]
+  %acc32127 = phi <8 x float> [ zeroinitializer, %micro.3.body.lr.ph ], [ %170, %micro.3.body ]
+  %acc31126 = phi <8 x float> [ zeroinitializer, %micro.3.body.lr.ph ], [ %169, %micro.3.body ]
+  %acc30125 = phi <8 x float> [ zeroinitializer, %micro.3.body.lr.ph ], [ %164, %micro.3.body ]
+  %acc29124 = phi <8 x float> [ zeroinitializer, %micro.3.body.lr.ph ], [ %163, %micro.3.body ]
+  %acc28123 = phi <8 x float> [ zeroinitializer, %micro.3.body.lr.ph ], [ %158, %micro.3.body ]
+  %acc27122 = phi <8 x float> [ zeroinitializer, %micro.3.body.lr.ph ], [ %157, %micro.3.body ]
+  %k26121 = phi i64 [ 0, %micro.3.body.lr.ph ], [ %177, %micro.3.body ]
+  %147 = mul i64 %k26121, %N
+  %148 = getelementptr float, ptr %B, i64 %147
+  %149 = getelementptr float, ptr %148, i64 16
+  %150 = load <8 x float>, ptr %149, align 1
+  %151 = getelementptr float, ptr %148, i64 24
+  %152 = load <8 x float>, ptr %151, align 1
+  %153 = getelementptr float, ptr %140, i64 %k26121
+  %154 = load float, ptr %153, align 4
+  %155 = insertelement <8 x float> poison, float %154, i64 0
+  %156 = shufflevector <8 x float> %155, <8 x float> poison, <8 x i32> zeroinitializer
+  %157 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %156, <8 x float> %150, <8 x float> %acc27122)
+  %158 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %156, <8 x float> %152, <8 x float> %acc28123)
+  %159 = getelementptr float, ptr %142, i64 %k26121
+  %160 = load float, ptr %159, align 4
+  %161 = insertelement <8 x float> poison, float %160, i64 0
+  %162 = shufflevector <8 x float> %161, <8 x float> poison, <8 x i32> zeroinitializer
+  %163 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %162, <8 x float> %150, <8 x float> %acc29124)
+  %164 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %162, <8 x float> %152, <8 x float> %acc30125)
+  %165 = getelementptr float, ptr %144, i64 %k26121
+  %166 = load float, ptr %165, align 4
+  %167 = insertelement <8 x float> poison, float %166, i64 0
+  %168 = shufflevector <8 x float> %167, <8 x float> poison, <8 x i32> zeroinitializer
+  %169 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %168, <8 x float> %150, <8 x float> %acc31126)
+  %170 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %168, <8 x float> %152, <8 x float> %acc32127)
+  %171 = getelementptr float, ptr %146, i64 %k26121
+  %172 = load float, ptr %171, align 4
+  %173 = insertelement <8 x float> poison, float %172, i64 0
+  %174 = shufflevector <8 x float> %173, <8 x float> poison, <8 x i32> zeroinitializer
+  %175 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %174, <8 x float> %150, <8 x float> %acc33128)
+  %176 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %174, <8 x float> %152, <8 x float> %acc34129)
+  %177 = add nuw i64 %k26121, 1
+  %178 = icmp ult i64 %177, %K
+  br i1 %178, label %micro.3.body, label %micro.3.store
+
+micro.3.store:                                    ; preds = %micro.3.body, %micro.2.store
+  %acc27.lcssa = phi <8 x float> [ zeroinitializer, %micro.2.store ], [ %157, %micro.3.body ]
+  %acc28.lcssa = phi <8 x float> [ zeroinitializer, %micro.2.store ], [ %158, %micro.3.body ]
+  %acc29.lcssa = phi <8 x float> [ zeroinitializer, %micro.2.store ], [ %163, %micro.3.body ]
+  %acc30.lcssa = phi <8 x float> [ zeroinitializer, %micro.2.store ], [ %164, %micro.3.body ]
+  %acc31.lcssa = phi <8 x float> [ zeroinitializer, %micro.2.store ], [ %169, %micro.3.body ]
+  %acc32.lcssa = phi <8 x float> [ zeroinitializer, %micro.2.store ], [ %170, %micro.3.body ]
+  %acc33.lcssa = phi <8 x float> [ zeroinitializer, %micro.2.store ], [ %175, %micro.3.body ]
+  %acc34.lcssa = phi <8 x float> [ zeroinitializer, %micro.2.store ], [ %176, %micro.3.body ]
+  %179 = getelementptr float, ptr %128, i64 16
+  store <8 x float> %acc27.lcssa, ptr %179, align 1
+  %180 = getelementptr float, ptr %128, i64 24
+  store <8 x float> %acc28.lcssa, ptr %180, align 1
+  %181 = getelementptr float, ptr %131, i64 16
+  store <8 x float> %acc29.lcssa, ptr %181, align 1
+  %182 = getelementptr float, ptr %131, i64 24
+  store <8 x float> %acc30.lcssa, ptr %182, align 1
+  %183 = getelementptr float, ptr %134, i64 16
+  store <8 x float> %acc31.lcssa, ptr %183, align 1
+  %184 = getelementptr float, ptr %134, i64 24
+  store <8 x float> %acc32.lcssa, ptr %184, align 1
+  %185 = getelementptr float, ptr %137, i64 16
+  store <8 x float> %acc33.lcssa, ptr %185, align 1
+  %186 = getelementptr float, ptr %137, i64 24
+  store <8 x float> %acc34.lcssa, ptr %186, align 1
+  br i1 %.not, label %micro.4.store, label %micro.4.body.lr.ph
+
+micro.4.body.lr.ph:                               ; preds = %micro.3.store
+  %187 = shl i64 %K, 3
+  %188 = getelementptr float, ptr %A, i64 %187
+  %189 = mul i64 %K, 9
+  %190 = getelementptr float, ptr %A, i64 %189
+  %191 = mul i64 %K, 10
+  %192 = getelementptr float, ptr %A, i64 %191
+  %193 = mul i64 %K, 11
+  %194 = getelementptr float, ptr %A, i64 %193
+  br label %micro.4.body
+
+micro.4.body:                                     ; preds = %micro.4.body.lr.ph, %micro.4.body
+  %acc43146 = phi <8 x float> [ zeroinitializer, %micro.4.body.lr.ph ], [ %223, %micro.4.body ]
+  %acc42145 = phi <8 x float> [ zeroinitializer, %micro.4.body.lr.ph ], [ %222, %micro.4.body ]
+  %acc41144 = phi <8 x float> [ zeroinitializer, %micro.4.body.lr.ph ], [ %217, %micro.4.body ]
+  %acc40143 = phi <8 x float> [ zeroinitializer, %micro.4.body.lr.ph ], [ %216, %micro.4.body ]
+  %acc39142 = phi <8 x float> [ zeroinitializer, %micro.4.body.lr.ph ], [ %211, %micro.4.body ]
+  %acc38141 = phi <8 x float> [ zeroinitializer, %micro.4.body.lr.ph ], [ %210, %micro.4.body ]
+  %acc37140 = phi <8 x float> [ zeroinitializer, %micro.4.body.lr.ph ], [ %205, %micro.4.body ]
+  %acc36139 = phi <8 x float> [ zeroinitializer, %micro.4.body.lr.ph ], [ %204, %micro.4.body ]
+  %k35138 = phi i64 [ 0, %micro.4.body.lr.ph ], [ %224, %micro.4.body ]
+  %195 = mul i64 %k35138, %N
+  %196 = getelementptr float, ptr %B, i64 %195
+  %197 = load <8 x float>, ptr %196, align 1
+  %198 = getelementptr float, ptr %196, i64 8
+  %199 = load <8 x float>, ptr %198, align 1
+  %200 = getelementptr float, ptr %188, i64 %k35138
+  %201 = load float, ptr %200, align 4
+  %202 = insertelement <8 x float> poison, float %201, i64 0
+  %203 = shufflevector <8 x float> %202, <8 x float> poison, <8 x i32> zeroinitializer
+  %204 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %203, <8 x float> %197, <8 x float> %acc36139)
+  %205 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %203, <8 x float> %199, <8 x float> %acc37140)
+  %206 = getelementptr float, ptr %190, i64 %k35138
+  %207 = load float, ptr %206, align 4
+  %208 = insertelement <8 x float> poison, float %207, i64 0
+  %209 = shufflevector <8 x float> %208, <8 x float> poison, <8 x i32> zeroinitializer
+  %210 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %209, <8 x float> %197, <8 x float> %acc38141)
+  %211 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %209, <8 x float> %199, <8 x float> %acc39142)
+  %212 = getelementptr float, ptr %192, i64 %k35138
+  %213 = load float, ptr %212, align 4
+  %214 = insertelement <8 x float> poison, float %213, i64 0
+  %215 = shufflevector <8 x float> %214, <8 x float> poison, <8 x i32> zeroinitializer
+  %216 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %215, <8 x float> %197, <8 x float> %acc40143)
+  %217 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %215, <8 x float> %199, <8 x float> %acc41144)
+  %218 = getelementptr float, ptr %194, i64 %k35138
+  %219 = load float, ptr %218, align 4
+  %220 = insertelement <8 x float> poison, float %219, i64 0
+  %221 = shufflevector <8 x float> %220, <8 x float> poison, <8 x i32> zeroinitializer
+  %222 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %221, <8 x float> %197, <8 x float> %acc42145)
+  %223 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %221, <8 x float> %199, <8 x float> %acc43146)
+  %224 = add nuw i64 %k35138, 1
+  %225 = icmp ult i64 %224, %K
+  br i1 %225, label %micro.4.body, label %micro.4.store
+
+micro.4.store:                                    ; preds = %micro.4.body, %micro.3.store
+  %acc36.lcssa = phi <8 x float> [ zeroinitializer, %micro.3.store ], [ %204, %micro.4.body ]
+  %acc37.lcssa = phi <8 x float> [ zeroinitializer, %micro.3.store ], [ %205, %micro.4.body ]
+  %acc38.lcssa = phi <8 x float> [ zeroinitializer, %micro.3.store ], [ %210, %micro.4.body ]
+  %acc39.lcssa = phi <8 x float> [ zeroinitializer, %micro.3.store ], [ %211, %micro.4.body ]
+  %acc40.lcssa = phi <8 x float> [ zeroinitializer, %micro.3.store ], [ %216, %micro.4.body ]
+  %acc41.lcssa = phi <8 x float> [ zeroinitializer, %micro.3.store ], [ %217, %micro.4.body ]
+  %acc42.lcssa = phi <8 x float> [ zeroinitializer, %micro.3.store ], [ %222, %micro.4.body ]
+  %acc43.lcssa = phi <8 x float> [ zeroinitializer, %micro.3.store ], [ %223, %micro.4.body ]
+  %226 = shl i64 %N, 3
+  %227 = getelementptr float, ptr %C, i64 %226
+  store <8 x float> %acc36.lcssa, ptr %227, align 1
+  %228 = getelementptr float, ptr %227, i64 8
+  store <8 x float> %acc37.lcssa, ptr %228, align 1
+  %229 = mul i64 %N, 9
+  %230 = getelementptr float, ptr %C, i64 %229
+  store <8 x float> %acc38.lcssa, ptr %230, align 1
+  %231 = getelementptr float, ptr %230, i64 8
+  store <8 x float> %acc39.lcssa, ptr %231, align 1
+  %232 = mul i64 %N, 10
+  %233 = getelementptr float, ptr %C, i64 %232
+  store <8 x float> %acc40.lcssa, ptr %233, align 1
+  %234 = getelementptr float, ptr %233, i64 8
+  store <8 x float> %acc41.lcssa, ptr %234, align 1
+  %235 = mul i64 %N, 11
+  %236 = getelementptr float, ptr %C, i64 %235
+  store <8 x float> %acc42.lcssa, ptr %236, align 1
+  %237 = getelementptr float, ptr %236, i64 8
+  store <8 x float> %acc43.lcssa, ptr %237, align 1
+  br i1 %.not, label %micro.5.store, label %micro.5.body.lr.ph
+
+micro.5.body.lr.ph:                               ; preds = %micro.4.store
+  %238 = shl i64 %K, 3
+  %239 = getelementptr float, ptr %A, i64 %238
+  %240 = mul i64 %K, 9
+  %241 = getelementptr float, ptr %A, i64 %240
+  %242 = mul i64 %K, 10
+  %243 = getelementptr float, ptr %A, i64 %242
+  %244 = mul i64 %K, 11
+  %245 = getelementptr float, ptr %A, i64 %244
+  br label %micro.5.body
+
+micro.5.body:                                     ; preds = %micro.5.body.lr.ph, %micro.5.body
+  %acc52163 = phi <8 x float> [ zeroinitializer, %micro.5.body.lr.ph ], [ %275, %micro.5.body ]
+  %acc51162 = phi <8 x float> [ zeroinitializer, %micro.5.body.lr.ph ], [ %274, %micro.5.body ]
+  %acc50161 = phi <8 x float> [ zeroinitializer, %micro.5.body.lr.ph ], [ %269, %micro.5.body ]
+  %acc49160 = phi <8 x float> [ zeroinitializer, %micro.5.body.lr.ph ], [ %268, %micro.5.body ]
+  %acc48159 = phi <8 x float> [ zeroinitializer, %micro.5.body.lr.ph ], [ %263, %micro.5.body ]
+  %acc47158 = phi <8 x float> [ zeroinitializer, %micro.5.body.lr.ph ], [ %262, %micro.5.body ]
+  %acc46157 = phi <8 x float> [ zeroinitializer, %micro.5.body.lr.ph ], [ %257, %micro.5.body ]
+  %acc45156 = phi <8 x float> [ zeroinitializer, %micro.5.body.lr.ph ], [ %256, %micro.5.body ]
+  %k44155 = phi i64 [ 0, %micro.5.body.lr.ph ], [ %276, %micro.5.body ]
+  %246 = mul i64 %k44155, %N
+  %247 = getelementptr float, ptr %B, i64 %246
+  %248 = getelementptr float, ptr %247, i64 16
+  %249 = load <8 x float>, ptr %248, align 1
+  %250 = getelementptr float, ptr %247, i64 24
+  %251 = load <8 x float>, ptr %250, align 1
+  %252 = getelementptr float, ptr %239, i64 %k44155
+  %253 = load float, ptr %252, align 4
+  %254 = insertelement <8 x float> poison, float %253, i64 0
+  %255 = shufflevector <8 x float> %254, <8 x float> poison, <8 x i32> zeroinitializer
+  %256 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %255, <8 x float> %249, <8 x float> %acc45156)
+  %257 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %255, <8 x float> %251, <8 x float> %acc46157)
+  %258 = getelementptr float, ptr %241, i64 %k44155
+  %259 = load float, ptr %258, align 4
+  %260 = insertelement <8 x float> poison, float %259, i64 0
+  %261 = shufflevector <8 x float> %260, <8 x float> poison, <8 x i32> zeroinitializer
+  %262 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %261, <8 x float> %249, <8 x float> %acc47158)
+  %263 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %261, <8 x float> %251, <8 x float> %acc48159)
+  %264 = getelementptr float, ptr %243, i64 %k44155
+  %265 = load float, ptr %264, align 4
+  %266 = insertelement <8 x float> poison, float %265, i64 0
+  %267 = shufflevector <8 x float> %266, <8 x float> poison, <8 x i32> zeroinitializer
+  %268 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %267, <8 x float> %249, <8 x float> %acc49160)
+  %269 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %267, <8 x float> %251, <8 x float> %acc50161)
+  %270 = getelementptr float, ptr %245, i64 %k44155
+  %271 = load float, ptr %270, align 4
+  %272 = insertelement <8 x float> poison, float %271, i64 0
+  %273 = shufflevector <8 x float> %272, <8 x float> poison, <8 x i32> zeroinitializer
+  %274 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %273, <8 x float> %249, <8 x float> %acc51162)
+  %275 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %273, <8 x float> %251, <8 x float> %acc52163)
+  %276 = add nuw i64 %k44155, 1
+  %277 = icmp ult i64 %276, %K
+  br i1 %277, label %micro.5.body, label %micro.5.store
+
+micro.5.store:                                    ; preds = %micro.5.body, %micro.4.store
+  %acc45.lcssa = phi <8 x float> [ zeroinitializer, %micro.4.store ], [ %256, %micro.5.body ]
+  %acc46.lcssa = phi <8 x float> [ zeroinitializer, %micro.4.store ], [ %257, %micro.5.body ]
+  %acc47.lcssa = phi <8 x float> [ zeroinitializer, %micro.4.store ], [ %262, %micro.5.body ]
+  %acc48.lcssa = phi <8 x float> [ zeroinitializer, %micro.4.store ], [ %263, %micro.5.body ]
+  %acc49.lcssa = phi <8 x float> [ zeroinitializer, %micro.4.store ], [ %268, %micro.5.body ]
+  %acc50.lcssa = phi <8 x float> [ zeroinitializer, %micro.4.store ], [ %269, %micro.5.body ]
+  %acc51.lcssa = phi <8 x float> [ zeroinitializer, %micro.4.store ], [ %274, %micro.5.body ]
+  %acc52.lcssa = phi <8 x float> [ zeroinitializer, %micro.4.store ], [ %275, %micro.5.body ]
+  %278 = getelementptr float, ptr %227, i64 16
+  store <8 x float> %acc45.lcssa, ptr %278, align 1
+  %279 = getelementptr float, ptr %227, i64 24
+  store <8 x float> %acc46.lcssa, ptr %279, align 1
+  %280 = getelementptr float, ptr %230, i64 16
+  store <8 x float> %acc47.lcssa, ptr %280, align 1
+  %281 = getelementptr float, ptr %230, i64 24
+  store <8 x float> %acc48.lcssa, ptr %281, align 1
+  %282 = getelementptr float, ptr %233, i64 16
+  store <8 x float> %acc49.lcssa, ptr %282, align 1
+  %283 = getelementptr float, ptr %233, i64 24
+  store <8 x float> %acc50.lcssa, ptr %283, align 1
+  %284 = getelementptr float, ptr %236, i64 16
+  store <8 x float> %acc51.lcssa, ptr %284, align 1
+  %285 = getelementptr float, ptr %236, i64 24
+  store <8 x float> %acc52.lcssa, ptr %285, align 1
+  br i1 %.not, label %micro.6.store, label %micro.6.body.lr.ph
+
+micro.6.body.lr.ph:                               ; preds = %micro.5.store
+  %286 = mul i64 %K, 12
+  %287 = getelementptr float, ptr %A, i64 %286
+  %288 = mul i64 %K, 13
+  %289 = getelementptr float, ptr %A, i64 %288
+  %290 = mul i64 %K, 14
+  %291 = getelementptr float, ptr %A, i64 %290
+  %292 = mul i64 %K, 15
+  %293 = getelementptr float, ptr %A, i64 %292
+  br label %micro.6.body
+
+micro.6.body:                                     ; preds = %micro.6.body.lr.ph, %micro.6.body
+  %acc61180 = phi <8 x float> [ zeroinitializer, %micro.6.body.lr.ph ], [ %322, %micro.6.body ]
+  %acc60179 = phi <8 x float> [ zeroinitializer, %micro.6.body.lr.ph ], [ %321, %micro.6.body ]
+  %acc59178 = phi <8 x float> [ zeroinitializer, %micro.6.body.lr.ph ], [ %316, %micro.6.body ]
+  %acc58177 = phi <8 x float> [ zeroinitializer, %micro.6.body.lr.ph ], [ %315, %micro.6.body ]
+  %acc57176 = phi <8 x float> [ zeroinitializer, %micro.6.body.lr.ph ], [ %310, %micro.6.body ]
+  %acc56175 = phi <8 x float> [ zeroinitializer, %micro.6.body.lr.ph ], [ %309, %micro.6.body ]
+  %acc55174 = phi <8 x float> [ zeroinitializer, %micro.6.body.lr.ph ], [ %304, %micro.6.body ]
+  %acc54173 = phi <8 x float> [ zeroinitializer, %micro.6.body.lr.ph ], [ %303, %micro.6.body ]
+  %k53172 = phi i64 [ 0, %micro.6.body.lr.ph ], [ %323, %micro.6.body ]
+  %294 = mul i64 %k53172, %N
+  %295 = getelementptr float, ptr %B, i64 %294
+  %296 = load <8 x float>, ptr %295, align 1
+  %297 = getelementptr float, ptr %295, i64 8
+  %298 = load <8 x float>, ptr %297, align 1
+  %299 = getelementptr float, ptr %287, i64 %k53172
+  %300 = load float, ptr %299, align 4
+  %301 = insertelement <8 x float> poison, float %300, i64 0
+  %302 = shufflevector <8 x float> %301, <8 x float> poison, <8 x i32> zeroinitializer
+  %303 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %302, <8 x float> %296, <8 x float> %acc54173)
+  %304 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %302, <8 x float> %298, <8 x float> %acc55174)
+  %305 = getelementptr float, ptr %289, i64 %k53172
+  %306 = load float, ptr %305, align 4
+  %307 = insertelement <8 x float> poison, float %306, i64 0
+  %308 = shufflevector <8 x float> %307, <8 x float> poison, <8 x i32> zeroinitializer
+  %309 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %308, <8 x float> %296, <8 x float> %acc56175)
+  %310 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %308, <8 x float> %298, <8 x float> %acc57176)
+  %311 = getelementptr float, ptr %291, i64 %k53172
+  %312 = load float, ptr %311, align 4
+  %313 = insertelement <8 x float> poison, float %312, i64 0
+  %314 = shufflevector <8 x float> %313, <8 x float> poison, <8 x i32> zeroinitializer
+  %315 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %314, <8 x float> %296, <8 x float> %acc58177)
+  %316 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %314, <8 x float> %298, <8 x float> %acc59178)
+  %317 = getelementptr float, ptr %293, i64 %k53172
+  %318 = load float, ptr %317, align 4
+  %319 = insertelement <8 x float> poison, float %318, i64 0
+  %320 = shufflevector <8 x float> %319, <8 x float> poison, <8 x i32> zeroinitializer
+  %321 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %320, <8 x float> %296, <8 x float> %acc60179)
+  %322 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %320, <8 x float> %298, <8 x float> %acc61180)
+  %323 = add nuw i64 %k53172, 1
+  %324 = icmp ult i64 %323, %K
+  br i1 %324, label %micro.6.body, label %micro.6.store
+
+micro.6.store:                                    ; preds = %micro.6.body, %micro.5.store
+  %acc54.lcssa = phi <8 x float> [ zeroinitializer, %micro.5.store ], [ %303, %micro.6.body ]
+  %acc55.lcssa = phi <8 x float> [ zeroinitializer, %micro.5.store ], [ %304, %micro.6.body ]
+  %acc56.lcssa = phi <8 x float> [ zeroinitializer, %micro.5.store ], [ %309, %micro.6.body ]
+  %acc57.lcssa = phi <8 x float> [ zeroinitializer, %micro.5.store ], [ %310, %micro.6.body ]
+  %acc58.lcssa = phi <8 x float> [ zeroinitializer, %micro.5.store ], [ %315, %micro.6.body ]
+  %acc59.lcssa = phi <8 x float> [ zeroinitializer, %micro.5.store ], [ %316, %micro.6.body ]
+  %acc60.lcssa = phi <8 x float> [ zeroinitializer, %micro.5.store ], [ %321, %micro.6.body ]
+  %acc61.lcssa = phi <8 x float> [ zeroinitializer, %micro.5.store ], [ %322, %micro.6.body ]
+  %325 = mul i64 %N, 12
+  %326 = getelementptr float, ptr %C, i64 %325
+  store <8 x float> %acc54.lcssa, ptr %326, align 1
+  %327 = getelementptr float, ptr %326, i64 8
+  store <8 x float> %acc55.lcssa, ptr %327, align 1
+  %328 = mul i64 %N, 13
+  %329 = getelementptr float, ptr %C, i64 %328
+  store <8 x float> %acc56.lcssa, ptr %329, align 1
+  %330 = getelementptr float, ptr %329, i64 8
+  store <8 x float> %acc57.lcssa, ptr %330, align 1
+  %331 = mul i64 %N, 14
+  %332 = getelementptr float, ptr %C, i64 %331
+  store <8 x float> %acc58.lcssa, ptr %332, align 1
+  %333 = getelementptr float, ptr %332, i64 8
+  store <8 x float> %acc59.lcssa, ptr %333, align 1
+  %334 = mul i64 %N, 15
+  %335 = getelementptr float, ptr %C, i64 %334
+  store <8 x float> %acc60.lcssa, ptr %335, align 1
+  %336 = getelementptr float, ptr %335, i64 8
+  store <8 x float> %acc61.lcssa, ptr %336, align 1
+  br i1 %.not, label %micro.7.store, label %micro.7.body.lr.ph
+
+micro.7.body.lr.ph:                               ; preds = %micro.6.store
+  %337 = mul i64 %K, 12
+  %338 = getelementptr float, ptr %A, i64 %337
+  %339 = mul i64 %K, 13
+  %340 = getelementptr float, ptr %A, i64 %339
+  %341 = mul i64 %K, 14
+  %342 = getelementptr float, ptr %A, i64 %341
+  %343 = mul i64 %K, 15
+  %344 = getelementptr float, ptr %A, i64 %343
+  br label %micro.7.body
+
+micro.7.body:                                     ; preds = %micro.7.body.lr.ph, %micro.7.body
+  %acc70197 = phi <8 x float> [ zeroinitializer, %micro.7.body.lr.ph ], [ %374, %micro.7.body ]
+  %acc69196 = phi <8 x float> [ zeroinitializer, %micro.7.body.lr.ph ], [ %373, %micro.7.body ]
+  %acc68195 = phi <8 x float> [ zeroinitializer, %micro.7.body.lr.ph ], [ %368, %micro.7.body ]
+  %acc67194 = phi <8 x float> [ zeroinitializer, %micro.7.body.lr.ph ], [ %367, %micro.7.body ]
+  %acc66193 = phi <8 x float> [ zeroinitializer, %micro.7.body.lr.ph ], [ %362, %micro.7.body ]
+  %acc65192 = phi <8 x float> [ zeroinitializer, %micro.7.body.lr.ph ], [ %361, %micro.7.body ]
+  %acc64191 = phi <8 x float> [ zeroinitializer, %micro.7.body.lr.ph ], [ %356, %micro.7.body ]
+  %acc63190 = phi <8 x float> [ zeroinitializer, %micro.7.body.lr.ph ], [ %355, %micro.7.body ]
+  %k62189 = phi i64 [ 0, %micro.7.body.lr.ph ], [ %375, %micro.7.body ]
+  %345 = mul i64 %k62189, %N
+  %346 = getelementptr float, ptr %B, i64 %345
+  %347 = getelementptr float, ptr %346, i64 16
+  %348 = load <8 x float>, ptr %347, align 1
+  %349 = getelementptr float, ptr %346, i64 24
+  %350 = load <8 x float>, ptr %349, align 1
+  %351 = getelementptr float, ptr %338, i64 %k62189
+  %352 = load float, ptr %351, align 4
+  %353 = insertelement <8 x float> poison, float %352, i64 0
+  %354 = shufflevector <8 x float> %353, <8 x float> poison, <8 x i32> zeroinitializer
+  %355 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %354, <8 x float> %348, <8 x float> %acc63190)
+  %356 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %354, <8 x float> %350, <8 x float> %acc64191)
+  %357 = getelementptr float, ptr %340, i64 %k62189
+  %358 = load float, ptr %357, align 4
+  %359 = insertelement <8 x float> poison, float %358, i64 0
+  %360 = shufflevector <8 x float> %359, <8 x float> poison, <8 x i32> zeroinitializer
+  %361 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %360, <8 x float> %348, <8 x float> %acc65192)
+  %362 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %360, <8 x float> %350, <8 x float> %acc66193)
+  %363 = getelementptr float, ptr %342, i64 %k62189
+  %364 = load float, ptr %363, align 4
+  %365 = insertelement <8 x float> poison, float %364, i64 0
+  %366 = shufflevector <8 x float> %365, <8 x float> poison, <8 x i32> zeroinitializer
+  %367 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %366, <8 x float> %348, <8 x float> %acc67194)
+  %368 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %366, <8 x float> %350, <8 x float> %acc68195)
+  %369 = getelementptr float, ptr %344, i64 %k62189
+  %370 = load float, ptr %369, align 4
+  %371 = insertelement <8 x float> poison, float %370, i64 0
+  %372 = shufflevector <8 x float> %371, <8 x float> poison, <8 x i32> zeroinitializer
+  %373 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %372, <8 x float> %348, <8 x float> %acc69196)
+  %374 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %372, <8 x float> %350, <8 x float> %acc70197)
+  %375 = add nuw i64 %k62189, 1
+  %376 = icmp ult i64 %375, %K
+  br i1 %376, label %micro.7.body, label %micro.7.store
+
+micro.7.store:                                    ; preds = %micro.7.body, %micro.6.store
+  %acc63.lcssa = phi <8 x float> [ zeroinitializer, %micro.6.store ], [ %355, %micro.7.body ]
+  %acc64.lcssa = phi <8 x float> [ zeroinitializer, %micro.6.store ], [ %356, %micro.7.body ]
+  %acc65.lcssa = phi <8 x float> [ zeroinitializer, %micro.6.store ], [ %361, %micro.7.body ]
+  %acc66.lcssa = phi <8 x float> [ zeroinitializer, %micro.6.store ], [ %362, %micro.7.body ]
+  %acc67.lcssa = phi <8 x float> [ zeroinitializer, %micro.6.store ], [ %367, %micro.7.body ]
+  %acc68.lcssa = phi <8 x float> [ zeroinitializer, %micro.6.store ], [ %368, %micro.7.body ]
+  %acc69.lcssa = phi <8 x float> [ zeroinitializer, %micro.6.store ], [ %373, %micro.7.body ]
+  %acc70.lcssa = phi <8 x float> [ zeroinitializer, %micro.6.store ], [ %374, %micro.7.body ]
+  %377 = getelementptr float, ptr %326, i64 16
+  store <8 x float> %acc63.lcssa, ptr %377, align 1
+  %378 = getelementptr float, ptr %326, i64 24
+  store <8 x float> %acc64.lcssa, ptr %378, align 1
+  %379 = getelementptr float, ptr %329, i64 16
+  store <8 x float> %acc65.lcssa, ptr %379, align 1
+  %380 = getelementptr float, ptr %329, i64 24
+  store <8 x float> %acc66.lcssa, ptr %380, align 1
+  %381 = getelementptr float, ptr %332, i64 16
+  store <8 x float> %acc67.lcssa, ptr %381, align 1
+  %382 = getelementptr float, ptr %332, i64 24
+  store <8 x float> %acc68.lcssa, ptr %382, align 1
+  %383 = getelementptr float, ptr %335, i64 16
+  store <8 x float> %acc69.lcssa, ptr %383, align 1
+  %384 = getelementptr float, ptr %335, i64 24
+  store <8 x float> %acc70.lcssa, ptr %384, align 1
+  ret void
+}
+
+; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare <8 x float> @llvm.fma.v8f32(<8 x float>, <8 x float>, <8 x float>) #1
+
+attributes #0 = { nofree norecurse nosync nounwind memory(argmem: readwrite) }
+attributes #1 = { mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+  }
+  llvm.w2 {
+; ModuleID = 'schedforge_jit'
+source_filename = "schedforge_jit"
+
+; Function Attrs: nofree norecurse nosync nounwind memory(argmem: readwrite)
+define void @schedforge_matmul(ptr nocapture readonly %A, ptr nocapture readonly %B, ptr nocapture readnone %bias, ptr nocapture readnone %residual, ptr nocapture writeonly %C, i64 %M, i64 %N, i64 %K) local_unnamed_addr #0 {
+entry:
+  %.not = icmp eq i64 %K, 0
+  br i1 %.not, label %micro.0.store, label %micro.0.body.lr.ph
+
+micro.0.body.lr.ph:                               ; preds = %entry
+  %0 = shl i64 %K, 1
+  %1 = getelementptr float, ptr %A, i64 %0
+  %2 = mul i64 %K, 3
+  %3 = getelementptr float, ptr %A, i64 %2
+  br label %micro.0.body
+
+micro.0.body:                                     ; preds = %micro.0.body.lr.ph, %micro.0.body
+  %acc743 = phi <8 x float> [ zeroinitializer, %micro.0.body.lr.ph ], [ %32, %micro.0.body ]
+  %acc642 = phi <8 x float> [ zeroinitializer, %micro.0.body.lr.ph ], [ %31, %micro.0.body ]
+  %acc541 = phi <8 x float> [ zeroinitializer, %micro.0.body.lr.ph ], [ %26, %micro.0.body ]
+  %acc440 = phi <8 x float> [ zeroinitializer, %micro.0.body.lr.ph ], [ %25, %micro.0.body ]
+  %acc339 = phi <8 x float> [ zeroinitializer, %micro.0.body.lr.ph ], [ %20, %micro.0.body ]
+  %acc238 = phi <8 x float> [ zeroinitializer, %micro.0.body.lr.ph ], [ %19, %micro.0.body ]
+  %acc137 = phi <8 x float> [ zeroinitializer, %micro.0.body.lr.ph ], [ %14, %micro.0.body ]
+  %acc36 = phi <8 x float> [ zeroinitializer, %micro.0.body.lr.ph ], [ %13, %micro.0.body ]
+  %k35 = phi i64 [ 0, %micro.0.body.lr.ph ], [ %33, %micro.0.body ]
+  %4 = mul i64 %k35, %N
+  %5 = getelementptr float, ptr %B, i64 %4
+  %6 = load <8 x float>, ptr %5, align 1
+  %7 = getelementptr float, ptr %5, i64 8
+  %8 = load <8 x float>, ptr %7, align 1
+  %9 = getelementptr float, ptr %A, i64 %k35
+  %10 = load float, ptr %9, align 4
+  %11 = insertelement <8 x float> poison, float %10, i64 0
+  %12 = shufflevector <8 x float> %11, <8 x float> poison, <8 x i32> zeroinitializer
+  %13 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %12, <8 x float> %6, <8 x float> %acc36)
+  %14 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %12, <8 x float> %8, <8 x float> %acc137)
+  %15 = getelementptr float, ptr %9, i64 %K
+  %16 = load float, ptr %15, align 4
+  %17 = insertelement <8 x float> poison, float %16, i64 0
+  %18 = shufflevector <8 x float> %17, <8 x float> poison, <8 x i32> zeroinitializer
+  %19 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %18, <8 x float> %6, <8 x float> %acc238)
+  %20 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %18, <8 x float> %8, <8 x float> %acc339)
+  %21 = getelementptr float, ptr %1, i64 %k35
+  %22 = load float, ptr %21, align 4
+  %23 = insertelement <8 x float> poison, float %22, i64 0
+  %24 = shufflevector <8 x float> %23, <8 x float> poison, <8 x i32> zeroinitializer
+  %25 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %24, <8 x float> %6, <8 x float> %acc440)
+  %26 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %24, <8 x float> %8, <8 x float> %acc541)
+  %27 = getelementptr float, ptr %3, i64 %k35
+  %28 = load float, ptr %27, align 4
+  %29 = insertelement <8 x float> poison, float %28, i64 0
+  %30 = shufflevector <8 x float> %29, <8 x float> poison, <8 x i32> zeroinitializer
+  %31 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %30, <8 x float> %6, <8 x float> %acc642)
+  %32 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %30, <8 x float> %8, <8 x float> %acc743)
+  %33 = add nuw i64 %k35, 1
+  %34 = icmp ult i64 %33, %K
+  br i1 %34, label %micro.0.body, label %micro.0.store
+
+micro.0.store:                                    ; preds = %micro.0.body, %entry
+  %acc.lcssa = phi <8 x float> [ zeroinitializer, %entry ], [ %13, %micro.0.body ]
+  %acc1.lcssa = phi <8 x float> [ zeroinitializer, %entry ], [ %14, %micro.0.body ]
+  %acc2.lcssa = phi <8 x float> [ zeroinitializer, %entry ], [ %19, %micro.0.body ]
+  %acc3.lcssa = phi <8 x float> [ zeroinitializer, %entry ], [ %20, %micro.0.body ]
+  %acc4.lcssa = phi <8 x float> [ zeroinitializer, %entry ], [ %25, %micro.0.body ]
+  %acc5.lcssa = phi <8 x float> [ zeroinitializer, %entry ], [ %26, %micro.0.body ]
+  %acc6.lcssa = phi <8 x float> [ zeroinitializer, %entry ], [ %31, %micro.0.body ]
+  %acc7.lcssa = phi <8 x float> [ zeroinitializer, %entry ], [ %32, %micro.0.body ]
+  store <8 x float> %acc.lcssa, ptr %C, align 1
+  %35 = getelementptr float, ptr %C, i64 8
+  store <8 x float> %acc1.lcssa, ptr %35, align 1
+  %36 = getelementptr float, ptr %C, i64 %N
+  store <8 x float> %acc2.lcssa, ptr %36, align 1
+  %37 = getelementptr float, ptr %36, i64 8
+  store <8 x float> %acc3.lcssa, ptr %37, align 1
+  %38 = shl i64 %N, 1
+  %39 = getelementptr float, ptr %C, i64 %38
+  store <8 x float> %acc4.lcssa, ptr %39, align 1
+  %40 = getelementptr float, ptr %39, i64 8
+  store <8 x float> %acc5.lcssa, ptr %40, align 1
+  %41 = mul i64 %N, 3
+  %42 = getelementptr float, ptr %C, i64 %41
+  store <8 x float> %acc6.lcssa, ptr %42, align 1
+  %43 = getelementptr float, ptr %42, i64 8
+  store <8 x float> %acc7.lcssa, ptr %43, align 1
+  br i1 %.not, label %micro.1.store, label %micro.1.body.lr.ph
+
+micro.1.body.lr.ph:                               ; preds = %micro.0.store
+  %44 = shl i64 %K, 2
+  %45 = getelementptr float, ptr %A, i64 %44
+  %46 = mul i64 %K, 5
+  %47 = getelementptr float, ptr %A, i64 %46
+  %48 = mul i64 %K, 6
+  %49 = getelementptr float, ptr %A, i64 %48
+  %50 = mul i64 %K, 7
+  %51 = getelementptr float, ptr %A, i64 %50
+  br label %micro.1.body
+
+micro.1.body:                                     ; preds = %micro.1.body.lr.ph, %micro.1.body
+  %acc1659 = phi <8 x float> [ zeroinitializer, %micro.1.body.lr.ph ], [ %80, %micro.1.body ]
+  %acc1558 = phi <8 x float> [ zeroinitializer, %micro.1.body.lr.ph ], [ %79, %micro.1.body ]
+  %acc1457 = phi <8 x float> [ zeroinitializer, %micro.1.body.lr.ph ], [ %74, %micro.1.body ]
+  %acc1356 = phi <8 x float> [ zeroinitializer, %micro.1.body.lr.ph ], [ %73, %micro.1.body ]
+  %acc1255 = phi <8 x float> [ zeroinitializer, %micro.1.body.lr.ph ], [ %68, %micro.1.body ]
+  %acc1154 = phi <8 x float> [ zeroinitializer, %micro.1.body.lr.ph ], [ %67, %micro.1.body ]
+  %acc1053 = phi <8 x float> [ zeroinitializer, %micro.1.body.lr.ph ], [ %62, %micro.1.body ]
+  %acc952 = phi <8 x float> [ zeroinitializer, %micro.1.body.lr.ph ], [ %61, %micro.1.body ]
+  %k851 = phi i64 [ 0, %micro.1.body.lr.ph ], [ %81, %micro.1.body ]
+  %52 = mul i64 %k851, %N
+  %53 = getelementptr float, ptr %B, i64 %52
+  %54 = load <8 x float>, ptr %53, align 1
+  %55 = getelementptr float, ptr %53, i64 8
+  %56 = load <8 x float>, ptr %55, align 1
+  %57 = getelementptr float, ptr %45, i64 %k851
+  %58 = load float, ptr %57, align 4
+  %59 = insertelement <8 x float> poison, float %58, i64 0
+  %60 = shufflevector <8 x float> %59, <8 x float> poison, <8 x i32> zeroinitializer
+  %61 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %60, <8 x float> %54, <8 x float> %acc952)
+  %62 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %60, <8 x float> %56, <8 x float> %acc1053)
+  %63 = getelementptr float, ptr %47, i64 %k851
+  %64 = load float, ptr %63, align 4
+  %65 = insertelement <8 x float> poison, float %64, i64 0
+  %66 = shufflevector <8 x float> %65, <8 x float> poison, <8 x i32> zeroinitializer
+  %67 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %66, <8 x float> %54, <8 x float> %acc1154)
+  %68 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %66, <8 x float> %56, <8 x float> %acc1255)
+  %69 = getelementptr float, ptr %49, i64 %k851
+  %70 = load float, ptr %69, align 4
+  %71 = insertelement <8 x float> poison, float %70, i64 0
+  %72 = shufflevector <8 x float> %71, <8 x float> poison, <8 x i32> zeroinitializer
+  %73 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %72, <8 x float> %54, <8 x float> %acc1356)
+  %74 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %72, <8 x float> %56, <8 x float> %acc1457)
+  %75 = getelementptr float, ptr %51, i64 %k851
+  %76 = load float, ptr %75, align 4
+  %77 = insertelement <8 x float> poison, float %76, i64 0
+  %78 = shufflevector <8 x float> %77, <8 x float> poison, <8 x i32> zeroinitializer
+  %79 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %78, <8 x float> %54, <8 x float> %acc1558)
+  %80 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %78, <8 x float> %56, <8 x float> %acc1659)
+  %81 = add nuw i64 %k851, 1
+  %82 = icmp ult i64 %81, %K
+  br i1 %82, label %micro.1.body, label %micro.1.store
+
+micro.1.store:                                    ; preds = %micro.1.body, %micro.0.store
+  %acc9.lcssa = phi <8 x float> [ zeroinitializer, %micro.0.store ], [ %61, %micro.1.body ]
+  %acc10.lcssa = phi <8 x float> [ zeroinitializer, %micro.0.store ], [ %62, %micro.1.body ]
+  %acc11.lcssa = phi <8 x float> [ zeroinitializer, %micro.0.store ], [ %67, %micro.1.body ]
+  %acc12.lcssa = phi <8 x float> [ zeroinitializer, %micro.0.store ], [ %68, %micro.1.body ]
+  %acc13.lcssa = phi <8 x float> [ zeroinitializer, %micro.0.store ], [ %73, %micro.1.body ]
+  %acc14.lcssa = phi <8 x float> [ zeroinitializer, %micro.0.store ], [ %74, %micro.1.body ]
+  %acc15.lcssa = phi <8 x float> [ zeroinitializer, %micro.0.store ], [ %79, %micro.1.body ]
+  %acc16.lcssa = phi <8 x float> [ zeroinitializer, %micro.0.store ], [ %80, %micro.1.body ]
+  %83 = shl i64 %N, 2
+  %84 = getelementptr float, ptr %C, i64 %83
+  store <8 x float> %acc9.lcssa, ptr %84, align 1
+  %85 = getelementptr float, ptr %84, i64 8
+  store <8 x float> %acc10.lcssa, ptr %85, align 1
+  %86 = mul i64 %N, 5
+  %87 = getelementptr float, ptr %C, i64 %86
+  store <8 x float> %acc11.lcssa, ptr %87, align 1
+  %88 = getelementptr float, ptr %87, i64 8
+  store <8 x float> %acc12.lcssa, ptr %88, align 1
+  %89 = mul i64 %N, 6
+  %90 = getelementptr float, ptr %C, i64 %89
+  store <8 x float> %acc13.lcssa, ptr %90, align 1
+  %91 = getelementptr float, ptr %90, i64 8
+  store <8 x float> %acc14.lcssa, ptr %91, align 1
+  %92 = mul i64 %N, 7
+  %93 = getelementptr float, ptr %C, i64 %92
+  store <8 x float> %acc15.lcssa, ptr %93, align 1
+  %94 = getelementptr float, ptr %93, i64 8
+  store <8 x float> %acc16.lcssa, ptr %94, align 1
+  br i1 %.not, label %micro.2.store, label %micro.2.body.lr.ph
+
+micro.2.body.lr.ph:                               ; preds = %micro.1.store
+  %95 = shl i64 %K, 3
+  %96 = getelementptr float, ptr %A, i64 %95
+  %97 = mul i64 %K, 9
+  %98 = getelementptr float, ptr %A, i64 %97
+  %99 = mul i64 %K, 10
+  %100 = getelementptr float, ptr %A, i64 %99
+  %101 = mul i64 %K, 11
+  %102 = getelementptr float, ptr %A, i64 %101
+  br label %micro.2.body
+
+micro.2.body:                                     ; preds = %micro.2.body.lr.ph, %micro.2.body
+  %acc2576 = phi <8 x float> [ zeroinitializer, %micro.2.body.lr.ph ], [ %131, %micro.2.body ]
+  %acc2475 = phi <8 x float> [ zeroinitializer, %micro.2.body.lr.ph ], [ %130, %micro.2.body ]
+  %acc2374 = phi <8 x float> [ zeroinitializer, %micro.2.body.lr.ph ], [ %125, %micro.2.body ]
+  %acc2273 = phi <8 x float> [ zeroinitializer, %micro.2.body.lr.ph ], [ %124, %micro.2.body ]
+  %acc2172 = phi <8 x float> [ zeroinitializer, %micro.2.body.lr.ph ], [ %119, %micro.2.body ]
+  %acc2071 = phi <8 x float> [ zeroinitializer, %micro.2.body.lr.ph ], [ %118, %micro.2.body ]
+  %acc1970 = phi <8 x float> [ zeroinitializer, %micro.2.body.lr.ph ], [ %113, %micro.2.body ]
+  %acc1869 = phi <8 x float> [ zeroinitializer, %micro.2.body.lr.ph ], [ %112, %micro.2.body ]
+  %k1768 = phi i64 [ 0, %micro.2.body.lr.ph ], [ %132, %micro.2.body ]
+  %103 = mul i64 %k1768, %N
+  %104 = getelementptr float, ptr %B, i64 %103
+  %105 = load <8 x float>, ptr %104, align 1
+  %106 = getelementptr float, ptr %104, i64 8
+  %107 = load <8 x float>, ptr %106, align 1
+  %108 = getelementptr float, ptr %96, i64 %k1768
+  %109 = load float, ptr %108, align 4
+  %110 = insertelement <8 x float> poison, float %109, i64 0
+  %111 = shufflevector <8 x float> %110, <8 x float> poison, <8 x i32> zeroinitializer
+  %112 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %111, <8 x float> %105, <8 x float> %acc1869)
+  %113 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %111, <8 x float> %107, <8 x float> %acc1970)
+  %114 = getelementptr float, ptr %98, i64 %k1768
+  %115 = load float, ptr %114, align 4
+  %116 = insertelement <8 x float> poison, float %115, i64 0
+  %117 = shufflevector <8 x float> %116, <8 x float> poison, <8 x i32> zeroinitializer
+  %118 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %117, <8 x float> %105, <8 x float> %acc2071)
+  %119 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %117, <8 x float> %107, <8 x float> %acc2172)
+  %120 = getelementptr float, ptr %100, i64 %k1768
+  %121 = load float, ptr %120, align 4
+  %122 = insertelement <8 x float> poison, float %121, i64 0
+  %123 = shufflevector <8 x float> %122, <8 x float> poison, <8 x i32> zeroinitializer
+  %124 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %123, <8 x float> %105, <8 x float> %acc2273)
+  %125 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %123, <8 x float> %107, <8 x float> %acc2374)
+  %126 = getelementptr float, ptr %102, i64 %k1768
+  %127 = load float, ptr %126, align 4
+  %128 = insertelement <8 x float> poison, float %127, i64 0
+  %129 = shufflevector <8 x float> %128, <8 x float> poison, <8 x i32> zeroinitializer
+  %130 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %129, <8 x float> %105, <8 x float> %acc2475)
+  %131 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %129, <8 x float> %107, <8 x float> %acc2576)
+  %132 = add nuw i64 %k1768, 1
+  %133 = icmp ult i64 %132, %K
+  br i1 %133, label %micro.2.body, label %micro.2.store
+
+micro.2.store:                                    ; preds = %micro.2.body, %micro.1.store
+  %acc18.lcssa = phi <8 x float> [ zeroinitializer, %micro.1.store ], [ %112, %micro.2.body ]
+  %acc19.lcssa = phi <8 x float> [ zeroinitializer, %micro.1.store ], [ %113, %micro.2.body ]
+  %acc20.lcssa = phi <8 x float> [ zeroinitializer, %micro.1.store ], [ %118, %micro.2.body ]
+  %acc21.lcssa = phi <8 x float> [ zeroinitializer, %micro.1.store ], [ %119, %micro.2.body ]
+  %acc22.lcssa = phi <8 x float> [ zeroinitializer, %micro.1.store ], [ %124, %micro.2.body ]
+  %acc23.lcssa = phi <8 x float> [ zeroinitializer, %micro.1.store ], [ %125, %micro.2.body ]
+  %acc24.lcssa = phi <8 x float> [ zeroinitializer, %micro.1.store ], [ %130, %micro.2.body ]
+  %acc25.lcssa = phi <8 x float> [ zeroinitializer, %micro.1.store ], [ %131, %micro.2.body ]
+  %134 = shl i64 %N, 3
+  %135 = getelementptr float, ptr %C, i64 %134
+  store <8 x float> %acc18.lcssa, ptr %135, align 1
+  %136 = getelementptr float, ptr %135, i64 8
+  store <8 x float> %acc19.lcssa, ptr %136, align 1
+  %137 = mul i64 %N, 9
+  %138 = getelementptr float, ptr %C, i64 %137
+  store <8 x float> %acc20.lcssa, ptr %138, align 1
+  %139 = getelementptr float, ptr %138, i64 8
+  store <8 x float> %acc21.lcssa, ptr %139, align 1
+  %140 = mul i64 %N, 10
+  %141 = getelementptr float, ptr %C, i64 %140
+  store <8 x float> %acc22.lcssa, ptr %141, align 1
+  %142 = getelementptr float, ptr %141, i64 8
+  store <8 x float> %acc23.lcssa, ptr %142, align 1
+  %143 = mul i64 %N, 11
+  %144 = getelementptr float, ptr %C, i64 %143
+  store <8 x float> %acc24.lcssa, ptr %144, align 1
+  %145 = getelementptr float, ptr %144, i64 8
+  store <8 x float> %acc25.lcssa, ptr %145, align 1
+  br i1 %.not, label %micro.3.store, label %micro.3.body.lr.ph
+
+micro.3.body.lr.ph:                               ; preds = %micro.2.store
+  %146 = mul i64 %K, 12
+  %147 = getelementptr float, ptr %A, i64 %146
+  %148 = mul i64 %K, 13
+  %149 = getelementptr float, ptr %A, i64 %148
+  %150 = mul i64 %K, 14
+  %151 = getelementptr float, ptr %A, i64 %150
+  %152 = mul i64 %K, 15
+  %153 = getelementptr float, ptr %A, i64 %152
+  br label %micro.3.body
+
+micro.3.body:                                     ; preds = %micro.3.body.lr.ph, %micro.3.body
+  %acc3493 = phi <8 x float> [ zeroinitializer, %micro.3.body.lr.ph ], [ %182, %micro.3.body ]
+  %acc3392 = phi <8 x float> [ zeroinitializer, %micro.3.body.lr.ph ], [ %181, %micro.3.body ]
+  %acc3291 = phi <8 x float> [ zeroinitializer, %micro.3.body.lr.ph ], [ %176, %micro.3.body ]
+  %acc3190 = phi <8 x float> [ zeroinitializer, %micro.3.body.lr.ph ], [ %175, %micro.3.body ]
+  %acc3089 = phi <8 x float> [ zeroinitializer, %micro.3.body.lr.ph ], [ %170, %micro.3.body ]
+  %acc2988 = phi <8 x float> [ zeroinitializer, %micro.3.body.lr.ph ], [ %169, %micro.3.body ]
+  %acc2887 = phi <8 x float> [ zeroinitializer, %micro.3.body.lr.ph ], [ %164, %micro.3.body ]
+  %acc2786 = phi <8 x float> [ zeroinitializer, %micro.3.body.lr.ph ], [ %163, %micro.3.body ]
+  %k2685 = phi i64 [ 0, %micro.3.body.lr.ph ], [ %183, %micro.3.body ]
+  %154 = mul i64 %k2685, %N
+  %155 = getelementptr float, ptr %B, i64 %154
+  %156 = load <8 x float>, ptr %155, align 1
+  %157 = getelementptr float, ptr %155, i64 8
+  %158 = load <8 x float>, ptr %157, align 1
+  %159 = getelementptr float, ptr %147, i64 %k2685
+  %160 = load float, ptr %159, align 4
+  %161 = insertelement <8 x float> poison, float %160, i64 0
+  %162 = shufflevector <8 x float> %161, <8 x float> poison, <8 x i32> zeroinitializer
+  %163 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %162, <8 x float> %156, <8 x float> %acc2786)
+  %164 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %162, <8 x float> %158, <8 x float> %acc2887)
+  %165 = getelementptr float, ptr %149, i64 %k2685
+  %166 = load float, ptr %165, align 4
+  %167 = insertelement <8 x float> poison, float %166, i64 0
+  %168 = shufflevector <8 x float> %167, <8 x float> poison, <8 x i32> zeroinitializer
+  %169 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %168, <8 x float> %156, <8 x float> %acc2988)
+  %170 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %168, <8 x float> %158, <8 x float> %acc3089)
+  %171 = getelementptr float, ptr %151, i64 %k2685
+  %172 = load float, ptr %171, align 4
+  %173 = insertelement <8 x float> poison, float %172, i64 0
+  %174 = shufflevector <8 x float> %173, <8 x float> poison, <8 x i32> zeroinitializer
+  %175 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %174, <8 x float> %156, <8 x float> %acc3190)
+  %176 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %174, <8 x float> %158, <8 x float> %acc3291)
+  %177 = getelementptr float, ptr %153, i64 %k2685
+  %178 = load float, ptr %177, align 4
+  %179 = insertelement <8 x float> poison, float %178, i64 0
+  %180 = shufflevector <8 x float> %179, <8 x float> poison, <8 x i32> zeroinitializer
+  %181 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %180, <8 x float> %156, <8 x float> %acc3392)
+  %182 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %180, <8 x float> %158, <8 x float> %acc3493)
+  %183 = add nuw i64 %k2685, 1
+  %184 = icmp ult i64 %183, %K
+  br i1 %184, label %micro.3.body, label %micro.3.store
+
+micro.3.store:                                    ; preds = %micro.3.body, %micro.2.store
+  %acc27.lcssa = phi <8 x float> [ zeroinitializer, %micro.2.store ], [ %163, %micro.3.body ]
+  %acc28.lcssa = phi <8 x float> [ zeroinitializer, %micro.2.store ], [ %164, %micro.3.body ]
+  %acc29.lcssa = phi <8 x float> [ zeroinitializer, %micro.2.store ], [ %169, %micro.3.body ]
+  %acc30.lcssa = phi <8 x float> [ zeroinitializer, %micro.2.store ], [ %170, %micro.3.body ]
+  %acc31.lcssa = phi <8 x float> [ zeroinitializer, %micro.2.store ], [ %175, %micro.3.body ]
+  %acc32.lcssa = phi <8 x float> [ zeroinitializer, %micro.2.store ], [ %176, %micro.3.body ]
+  %acc33.lcssa = phi <8 x float> [ zeroinitializer, %micro.2.store ], [ %181, %micro.3.body ]
+  %acc34.lcssa = phi <8 x float> [ zeroinitializer, %micro.2.store ], [ %182, %micro.3.body ]
+  %185 = mul i64 %N, 12
+  %186 = getelementptr float, ptr %C, i64 %185
+  store <8 x float> %acc27.lcssa, ptr %186, align 1
+  %187 = getelementptr float, ptr %186, i64 8
+  store <8 x float> %acc28.lcssa, ptr %187, align 1
+  %188 = mul i64 %N, 13
+  %189 = getelementptr float, ptr %C, i64 %188
+  store <8 x float> %acc29.lcssa, ptr %189, align 1
+  %190 = getelementptr float, ptr %189, i64 8
+  store <8 x float> %acc30.lcssa, ptr %190, align 1
+  %191 = mul i64 %N, 14
+  %192 = getelementptr float, ptr %C, i64 %191
+  store <8 x float> %acc31.lcssa, ptr %192, align 1
+  %193 = getelementptr float, ptr %192, i64 8
+  store <8 x float> %acc32.lcssa, ptr %193, align 1
+  %194 = mul i64 %N, 15
+  %195 = getelementptr float, ptr %C, i64 %194
+  store <8 x float> %acc33.lcssa, ptr %195, align 1
+  %196 = getelementptr float, ptr %195, i64 8
+  store <8 x float> %acc34.lcssa, ptr %196, align 1
+  ret void
+}
+
+; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare <8 x float> @llvm.fma.v8f32(<8 x float>, <8 x float>, <8 x float>) #1
+
+attributes #0 = { nofree norecurse nosync nounwind memory(argmem: readwrite) }
+attributes #1 = { mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+  }
+  }
+  bucket M<=64 {
+func @matmul(%A, %B, %bias, %C) {
+  scf.for %ii = 0 to M step 16 {
+    scf.for %jj = 0 to N step 64 {
+      scf.for %i = 0 to min(ii+16,M) step 6 {
+        scf.for %j = 0 to min(jj+64,N) step 16 {
+          %acc = vector.accumulator.init : vector<8xf32>
+          scf.for %kk = 0 to K step 16 {
+            scf.for %k = 0 to min(kk+16,K) step 4 {
+              %a = memref.load %A[%i,%k]
+              %b = vector.load %B[%k,%j] : vector<8xf32>
+              %a_vec = vector.broadcast %a : vector<8xf32>
+              %acc = vector.fma %a_vec,%b,%acc : vector<8xf32>
+            }
+          }
+          vector.store %acc -> %C[%i,%j] : vector<8xf32>
+        }
+      }
+    }
+  }
+}
+func @matmul(%A, %B, %bias, %C) {
+  scf.for %ii = 0 to M step 16 {
+    scf.for %jj = 0 to N step 64 {
+      scf.for %i = 0 to min(ii+16,M) step 6 {
+        scf.for %j = 0 to min(jj+64,N) step 16 {
+          %acc = vector.accumulator.init : vector<8xf32>
+          scf.for %kk = 0 to K step 16 {
+            scf.for %k = 0 to min(kk+16,K) step 4 {
+              %a = memref.load %A[%i,%k]
+              %b = vector.load %B[%k,%j] : vector<8xf32>
+              %a_vec = vector.broadcast %a : vector<8xf32>
+              %acc = vector.fma %a_vec,%b,%acc : vector<8xf32>
+            }
+          }
+          vector.store %acc -> %C[%i,%j] : vector<8xf32>
+        }
+      }
+    }
+  }
+}
+  llvm.w1 {
+; ModuleID = 'schedforge_jit'
+source_filename = "schedforge_jit"
+
+; Function Attrs: nofree norecurse nosync nounwind memory(argmem: readwrite)
+define void @schedforge_matmul(ptr nocapture readonly %A, ptr nocapture readonly %B, ptr nocapture readnone %bias, ptr nocapture readnone %residual, ptr nocapture %C, i64 %M, i64 %N, i64 %K) local_unnamed_addr #0 {
+entry:
+  %.not19 = icmp eq i64 %N, 0
+  br i1 %.not19, label %epilogue.i.preheader, label %compute.i.preheader
+
+compute.i.preheader:                              ; preds = %entry
+  %umax = tail call i64 @llvm.umax.i64(i64 %M, i64 1)
+  %0 = mul i64 %umax, %N
+  %1 = shl i64 %0, 2
+  tail call void @llvm.memset.p0.i64(ptr align 4 %C, i8 0, i64 %1, i1 false)
+  %.not510 = icmp ult i64 %N, 8
+  br i1 %.not510, label %compute.i.us.us, label %compute.i
+
+compute.i.us.us:                                  ; preds = %compute.i.preheader, %compute.i.latch.split.us.split.us.us.us
+  %i.us.us = phi i64 [ %18, %compute.i.latch.split.us.split.us.us.us ], [ 0, %compute.i.preheader ]
+  %2 = mul i64 %i.us.us, %K
+  %3 = getelementptr float, ptr %A, i64 %2
+  %4 = mul i64 %i.us.us, %N
+  %5 = getelementptr float, ptr %C, i64 %4
+  br label %compute.k.us.us.us.us
+
+compute.k.us.us.us.us:                            ; preds = %scalar.j.compute.k.latch_crit_edge.us.us.us.us, %compute.i.us.us
+  %k.us.us.us.us = phi i64 [ 0, %compute.i.us.us ], [ %17, %scalar.j.compute.k.latch_crit_edge.us.us.us.us ]
+  %6 = getelementptr float, ptr %3, i64 %k.us.us.us.us
+  %7 = load float, ptr %6, align 4
+  %8 = mul i64 %k.us.us.us.us, %N
+  %9 = getelementptr float, ptr %B, i64 %8
+  br label %scalar.j.body.us.us.us.us
+
+scalar.j.body.us.us.us.us:                        ; preds = %scalar.j.body.us.us.us.us, %compute.k.us.us.us.us
+  %j.scalar12.us.us.us.us = phi i64 [ 0, %compute.k.us.us.us.us ], [ %15, %scalar.j.body.us.us.us.us ]
+  %10 = getelementptr float, ptr %9, i64 %j.scalar12.us.us.us.us
+  %11 = getelementptr float, ptr %5, i64 %j.scalar12.us.us.us.us
+  %12 = load float, ptr %10, align 4
+  %13 = load float, ptr %11, align 4
+  %14 = tail call float @llvm.fma.f32(float %7, float %12, float %13)
+  store float %14, ptr %11, align 4
+  %15 = add nuw i64 %j.scalar12.us.us.us.us, 1
+  %16 = icmp ult i64 %15, %N
+  br i1 %16, label %scalar.j.body.us.us.us.us, label %scalar.j.compute.k.latch_crit_edge.us.us.us.us
+
+scalar.j.compute.k.latch_crit_edge.us.us.us.us:   ; preds = %scalar.j.body.us.us.us.us
+  %17 = add nuw i64 %k.us.us.us.us, 1
+  %.not6.us.us.us.us = icmp ult i64 %17, %K
+  br i1 %.not6.us.us.us.us, label %compute.k.us.us.us.us, label %compute.i.latch.split.us.split.us.us.us
+
+compute.i.latch.split.us.split.us.us.us:          ; preds = %scalar.j.compute.k.latch_crit_edge.us.us.us.us
+  %18 = add nuw i64 %i.us.us, 1
+  %.not7.us.us = icmp ult i64 %18, %M
+  br i1 %.not7.us.us, label %compute.i.us.us, label %epilogue.i.preheader
+
+compute.i:                                        ; preds = %compute.i.preheader, %compute.i.latch.split
+  %i = phi i64 [ %44, %compute.i.latch.split ], [ 0, %compute.i.preheader ]
+  %19 = mul i64 %i, %K
+  %20 = getelementptr float, ptr %A, i64 %19
+  %21 = mul i64 %i, %N
+  %22 = getelementptr float, ptr %C, i64 %21
+  br label %compute.k
+
+compute.k:                                        ; preds = %compute.k.latch, %compute.i
+  %k = phi i64 [ 0, %compute.i ], [ %45, %compute.k.latch ]
+  %23 = getelementptr float, ptr %20, i64 %k
+  %24 = load float, ptr %23, align 4
+  %25 = mul i64 %k, %N
+  %26 = getelementptr float, ptr %B, i64 %25
+  %27 = insertelement <8 x float> poison, float %24, i64 0
+  %28 = shufflevector <8 x float> %27, <8 x float> poison, <8 x i32> zeroinitializer
+  br label %vector.j.body
+
+vector.j.scalar.j.preheader_crit_edge:            ; preds = %vector.j.body
+  %29 = icmp ult i64 %30, %N
+  br i1 %29, label %scalar.j.body, label %compute.k.latch
+
+vector.j.body:                                    ; preds = %compute.k, %vector.j.body
+  %30 = phi i64 [ 8, %compute.k ], [ %36, %vector.j.body ]
+  %j.vec11 = phi i64 [ 0, %compute.k ], [ %30, %vector.j.body ]
+  %31 = getelementptr float, ptr %26, i64 %j.vec11
+  %32 = getelementptr float, ptr %22, i64 %j.vec11
+  %33 = load <8 x float>, ptr %31, align 1
+  %34 = load <8 x float>, ptr %32, align 1
+  %35 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %28, <8 x float> %33, <8 x float> %34)
+  store <8 x float> %35, ptr %32, align 1
+  %36 = add i64 %30, 8
+  %.not5 = icmp ugt i64 %36, %N
+  br i1 %.not5, label %vector.j.scalar.j.preheader_crit_edge, label %vector.j.body
+
+scalar.j.body:                                    ; preds = %vector.j.scalar.j.preheader_crit_edge, %scalar.j.body
+  %j.scalar12 = phi i64 [ %42, %scalar.j.body ], [ %30, %vector.j.scalar.j.preheader_crit_edge ]
+  %37 = getelementptr float, ptr %26, i64 %j.scalar12
+  %38 = getelementptr float, ptr %22, i64 %j.scalar12
+  %39 = load float, ptr %37, align 4
+  %40 = load float, ptr %38, align 4
+  %41 = tail call float @llvm.fma.f32(float %24, float %39, float %40)
+  store float %41, ptr %38, align 4
+  %42 = add nuw i64 %j.scalar12, 1
+  %43 = icmp ult i64 %42, %N
+  br i1 %43, label %scalar.j.body, label %compute.k.latch
+
+compute.i.latch.split:                            ; preds = %compute.k.latch
+  %44 = add nuw i64 %i, 1
+  %.not7 = icmp ult i64 %44, %M
+  br i1 %.not7, label %compute.i, label %epilogue.i.preheader
+
+epilogue.i.preheader:                             ; preds = %compute.i.latch.split, %compute.i.latch.split.us.split.us.us.us, %entry
+  ret void
+
+compute.k.latch:                                  ; preds = %scalar.j.body, %vector.j.scalar.j.preheader_crit_edge
+  %45 = add nuw i64 %k, 1
+  %.not6 = icmp ult i64 %45, %K
+  br i1 %.not6, label %compute.k, label %compute.i.latch.split
+}
+
+; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare <8 x float> @llvm.fma.v8f32(<8 x float>, <8 x float>, <8 x float>) #1
+
+; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare float @llvm.fma.f32(float, float, float) #1
+
+; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: write)
+declare void @llvm.memset.p0.i64(ptr nocapture writeonly, i8, i64, i1 immarg) #2
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare i64 @llvm.umax.i64(i64, i64) #3
+
+attributes #0 = { nofree norecurse nosync nounwind memory(argmem: readwrite) }
+attributes #1 = { mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+attributes #2 = { nocallback nofree nounwind willreturn memory(argmem: write) }
+attributes #3 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+  }
+  llvm.w2 {
+; ModuleID = 'schedforge_jit'
+source_filename = "schedforge_jit"
+
+; Function Attrs: nofree norecurse nosync nounwind memory(argmem: readwrite)
+define void @schedforge_matmul(ptr nocapture readonly %A, ptr nocapture readonly %B, ptr nocapture readnone %bias, ptr nocapture readnone %residual, ptr nocapture %C, i64 %M, i64 %N, i64 %K) local_unnamed_addr #0 {
+entry:
+  %.not19 = icmp eq i64 %N, 0
+  br i1 %.not19, label %epilogue.i.preheader, label %compute.i.preheader
+
+compute.i.preheader:                              ; preds = %entry
+  %umax = tail call i64 @llvm.umax.i64(i64 %M, i64 1)
+  %0 = mul i64 %umax, %N
+  %1 = shl i64 %0, 2
+  tail call void @llvm.memset.p0.i64(ptr align 4 %C, i8 0, i64 %1, i1 false)
+  %.not510 = icmp ult i64 %N, 8
+  br i1 %.not510, label %compute.i.us.us, label %compute.i
+
+compute.i.us.us:                                  ; preds = %compute.i.preheader, %compute.i.latch.split.us.split.us.us.us
+  %i.us.us = phi i64 [ %18, %compute.i.latch.split.us.split.us.us.us ], [ 0, %compute.i.preheader ]
+  %2 = mul i64 %i.us.us, %K
+  %3 = getelementptr float, ptr %A, i64 %2
+  %4 = mul i64 %i.us.us, %N
+  %5 = getelementptr float, ptr %C, i64 %4
+  br label %compute.k.us.us.us.us
+
+compute.k.us.us.us.us:                            ; preds = %scalar.j.compute.k.latch_crit_edge.us.us.us.us, %compute.i.us.us
+  %k.us.us.us.us = phi i64 [ 0, %compute.i.us.us ], [ %17, %scalar.j.compute.k.latch_crit_edge.us.us.us.us ]
+  %6 = getelementptr float, ptr %3, i64 %k.us.us.us.us
+  %7 = load float, ptr %6, align 4
+  %8 = mul i64 %k.us.us.us.us, %N
+  %9 = getelementptr float, ptr %B, i64 %8
+  br label %scalar.j.body.us.us.us.us
+
+scalar.j.body.us.us.us.us:                        ; preds = %scalar.j.body.us.us.us.us, %compute.k.us.us.us.us
+  %j.scalar12.us.us.us.us = phi i64 [ 0, %compute.k.us.us.us.us ], [ %15, %scalar.j.body.us.us.us.us ]
+  %10 = getelementptr float, ptr %9, i64 %j.scalar12.us.us.us.us
+  %11 = getelementptr float, ptr %5, i64 %j.scalar12.us.us.us.us
+  %12 = load float, ptr %10, align 4
+  %13 = load float, ptr %11, align 4
+  %14 = tail call float @llvm.fma.f32(float %7, float %12, float %13)
+  store float %14, ptr %11, align 4
+  %15 = add nuw i64 %j.scalar12.us.us.us.us, 1
+  %16 = icmp ult i64 %15, %N
+  br i1 %16, label %scalar.j.body.us.us.us.us, label %scalar.j.compute.k.latch_crit_edge.us.us.us.us
+
+scalar.j.compute.k.latch_crit_edge.us.us.us.us:   ; preds = %scalar.j.body.us.us.us.us
+  %17 = add nuw i64 %k.us.us.us.us, 1
+  %.not6.us.us.us.us = icmp ult i64 %17, %K
+  br i1 %.not6.us.us.us.us, label %compute.k.us.us.us.us, label %compute.i.latch.split.us.split.us.us.us
+
+compute.i.latch.split.us.split.us.us.us:          ; preds = %scalar.j.compute.k.latch_crit_edge.us.us.us.us
+  %18 = add nuw i64 %i.us.us, 1
+  %.not7.us.us = icmp ult i64 %18, %M
+  br i1 %.not7.us.us, label %compute.i.us.us, label %epilogue.i.preheader
+
+compute.i:                                        ; preds = %compute.i.preheader, %compute.i.latch.split
+  %i = phi i64 [ %44, %compute.i.latch.split ], [ 0, %compute.i.preheader ]
+  %19 = mul i64 %i, %K
+  %20 = getelementptr float, ptr %A, i64 %19
+  %21 = mul i64 %i, %N
+  %22 = getelementptr float, ptr %C, i64 %21
+  br label %compute.k
+
+compute.k:                                        ; preds = %compute.k.latch, %compute.i
+  %k = phi i64 [ 0, %compute.i ], [ %45, %compute.k.latch ]
+  %23 = getelementptr float, ptr %20, i64 %k
+  %24 = load float, ptr %23, align 4
+  %25 = mul i64 %k, %N
+  %26 = getelementptr float, ptr %B, i64 %25
+  %27 = insertelement <8 x float> poison, float %24, i64 0
+  %28 = shufflevector <8 x float> %27, <8 x float> poison, <8 x i32> zeroinitializer
+  br label %vector.j.body
+
+vector.j.scalar.j.preheader_crit_edge:            ; preds = %vector.j.body
+  %29 = icmp ult i64 %30, %N
+  br i1 %29, label %scalar.j.body, label %compute.k.latch
+
+vector.j.body:                                    ; preds = %compute.k, %vector.j.body
+  %30 = phi i64 [ 8, %compute.k ], [ %36, %vector.j.body ]
+  %j.vec11 = phi i64 [ 0, %compute.k ], [ %30, %vector.j.body ]
+  %31 = getelementptr float, ptr %26, i64 %j.vec11
+  %32 = getelementptr float, ptr %22, i64 %j.vec11
+  %33 = load <8 x float>, ptr %31, align 1
+  %34 = load <8 x float>, ptr %32, align 1
+  %35 = tail call <8 x float> @llvm.fma.v8f32(<8 x float> %28, <8 x float> %33, <8 x float> %34)
+  store <8 x float> %35, ptr %32, align 1
+  %36 = add i64 %30, 8
+  %.not5 = icmp ugt i64 %36, %N
+  br i1 %.not5, label %vector.j.scalar.j.preheader_crit_edge, label %vector.j.body
+
+scalar.j.body:                                    ; preds = %vector.j.scalar.j.preheader_crit_edge, %scalar.j.body
+  %j.scalar12 = phi i64 [ %42, %scalar.j.body ], [ %30, %vector.j.scalar.j.preheader_crit_edge ]
+  %37 = getelementptr float, ptr %26, i64 %j.scalar12
+  %38 = getelementptr float, ptr %22, i64 %j.scalar12
+  %39 = load float, ptr %37, align 4
+  %40 = load float, ptr %38, align 4
+  %41 = tail call float @llvm.fma.f32(float %24, float %39, float %40)
+  store float %41, ptr %38, align 4
+  %42 = add nuw i64 %j.scalar12, 1
+  %43 = icmp ult i64 %42, %N
+  br i1 %43, label %scalar.j.body, label %compute.k.latch
+
+compute.i.latch.split:                            ; preds = %compute.k.latch
+  %44 = add nuw i64 %i, 1
+  %.not7 = icmp ult i64 %44, %M
+  br i1 %.not7, label %compute.i, label %epilogue.i.preheader
+
+epilogue.i.preheader:                             ; preds = %compute.i.latch.split, %compute.i.latch.split.us.split.us.us.us, %entry
+  ret void
+
+compute.k.latch:                                  ; preds = %scalar.j.body, %vector.j.scalar.j.preheader_crit_edge
+  %45 = add nuw i64 %k, 1
+  %.not6 = icmp ult i64 %45, %K
+  br i1 %.not6, label %compute.k, label %compute.i.latch.split
+}
+
+; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare <8 x float> @llvm.fma.v8f32(<8 x float>, <8 x float>, <8 x float>) #1
+
+; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare float @llvm.fma.f32(float, float, float) #1
+
+; Function Attrs: nocallback nofree nounwind willreturn memory(argmem: write)
+declare void @llvm.memset.p0.i64(ptr nocapture writeonly, i8, i64, i1 immarg) #2
+
+; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+declare i64 @llvm.umax.i64(i64, i64) #3
+
+attributes #0 = { nofree norecurse nosync nounwind memory(argmem: readwrite) }
+attributes #1 = { mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+attributes #2 = { nocallback nofree nounwind willreturn memory(argmem: write) }
+attributes #3 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+  }
+  }
+}
+  }
+}
+llvm_kernels=2
+}

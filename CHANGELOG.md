@@ -2,6 +2,27 @@
 
 All notable changes to SchedForge are documented here.
 
+## [0.7.0] - 2026-08-13
+
+### Added
+
+- Full Llama/Mistral-style Decoder Layer compilation from one StableHLO graph
+  into one serializable `DecoderExecutablePlan` and one runtime invocation.
+- Tensor SSA operations for RMSNorm, RoPE, SiLU, split/concat, fused QKV
+  projection, and fused Gate-Up projection.
+- Structural QKV, Gate-Up, and RoPE recognition independent of temporary names.
+- Compile-time QKV and Gate-Up constant concatenation/packing with serialized
+  constant-specialization metadata.
+- Dense SwiGLU and Top-K MoE FFN branches behind the same Decoder Layer API.
+- `schedforge-decoder`, `examples/decoder_layer.mlir`, end-to-end Dense/MoE
+  validation, ASan coverage, and CI artifact checks.
+
+### Changed
+
+- The StableHLO importer now parses multiline function arguments correctly.
+- SchedForge's flagship workload is now a complete executable Transformer
+  Decoder Layer rather than disconnected MLP, MoE, and Attention demos.
+
 ## [0.6.0] - 2026-08-13
 
 ### Added

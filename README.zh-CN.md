@@ -23,10 +23,13 @@ model-to-machine CPU AI 编译器。它能够
 复用，再通过 Structured Tensor Compute、Transform IR、Loop IR、Tensorization
 和 LLVM 18 ORC JIT 或原生 AVX2 后端生成并执行 CPU 代码。
 
-当前 Graph 级旗舰路径包括 Transformer MLP、Top-2 MoE MLP 与精确的 CPU
-Flash-style Attention。MatMul 继续作为 Kernel
-性能基准，MLP 则作为 Graph Compiler 基准，真实覆盖 use-def、融合边界、
-动态 Shape Guard、临时张量、布局、内存生命周期和 Dispatch。
+当前旗舰 Workload 是一层完整的 Llama/Mistral 风格 Transformer Decoder。
+一个 StableHLO 输入会被导入为一张图，编译为一个 `DecoderExecutablePlan`，并由
+一次 Runtime 调用完成 RMSNorm、融合 QKV、RoPE、GQA/MQA Flash-style Attention、
+输出投影、残差，以及 Dense SwiGLU 或 Top-K MoE FFN。MatMul 继续作为 Kernel
+性能与硬件自动调优实验室。
+
+`RMSNorm → 融合 QKV → RoPE → GQA/MQA Attention → O 投影 → 残差 → RMSNorm → Dense SwiGLU / MoE → 残差`。
 
 `Router → Softmax → TopK → Segmented Dispatch → Grouped Expert SwiGLU → Weighted Combine`。
 
@@ -36,7 +39,7 @@ Flash-style Attention。MatMul 继续作为 Kernel
 ```text
 StableHLO / AI Graph
   → Tensor SSA + Shape Inference
-  → Fusion + Dispatch IR
+  → Decoder Fusion + Dispatch IR
   → Layout + Bufferization
   → Structured Compute + Transform IR
   → Scheduled Loop IR + Tensorization
@@ -79,6 +82,9 @@ flowchart LR
   `Operation`、嵌套 `Block`、`Module`、`IRBuilder` 和分层 PassManager。
 - **Graph Compiler**：多算子 Tensor SSA、静态/动态/符号维度、Shape Constraint、
   StableHLO 子集导入、图正规化、Fusion Legality/Profitability、Dispatch IR。
+- **Decoder Layer Compiler**：一个 StableHLO Graph 编译成一个可执行计划，覆盖
+  RMSNorm、编译期 QKV/Gate-Up 权重打包、RoPE、GQA/MQA Attention、残差、
+  Dense SwiGLU 与可选 Top-K MoE。
 - **MoE Compiler**：显式 Router/TopK/Histogram/Prefix/Dispatch/Combine IR、
   Segmented Tensor、Variable-M Grouped Expert GEMM、SwiGLU、Token Bucket、
   Routing Trace 与 Load-aware Expert Task Scheduler。
@@ -172,6 +178,18 @@ cmake -S . -B build -G Ninja \
   --hidden=64 --intermediate=128 --threads=4 \
   -o results/transformer_mlp.sfe
 
+# 编译并真实执行一层完整 Dense Transformer Decoder
+./build/schedforge-decoder examples/decoder_layer.mlir \
+  --batch=1 --sequence=4 --hidden=16 --intermediate=32 \
+  --q-heads=4 --kv-heads=2 --head-dim=4 --threads=2 \
+  -o results/decoder_dense.sfe
+
+# 使用 Top-2 MoE FFN 执行同一 Decoder Layer
+./build/schedforge-decoder examples/decoder_layer_moe.mlir --moe \
+  --batch=1 --sequence=4 --hidden=16 --intermediate=32 \
+  --q-heads=4 --kv-heads=2 --head-dim=4 --experts=4 --top-k=2 \
+  --threads=2 -o results/decoder_moe.sfe
+
 # 编译并真实运行动态路由 Top-2 MoE MLP
 ./build/schedforge-moe --tokens=128 --hidden=512 --intermediate=2048 \
   --experts=8 --top-k=2 --threads=8 --router-data \
@@ -237,6 +255,22 @@ vector=8;unroll=4;threads=8;pack=ab;prefetch=4;fuse=true;pin=true
 | `schedforge-compile` | 将 StableHLO Graph 编译为 `.sfe` ExecutablePlan |
 | `schedforge-moe` | 编译、模拟、执行并对比 MoE Execution Plan |
 | `schedforge-attention` | 编译、调优、模拟并执行 Attention Plan |
+| `schedforge-decoder` | 编译并执行完整 Dense 或 MoE Decoder Layer |
+
+## Decoder Layer Compiler 实测 Demo
+
+SchedForge 0.7 将 `examples/decoder_layer.mlir` 或
+`examples/decoder_layer_moe.mlir` 作为一张完整 Graph 编译，生成单一 `.sfe`
+计划。计划包含导入与正规化后的 Tensor SSA、融合决策、打包常量、
+Memory Plan、QKV/O/Gate-Up/Down Scheduled LoopIR、嵌入的 Attention 或 MoE Plan，
+以及 LLVM Kernel Artifact。Q/K/V 权重只在编译期拼接一次；Dense Gate/Up 权重
+复用同一套常量特化路径。
+
+仓库内真实 CPU Smoke 使用 `B=1, S=4, H=16, I=32, Hq=4, Hkv=2, D=4`。
+Dense 端到端记录为 **0.025 ms**，MoE 为 **0.099 ms**，最大打印误差均为
+**0.000**。这些小尺寸结果用于验证单 Plan 真实执行，不是吞吐性能声明。详见
+`results/decoder_dense_run.txt`、`results/decoder_moe_run.txt` 与
+[Decoder Compiler 设计](docs/DECODER_COMPILER.md)。
 
 ## MoE Compiler 实测 Demo
 
@@ -330,8 +364,8 @@ scripts/              性能计数器辅助脚本
 
 - SchedForge 是研究型 CPU AI 编译器原型，不是 oneDNN、XLA、IREE、TVM
   或生产级推理 Runtime 的替代品。
-- Transformer MLP、FP32 Top-2 MoE、精确 IO-aware Prefill Attention 与连续
-  KV Cache Split-KV Decode 已端到端执行并验证。
+- 完整 Dense/MoE Decoder Layer、Transformer MLP、FP32 Top-2 MoE、精确
+  IO-aware Prefill Attention 与连续 KV Cache Split-KV Decode 已端到端执行并验证。
 - 当前只在真实硬件上验证了 AVX2 后端。AVX-512 和 NEON 目前只有目标抽象，
   不能视为已经完成并验证的机器码后端。
 - MoE 的 P-core/E-core 放置、NUMA-aware 执行、量化 Expert、Block-sparse
@@ -352,6 +386,7 @@ scripts/              性能计数器辅助脚本
 - [显式 Scheduled LoopIR](docs/LOOP_IR.md)
 - [MoE Compiler Pipeline](docs/MOE_COMPILER.md)
 - [Attention Compiler Pipeline](docs/ATTENTION_COMPILER.md)
+- [Decoder Layer Compiler Pipeline](docs/DECODER_COMPILER.md)
 - [实验方法](docs/EXPERIMENT.md)
 - [最终实验报告](results/FINAL_REPORT.md)
 - [架构决策记录](docs/decisions/)

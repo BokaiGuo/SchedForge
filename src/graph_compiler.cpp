@@ -29,6 +29,13 @@ std::string op_name(GraphOpKind kind) {
         case GraphOpKind::Exp: return "tensor.exp";
         case GraphOpKind::Rsqrt: return "tensor.rsqrt";
         case GraphOpKind::Convert: return "tensor.convert";
+        case GraphOpKind::RmsNorm: return "tensor.rms_norm";
+        case GraphOpKind::RoPE: return "tensor.rope";
+        case GraphOpKind::Silu: return "tensor.silu";
+        case GraphOpKind::Concat: return "tensor.concat";
+        case GraphOpKind::Split: return "tensor.split";
+        case GraphOpKind::FusedQKVProjection: return "tensor.fused_qkv";
+        case GraphOpKind::FusedGateUpProjection: return "tensor.fused_gate_up";
         case GraphOpKind::Softmax: return "tensor.softmax";
         case GraphOpKind::Mask: return "tensor.mask";
         case GraphOpKind::AttentionSdpa: return "attention.sdpa";
@@ -251,6 +258,22 @@ std::vector<ShapeConstraint> ShapeInferencePass::run(TensorGraph& graph) const {
             const auto& lhs = graph.values().at(static_cast<std::size_t>(operation.inputs[0])).type;
             const auto& rhs = graph.values().at(static_cast<std::size_t>(operation.inputs[1])).type;
             output = lhs.shape.size() >= rhs.shape.size() ? lhs : rhs;
+        } else if (operation.kind == GraphOpKind::RmsNorm ||
+                   operation.kind == GraphOpKind::RoPE ||
+                   operation.kind == GraphOpKind::Silu) {
+            output = graph.values().at(static_cast<std::size_t>(operation.inputs[0])).type;
+        } else if (operation.kind == GraphOpKind::FusedQKVProjection ||
+                   operation.kind == GraphOpKind::FusedGateUpProjection) {
+            const auto& lhs = graph.values().at(static_cast<std::size_t>(operation.inputs[0])).type;
+            const auto& rhs = graph.values().at(static_cast<std::size_t>(operation.inputs[1])).type;
+            if (lhs.shape.size() != 2 || rhs.shape.size() != 2 ||
+                !same_dimension(lhs.shape[1], rhs.shape[0]))
+                throw std::invalid_argument("fused projection requires compatible rank-2 tensors");
+            output = {{lhs.shape[0], rhs.shape[1]}, lhs.dtype, {}, std::nullopt, 0, -1};
+        } else if (operation.kind == GraphOpKind::Concat || operation.kind == GraphOpKind::Split) {
+            if (operation.inputs.empty()) throw std::invalid_argument("concat/split requires input");
+            if (output.shape.empty())
+                output = graph.values().at(static_cast<std::size_t>(operation.inputs[0])).type;
         } else if (operation.kind == GraphOpKind::AttentionSdpa) {
             const auto& query = graph.values().at(static_cast<std::size_t>(operation.inputs[0])).type;
             const auto& key = graph.values().at(static_cast<std::size_t>(operation.inputs[1])).type;
@@ -379,7 +402,8 @@ std::vector<StructuredCompute> StructuredComputeLowering::run(const TensorGraph&
                 "attention.qk -> reduce.max -> vector.exp -> reduce.sum -> attention.pv"});
         } else if (operation.kind == GraphOpKind::Add || operation.kind == GraphOpKind::Gelu ||
                    operation.kind == GraphOpKind::Softmax || operation.kind == GraphOpKind::Mask ||
-                   operation.kind == GraphOpKind::SwiGLU ||
+                   operation.kind == GraphOpKind::RmsNorm || operation.kind == GraphOpKind::RoPE ||
+                   operation.kind == GraphOpKind::Silu || operation.kind == GraphOpKind::SwiGLU ||
                    operation.kind == GraphOpKind::MoeCombine) {
             computes.push_back({operation.name, {"i", "j"},
                 {IteratorKind::Parallel, IteratorKind::Parallel},
@@ -390,6 +414,14 @@ std::vector<StructuredCompute> StructuredComputeLowering::run(const TensorGraph&
                  IteratorKind::Parallel, IteratorKind::Reduction},
                 {"X(offset[e]+i,k)", "W(e,k,j)", "Y(offset[e]+i,j)"},
                 "Y_e(i,j) += X_e(i,k) * W_e(k,j)"});
+        } else if (operation.kind == GraphOpKind::FusedQKVProjection ||
+                   operation.kind == GraphOpKind::FusedGateUpProjection) {
+            computes.push_back({operation.name, {"i", "j", "k"},
+                {IteratorKind::Parallel, IteratorKind::Parallel, IteratorKind::Reduction},
+                {"X(i,k)", "W(k,j)", "Y(i,j)"},
+                operation.kind == GraphOpKind::FusedQKVProjection
+                    ? "fused_qkv(i,j) += X(i,k) * Wqkv(k,j)"
+                    : "fused_gate_up(i,j) += X(i,k) * Wgate_up(k,j)"});
         }
     }
     return computes;
@@ -1102,14 +1134,15 @@ TensorGraph StableHLOImporter::importText(const std::string& text) const {
     const std::regex argument_pattern(R"((%[A-Za-z0-9_]+)\s*:\s*(tensor<[^>]+>))");
     const std::regex result_pattern(R"((%[A-Za-z0-9_]+)\s*=\s*stablehlo\.([A-Za-z0-9_]+)\s+([^:]+)(?::\s*(tensor<[^>]+>))?)");
     while (std::getline(lines, line)) {
-        if (line.find("func.func") != std::string::npos) {
-            for (auto iterator = std::sregex_iterator(line.begin(), line.end(), argument_pattern);
-                 iterator != std::sregex_iterator(); ++iterator) {
-                const std::string name = (*iterator)[1];
-                if (!values.contains(name)) values[name] = graph.addInput(name.substr(1), parse_tensor_type((*iterator)[2]));
-            }
-            continue;
+        for (auto iterator = std::sregex_iterator(line.begin(), line.end(), argument_pattern);
+             iterator != std::sregex_iterator(); ++iterator) {
+            const std::string name = (*iterator)[1];
+            if (!values.contains(name))
+                values[name] = graph.addInput(name.substr(1), parse_tensor_type((*iterator)[2]));
         }
+        if (line.find("func.func") != std::string::npos ||
+            (line.find('=') == std::string::npos && line.find("stablehlo.") == std::string::npos))
+            continue;
         std::smatch match;
         if (std::regex_search(line, match, result_pattern)) {
             const std::string result = match[1];
@@ -1135,8 +1168,14 @@ TensorGraph StableHLOImporter::importText(const std::string& text) const {
             else if (operation_name == "exponential") kind = GraphOpKind::Exp;
             else if (operation_name == "rsqrt") kind = GraphOpKind::Rsqrt;
             else if (operation_name == "convert") kind = GraphOpKind::Convert;
-            else if (operation_name == "custom_call" && operands_text.find("Gelu") != std::string::npos)
-                kind = GraphOpKind::Gelu;
+            else if (operation_name == "custom_call") {
+                if (operands_text.find("RmsNorm") != std::string::npos) kind = GraphOpKind::RmsNorm;
+                else if (operands_text.find("RoPE") != std::string::npos) kind = GraphOpKind::RoPE;
+                else if (operands_text.find("SwiGLU") != std::string::npos) kind = GraphOpKind::SwiGLU;
+                else if (operands_text.find("SiLU") != std::string::npos) kind = GraphOpKind::Silu;
+                else if (operands_text.find("MoeFFN") != std::string::npos) kind = GraphOpKind::MoeCombine;
+                else if (operands_text.find("Gelu") != std::string::npos) kind = GraphOpKind::Gelu;
+            }
             if (!kind)
                 throw std::invalid_argument("unsupported StableHLO operation: " + operation_name);
             GraphTensorType type;

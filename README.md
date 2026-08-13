@@ -23,11 +23,14 @@ bufferization, and workspace reuse, then lowers each dispatch through
 Structured Tensor Compute, Transform IR, scheduled Loop IR, tensorization, and
 LLVM 18 ORC JIT or native AVX2 execution.
 
-The flagship graph workloads are a Transformer MLP block, a Top-2 MoE MLP, and
-exact Flash-style CPU attention. MatMul remains the kernel
-benchmark and hardware auto-tuning laboratory; the MLP is the graph/compiler
-benchmark that exercises real use-def chains, fusion boundaries, dynamic shape
-guards, temporary tensors, layout propagation, memory lifetime, and dispatch.
+The flagship workload is now a complete Llama/Mistral-style Transformer Decoder
+Layer. One StableHLO input is imported into one graph, compiled into one
+`DecoderExecutablePlan`, and executed by one runtime call across RMSNorm, fused
+QKV projection, RoPE, GQA/MQA Flash-style attention, output projection,
+residuals, and either Dense SwiGLU or Top-K MoE FFN. MatMul remains the kernel
+benchmark and hardware auto-tuning laboratory.
+
+`RMSNorm → Fused QKV → RoPE → GQA/MQA Attention → O Projection → Residual → RMSNorm → Dense SwiGLU / MoE → Residual`.
 
 `Router → Softmax → TopK → Segmented Dispatch → Grouped Expert SwiGLU → Weighted Combine`.
 
@@ -37,7 +40,8 @@ full attention matrix for the IO-aware lowering.
 ```mermaid
 flowchart TD
     A["StableHLO / Tensor Graph"] --> B["Tensor SSA + Shape Inference"]
-    B --> C["Canonicalization + Fusion Planner"]
+    B --> DL["Decoder Fusion: RMSNorm / QKV / RoPE / Gate-Up"]
+    DL --> C["Canonicalization + Fusion Planner"]
     C --> D["Dense Dispatch IR + Layout Planning"]
     C --> M1["MoE Router + TopK"]
     C --> A1["SDPA Fusion + Attention Strategy Planner"]
@@ -65,6 +69,9 @@ flowchart TD
 - **Graph compiler:** multi-op Tensor SSA, symbolic/static/dynamic dimensions,
   shape constraints, StableHLO subset import, canonicalization, fusion legality
   and profitability, Dispatch IR, and Transformer MLP compilation.
+- **Decoder Layer compiler:** one StableHLO graph to one executable plan with
+  RMSNorm, compile-time packed QKV/Gate-Up weights, RoPE, GQA/MQA attention,
+  residuals, Dense SwiGLU, and optional Top-K MoE execution.
 - **MoE compiler:** decomposed Router/TopK/Histogram/Prefix/Dispatch/Combine IR,
   segmented tensors, variable-M grouped expert GEMM, SwiGLU, token buckets,
   routing traces, and load-aware expert task scheduling.
@@ -165,6 +172,18 @@ cmake -S . -B build -G Ninja \
   --hidden=64 --intermediate=128 --threads=4 \
   -o results/transformer_mlp.sfe
 
+# Compile and execute one complete Dense Transformer Decoder Layer
+./build/schedforge-decoder examples/decoder_layer.mlir \
+  --batch=1 --sequence=4 --hidden=16 --intermediate=32 \
+  --q-heads=4 --kv-heads=2 --head-dim=4 --threads=2 \
+  -o results/decoder_dense.sfe
+
+# Execute the Decoder Layer with a Top-2 MoE FFN
+./build/schedforge-decoder examples/decoder_layer_moe.mlir --moe \
+  --batch=1 --sequence=4 --hidden=16 --intermediate=32 \
+  --q-heads=4 --kv-heads=2 --head-dim=4 --experts=4 --top-k=2 \
+  --threads=2 -o results/decoder_moe.sfe
+
 # Compile and run a dynamically routed Top-2 MoE MLP
 ./build/schedforge-moe --tokens=128 --hidden=512 --intermediate=2048 \
   --experts=8 --top-k=2 --threads=8 --router-data \
@@ -236,6 +255,23 @@ inspectable and verifiable before target lowering.
 | `schedforge-compile` | Compile StableHLO graphs into `.sfe` ExecutablePlans |
 | `schedforge-moe` | Compile, simulate, execute, and compare MoE execution plans |
 | `schedforge-attention` | Compile, tune, simulate, and execute attention plans |
+| `schedforge-decoder` | Compile and execute a complete Dense or MoE Decoder Layer |
+
+## Decoder Layer Compiler Demo
+
+SchedForge 0.7 compiles `examples/decoder_layer.mlir` or
+`examples/decoder_layer_moe.mlir` as one graph and emits a single `.sfe` plan
+containing the imported and canonical Tensor SSA graphs,
+fusion decisions, packed constants, memory plan, scheduled QKV/O/Gate-Up/Down
+LoopIR, embedded Attention or MoE plans, and LLVM kernel artifacts. Q, K, and V
+weights are concatenated once at compile time; Dense Gate and Up weights use the
+same specialization path.
+
+The checked-in real CPU smoke uses `B=1, S=4, H=16, I=32, Hq=4, Hkv=2, D=4`.
+The Dense path records **0.025 ms** end-to-end and the MoE path **0.099 ms**, both
+with **0.000** maximum printed error. These tiny-shape numbers validate one-plan
+execution and are not throughput claims. See `results/decoder_dense_run.txt`,
+`results/decoder_moe_run.txt`, and [the Decoder compiler design](docs/DECODER_COMPILER.md).
 
 ## MoE Compiler Demo
 
@@ -336,8 +372,9 @@ scripts/               Hardware-counter helpers
 
 - SchedForge is a research compiler prototype, not a replacement for oneDNN,
   XLA, IREE, TVM, or production inference runtimes.
-- The Transformer MLP, FP32 Top-2 MoE, exact IO-aware prefill attention, and
-  contiguous-KV Split-KV decode paths execute and validate end to end.
+- The complete Dense/MoE Decoder Layer, Transformer MLP, FP32 Top-2 MoE, exact
+  IO-aware prefill attention, and contiguous-KV Split-KV decode paths execute
+  and validate end to end.
 - AVX2 is the physically validated SIMD backend. AVX-512 and NEON are target
   abstractions but are not validated code-generation backends in this release.
 - MoE P-core/E-core placement, NUMA-aware execution, quantized experts,
@@ -358,6 +395,7 @@ scripts/               Hardware-counter helpers
 - [Explicit Scheduled LoopIR](docs/LOOP_IR.md)
 - [MoE compiler pipeline](docs/MOE_COMPILER.md)
 - [Attention compiler pipeline](docs/ATTENTION_COMPILER.md)
+- [Decoder Layer compiler pipeline](docs/DECODER_COMPILER.md)
 - [Experiment design](docs/EXPERIMENT.md)
 - [Final experiment report](results/FINAL_REPORT.md)
 - [Architecture decisions](docs/decisions/)

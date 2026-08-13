@@ -1,0 +1,25 @@
+[Import]
+StableHLO operations: 25
+
+[Fusion]
+decoder.fusion qkv=1 gate_up=1 rope=1
+
+[Constants]
+constant @packed_qkv_weight logical=[16,16,8,8] packed=[16,32] layout=qkv_interleaved_nr bytes=2048
+constant @packed_gate_up_weight logical=[16,32,32] packed=[16,64] layout=gate_up_interleaved_nr bytes=4096
+
+[Memory]
+naive: 4096 bytes
+workspace: 1536 bytes
+
+[Runtime]
+FFN: dense
+execution: 0.025 ms
+attention: 0.000 ms
+ffn: 0.009 ms
+
+[Validation]
+max error: 0.000
+
+[Hardware]
+x86_64 AVX2 vector=8 registers=16 cpus=20
