@@ -217,6 +217,23 @@ void test_compiler_architecture() {
             !register_jit.assembly_report.has_spill_pattern,
             "llvm generated register microkernel");
 
+    auto graph_epilogue_loop = schedforge::apply_schedule(
+        {8, 16, 8, true, false}, register_schedule);
+    schedforge::LoopOperation gelu;
+    gelu.kind = schedforge::LoopOpKind::Gelu;
+    graph_epilogue_loop.insertEpilogueBeforeStores(std::move(gelu));
+    schedforge::LoopOperation residual;
+    residual.kind = schedforge::LoopOpKind::AddResidual;
+    graph_epilogue_loop.insertEpilogueBeforeStores(std::move(residual));
+    auto graph_epilogue_data = register_data;
+    graph_epilogue_data.residual.resize(8 * 16, 0.125F);
+    const auto graph_epilogue_jit = schedforge::LLVMJITBackend{}.benchmark(
+        graph_epilogue_loop, graph_epilogue_data, 0, 1);
+    require(graph_epilogue_jit.max_error < 1.0e-3 &&
+            graph_epilogue_jit.llvm_ir.find("llvm.exp") != std::string::npos &&
+            graph_epilogue_jit.llvm_ir.find("residual") != std::string::npos,
+            "llvm consumes explicit graph epilogues");
+
     const std::vector<float> dtype_values{-1.25F, 0.0F, 0.75F, 3.5F};
     const auto bf16 = schedforge::convert_from_bf16(schedforge::convert_to_bf16(dtype_values));
     require(schedforge::max_abs_error(dtype_values, bf16) < 0.02, "bf16 conversion");
@@ -292,6 +309,26 @@ void test_graph_compiler() {
     require(replayed.mr == plan.dispatches.front().schedule.mr &&
             replayed.nr == plan.dispatches.front().schedule.nr,
             "transform ir replay");
+    const auto transformed_loop = schedforge::TransformProgram::parse(
+        plan.dispatches.front().transforms.dump()).apply(
+            plan.dispatches.front().kernel_problem);
+    const auto transformed_execution = schedforge::analyze_loop_ir(transformed_loop);
+    require(transformed_execution.bm == plan.dispatches.front().schedule.bm &&
+            transformed_execution.vector_width == plan.dispatches.front().schedule.vector_width,
+            "transform ir directly lowers loop ir");
+
+    const auto dynamic_plan = schedforge::GraphCompiler{}.compile(
+        schedforge::build_transformer_mlp_graph(config, true), options);
+    const auto specialized_plan = dynamic_plan.specializeMLP(config, &data);
+    require(specialized_plan.scheduled_loops.size() == 2 &&
+            specialized_plan.scheduled_loops.front().problem.m == config.batch * config.sequence &&
+            specialized_plan.llvm_ir.size() == 2 &&
+            specialized_plan.guards.size() == 1,
+            "dynamic executable specialization");
+    const auto specialized_result = schedforge::execute_mlp(
+        specialized_plan, config, data, 0, 1);
+    require(specialized_result.max_error < 1.0e-3,
+            "specialized executable runtime correctness");
 
     auto quantized = schedforge::build_transformer_mlp_graph(config);
     quantized.values()[0].type.dtype = schedforge::DataType::I8;
@@ -303,6 +340,21 @@ void test_graph_compiler() {
     const auto attention_constraints = schedforge::ShapeInferencePass{}.run(attention);
     require(attention.operations().size() >= 15 && !attention_constraints.empty(),
             "mini attention graph");
+    schedforge::TensorGraph fused_attention;
+    const auto attention_type = schedforge::GraphTensorType{{
+        schedforge::Dimension::fixed(1), schedforge::Dimension::fixed(4),
+        schedforge::Dimension::fixed(8), schedforge::Dimension::fixed(16)}};
+    const int query = fused_attention.addInput("q", attention_type);
+    const int key = fused_attention.addInput("k", attention_type);
+    const int value = fused_attention.addInput("v", attention_type);
+    const int sdpa = fused_attention.addOperation(
+        schedforge::GraphOpKind::AttentionSdpa, "sdpa", {query, key, value});
+    fused_attention.setReturn(sdpa);
+    schedforge::ShapeInferencePass{}.run(fused_attention);
+    const auto attention_compute = schedforge::StructuredComputeLowering{}.run(fused_attention);
+    require(attention_compute.size() == 1 && attention_compute.front().iterators.size() == 6 &&
+            attention_compute.front().body.find("attention.qk") != std::string::npos,
+            "structured attention compute lowering");
 
     schedforge::MeasurementDatabase database;
     schedforge::Schedule learned_schedule;
@@ -322,6 +374,29 @@ void test_graph_compiler() {
     require(learned.trained() && std::isfinite(learned.predictMilliseconds(
         {8, 8, 8, true, true}, learned_schedule, simulated)), "learned cost model");
 
+    schedforge::MeasurementDatabase tuning_database;
+    schedforge::Schedule measured_first = plan.dispatches.front().schedule;
+    measured_first.bm = 16;
+    measured_first.threads = 1;
+    tuning_database.add({plan.dispatches.front().kernel_problem, measured_first,
+                         schedforge::simulate(schedforge::LoopIR{
+                             plan.dispatches.front().kernel_problem, measured_first}), 0.005});
+    schedforge::Schedule measured_second = plan.dispatches.back().schedule;
+    measured_second.bm = 16;
+    measured_second.threads = 1;
+    tuning_database.add({plan.dispatches.back().kernel_problem, measured_second,
+                         schedforge::simulate(schedforge::LoopIR{
+                             plan.dispatches.back().kernel_problem, measured_second}), 0.006});
+    tuning_database.saveCsv("build/test-tuning-database.csv");
+    auto database_options = options;
+    database_options.measurement_database = "build/test-tuning-database.csv";
+    const auto database_plan = schedforge::GraphCompiler{}.compile(
+        schedforge::build_transformer_mlp_graph(config), database_options);
+    require(database_plan.dispatches.front().schedule.bm == 16 &&
+            database_plan.dispatches.front().tuning_source == "measurement_database" &&
+            database_plan.dump().find("tuning<source=measurement_database") != std::string::npos,
+            "measurement database drives transform selection");
+
     const auto imported = schedforge::StableHLOImporter{}.importText(
         "func.func @main(%x: tensor<4x8xf32>, %w: tensor<8x16xf32>, %b: tensor<16xf32>) {\n"
         "  %0 = stablehlo.dot_general %x, %w : tensor<4x16xf32>\n"
@@ -329,6 +404,14 @@ void test_graph_compiler() {
         "  return %1\n}\n");
     require(imported.operations().size() >= 6 && imported.returnValue() >= 0,
             "stablehlo subset importer");
+    const auto imported_constant = schedforge::StableHLOImporter{}.importText(
+        "func.func @main(%x: tensor<4x8xf32>) {\n"
+        "  %c = stablehlo.constant dense<1.0> : tensor<4x8xf32>\n"
+        "  %0 = stablehlo.add %x, %c : tensor<4x8xf32>\n"
+        "  return %0\n}\n");
+    require(imported_constant.dump().find("tensor.constant") != std::string::npos &&
+            imported_constant.dump().find("value=dense<1.0>") != std::string::npos,
+            "stablehlo constant importer");
     bool rejected_unsupported = false;
     try {
         schedforge::StableHLOImporter{}.importText(

@@ -97,10 +97,16 @@ ISA-specialized AVX-512 BF16 or VNNI implementations.
 
 ## Graph Compiler Validation
 
-SchedForge 0.5 retains the explicit executable-IR backbone for the model-to-machine
+SchedForge 0.6 closes the explicit executable-IR backbone for the model-to-machine
 Transformer MLP path. The checked-in
 StableHLO example is canonicalized to 12 Tensor SSA operations and compiled into
 two dispatches: `MatMul + Bias + GELU` and `MatMul + Bias + Residual`.
+
+The v0.6 compiler path now uses `TransformProgram::apply` to generate verified
+Scheduled LoopIR, can select exact-shape schedules from a measurement database,
+and can concretize symbolic `B*S` plans into new buffer plans, dispatch problems,
+LoopIR, guards, and LLVM artifacts. StableHLO constants are preserved in Tensor
+SSA rather than discarded during import.
 
 For the recorded `batch=1, sequence=16, hidden=64, intermediate=128` run:
 
@@ -109,6 +115,20 @@ For the recorded `batch=1, sequence=16, hidden=64, intermediate=128` run:
 - propagated inter-dispatch layout: `blocked<6x16>`
 - naive intermediate memory: 32,768 bytes
 - planned workspace: 8,192 bytes
+- native and LLVM graph epilogues: explicit GELU and residual LoopIR operations
+- LLVM validation: final graph LoopIR JIT output remains below `1e-3` max error
+
+The non-autotuned v0.6 architecture smoke on the same host used four threads,
+compiled two LLVM kernels, executed the native Scheduled LoopIR MLP in **0.038
+ms**, and reported zero at the displayed three-decimal error precision. This is
+a functional architecture snapshot, not a replacement for the earlier autotuned
+0.021 ms performance record. Raw v0.6 evidence is stored in:
+
+- `results/transformer_mlp_v06_compile.txt`
+- `results/transformer_mlp_v06.sfe`
+
+The earlier autotuned graph-compiler record remains:
+
 - generated LLVM kernels: 2
 - compiled Scheduled LoopIR programs: 2
 - generated schedule candidates per dispatch: 16,200

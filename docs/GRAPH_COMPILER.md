@@ -44,9 +44,25 @@ transform.sequence {
 }
 ```
 
-`TransformProgram::parse` and `replay` reconstruct the payload schedule. This is
-also the serialization boundary used by the executable plan and future schedule
-mutation/search work.
+`TransformProgram::parse` and `replay` reconstruct the payload schedule, while
+`TransformProgram::apply` directly lowers that program into verified executable
+LoopIR. Graph compilation uses this path, so Transform IR is no longer only a
+serialized description beside an independently-created kernel.
+
+## Guarded Specialization
+
+`ExecutablePlan::specializeMLP` resolves the symbolic `B*S` dimension and then
+recomputes shape inference, buffer sizes, Dispatch kernel problems, Scheduled
+LoopIR, exact guards, and LLVM artifacts. The resulting plan is independently
+executable; the guard is not metadata attached to a static fallback kernel.
+
+## Measurement Database
+
+`MeasurementDatabase` stores real hardware latency records keyed by problem and
+schedule, including fused Bias/ReLU semantics. `GraphCompiler` can load this
+database and select the fastest exact workload match before Transform IR lowering. The Dispatch records whether its
+schedule came from defaults, a measurement database, the auto-tuning cache, or a
+new hardware auto-tuning run.
 
 ## `.sfe` ExecutablePlan
 
@@ -62,10 +78,10 @@ The text `.sfe` artifact contains:
 - LLVM IR kernel artifacts
 
 The current runtime executes the Transformer MLP plan through the compiled
-Scheduled LoopIR selected by hardware auto-tuning. GELU and residual are
-explicit LoopIR epilogues rather than hand-written wrapper steps. LLVM ORC
-kernels lower the MatMul/bias portion of the same dispatch LoopIR and are
-embedded in the plan, but the graph runtime does not yet load those embedded
-kernels back from `.sfe`.
+Scheduled LoopIR selected by hardware auto-tuning or the measurement database.
+GELU and residual are explicit LoopIR epilogues rather than hand-written wrapper
+steps. LLVM ORC kernels now lower those same graph epilogues from the final
+Scheduled LoopIR and are embedded in the plan, but the graph runtime does not yet
+load embedded kernels back from a parsed `.sfe` file.
 Other imported graphs can already be compiled and serialized even when a
 graph-specific runtime executor is not yet available.

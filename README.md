@@ -75,8 +75,8 @@ flowchart TD
   propagation, dispatch-boundary materialization, bufferization, lifetime
   analysis, aligned workspace reuse, and guarded shape specialization.
 - **Structured kernel compiler:** iteration domains, parallel/reduction
-  iterators, indexing maps, Transform IR serialization/replay, and schedule
-  programs generated from measured winners.
+  iterators, indexing maps, Transform IR serialization/replay/direct LoopIR
+  application, and schedule programs generated from measured winners.
 - **Explicit executable LoopIR:** Schedule programs rewrite concrete
   `scf.for`, `scf.parallel`, pack, prefetch, load, accumulator, vector FMA,
   epilogue, and store operations. Native execution, simulation, and LLVM
@@ -91,12 +91,16 @@ flowchart TD
   bandwidth calibration, and target-aware cost estimation.
 - **Measurement-first auto-tuning:** every deduplicated legal candidate is run
   on real hardware before randomized finalist remeasurement; analytical and
-  learned cost-model APIs consume the resulting measurement database.
+  learned cost-model APIs consume the resulting measurement database, and
+  `schedforge-compile --measurement-db=records.csv` reuses measured winners.
 - **AI runtime:** serializable `.sfe` ExecutablePlan with constants, buffers,
-  dispatches, shape guards, Transform IR, LLVM kernel artifacts, and workspace.
+  dispatches, shape guards, Transform IR, LLVM kernel artifacts, and workspace;
+  MLP specialization concretizes dynamic Tensor SSA, buffers, loops, and LLVM.
 - **Transformer and inference abstractions:** executable Dense MLP, MoE, prefill
   attention and KV-cache decode; quantized tensor metadata, per-axis quantization
   propagation, BF16/INT8 reference paths, and adaptive specialization guards.
+- **Single-source graph epilogues:** native execution and LLVM ORC both consume
+  explicit Scheduled LoopIR GELU/residual operations rather than wrapper code.
 
 ## Quick Start
 

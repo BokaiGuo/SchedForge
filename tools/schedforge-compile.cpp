@@ -1,6 +1,7 @@
 #include "schedforge/graph_compiler.h"
 
 #include <cstdlib>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <string>
@@ -16,6 +17,7 @@ struct Options {
     schedforge::MLPConfig mlp;
     int threads = 8;
     std::size_t top_k = 8;
+    std::filesystem::path measurement_database;
 };
 
 Options parse(int argc, char** argv) {
@@ -27,6 +29,7 @@ Options parse(int argc, char** argv) {
         else if (argument == "--no-run") options.run = false;
         else if (argument.starts_with("--threads=")) options.threads = std::stoi(argument.substr(10));
         else if (argument.starts_with("--top-k=")) options.top_k = static_cast<std::size_t>(std::stoul(argument.substr(8)));
+        else if (argument.starts_with("--measurement-db=")) options.measurement_database = argument.substr(17);
         else if (argument.starts_with("--batch=")) options.mlp.batch = std::stoi(argument.substr(8));
         else if (argument.starts_with("--sequence=")) options.mlp.sequence = std::stoi(argument.substr(11));
         else if (argument.starts_with("--hidden=")) options.mlp.hidden = std::stoi(argument.substr(9));
@@ -35,7 +38,7 @@ Options parse(int argc, char** argv) {
         else if (argument == "--help") {
             std::cout << "schedforge-compile MODEL.mlir [--target=native-cpu] [--autotune] [-o model.sfe]\n"
                          "                   [--batch=1 --sequence=16 --hidden=64 --intermediate=128]\n"
-                         "                   [--threads=8 --top-k=8 --no-run]\n";
+                         "                   [--threads=8 --top-k=8 --measurement-db=records.csv --no-run]\n";
             std::exit(0);
         } else if (!argument.starts_with('-')) options.input = argument;
         else throw std::invalid_argument("unknown option: " + argument);
@@ -56,6 +59,7 @@ int main(int argc, char** argv) {
         compile_options.autotune = options.autotune;
         compile_options.max_threads = options.threads;
         compile_options.top_k = options.top_k;
+        compile_options.measurement_database = options.measurement_database;
         const auto plan = schedforge::GraphCompiler{}.compile(
             std::move(graph), compile_options, &options.mlp, &data);
         plan.save(options.output);
@@ -82,7 +86,8 @@ int main(int argc, char** argv) {
             std::cout << "dispatch #" << index << ": candidates="
                       << dispatch.tuning_search_space << " hardware measured="
                       << dispatch.hardware_measurements << " cache="
-                      << (dispatch.tuning_cache_hit ? "hit" : "miss") << '\n';
+                      << (dispatch.tuning_cache_hit ? "hit" : "miss")
+                      << " source=" << dispatch.tuning_source << '\n';
         }
         std::cout << "\n[LLVM]\nkernels generated: " << plan.llvm_ir.size()
                   << "\nJIT compile: " << std::fixed << std::setprecision(3)

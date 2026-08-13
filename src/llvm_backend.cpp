@@ -35,8 +35,8 @@
 namespace schedforge {
 namespace {
 
-using MatMulFunction = void (*)(const float*, const float*, const float*, float*, std::int64_t,
-                                std::int64_t, std::int64_t);
+using MatMulFunction = void (*)(const float*, const float*, const float*, const float*, float*,
+                                std::int64_t, std::int64_t, std::int64_t);
 
 struct CachedKernel {
     std::unique_ptr<llvm::orc::LLJIT> jit;
@@ -68,7 +68,53 @@ llvm::Value* gep2d(llvm::IRBuilder<>& builder, llvm::Type* float_type,
     return builder.CreateGEP(float_type, base, index);
 }
 
-void build_ijk_function(llvm::Module& module, const Problem& problem) {
+llvm::Constant* constant_like(llvm::Type* type, double value) {
+    if (auto* vector_type = llvm::dyn_cast<llvm::FixedVectorType>(type)) {
+        return llvm::ConstantVector::getSplat(
+            vector_type->getElementCount(),
+            llvm::ConstantFP::get(vector_type->getElementType(), value));
+    }
+    return llvm::ConstantFP::get(type, value);
+}
+
+llvm::Value* apply_graph_epilogue(llvm::Module& module, llvm::IRBuilder<>& builder,
+                                  llvm::Value* value, llvm::Value* residual,
+                                  llvm::Value* index, const LoopExecutionPlan& execution) {
+    if (execution.gelu) {
+        auto* type = value->getType();
+        auto* square = builder.CreateFMul(value, value);
+        auto* cube = builder.CreateFMul(square, value);
+        auto* inner = builder.CreateFAdd(value,
+            builder.CreateFMul(constant_like(type, 0.044715), cube));
+        auto* scaled = builder.CreateFMul(constant_like(type, 0.7978845608), inner);
+        auto* exp_intrinsic = llvm::Intrinsic::getDeclaration(
+            &module, llvm::Intrinsic::exp, {type});
+        auto* fabs_intrinsic = llvm::Intrinsic::getDeclaration(
+            &module, llvm::Intrinsic::fabs, {type});
+        auto* absolute = builder.CreateCall(fabs_intrinsic, {scaled});
+        auto* exponential = builder.CreateCall(
+            exp_intrinsic, {builder.CreateFMul(constant_like(type, -2.0), absolute)});
+        auto* magnitude = builder.CreateFDiv(
+            builder.CreateFSub(constant_like(type, 1.0), exponential),
+            builder.CreateFAdd(constant_like(type, 1.0), exponential));
+        auto* activated = builder.CreateSelect(
+            builder.CreateFCmpOLT(scaled, constant_like(type, 0.0)),
+            builder.CreateFNeg(magnitude), magnitude);
+        value = builder.CreateFMul(
+            builder.CreateFMul(constant_like(type, 0.5), value),
+            builder.CreateFAdd(constant_like(type, 1.0), activated));
+    }
+    if (execution.residual) {
+        auto* residual_ptr = builder.CreateGEP(builder.getFloatTy(), residual, index);
+        auto* residual_value = builder.CreateLoad(value->getType(), residual_ptr);
+        residual_value->setAlignment(llvm::Align(1));
+        value = builder.CreateFAdd(value, residual_value);
+    }
+    return value;
+}
+
+void build_ijk_function(llvm::Module& module, const Problem& problem,
+                        const LoopExecutionPlan& execution) {
     auto& context = module.getContext();
     llvm::IRBuilder<> builder(context);
     auto* void_type = builder.getVoidTy();
@@ -76,7 +122,7 @@ void build_ijk_function(llvm::Module& module, const Problem& problem) {
     auto* pointer_type = builder.getPtrTy();
     auto* i64_type = builder.getInt64Ty();
     auto* function_type = llvm::FunctionType::get(
-        void_type, {pointer_type, pointer_type, pointer_type, pointer_type,
+        void_type, {pointer_type, pointer_type, pointer_type, pointer_type, pointer_type,
                     i64_type, i64_type, i64_type}, false);
     auto* function = llvm::Function::Create(function_type, llvm::Function::ExternalLinkage,
                                             "schedforge_matmul", module);
@@ -84,6 +130,7 @@ void build_ijk_function(llvm::Module& module, const Problem& problem) {
     llvm::Value* a = arguments++; a->setName("A");
     llvm::Value* b = arguments++; b->setName("B");
     llvm::Value* bias = arguments++; bias->setName("bias");
+    llvm::Value* residual = arguments++; residual->setName("residual");
     llvm::Value* c = arguments++; c->setName("C");
     llvm::Value* m = arguments++; m->setName("M");
     llvm::Value* n = arguments++; n->setName("N");
@@ -143,6 +190,8 @@ void build_ijk_function(llvm::Module& module, const Problem& problem) {
         result = builder.CreateSelect(positive, result, llvm::ConstantFP::get(float_type, 0.0));
     }
     auto* c_ptr = gep2d(builder, float_type, c, i, n, j);
+    auto* output_index = builder.CreateAdd(builder.CreateMul(i, n), j);
+    result = apply_graph_epilogue(module, builder, result, residual, output_index, execution);
     builder.CreateStore(result, c_ptr);
     builder.CreateBr(j_latch);
 
@@ -181,7 +230,7 @@ void build_register_tiled_function(llvm::Module& module, const Problem& problem,
     auto* i64_type = builder.getInt64Ty();
     auto* pointer_type = builder.getPtrTy();
     auto* function_type = llvm::FunctionType::get(
-        builder.getVoidTy(), {pointer_type, pointer_type, pointer_type, pointer_type,
+        builder.getVoidTy(), {pointer_type, pointer_type, pointer_type, pointer_type, pointer_type,
                               i64_type, i64_type, i64_type}, false);
     auto* function = llvm::Function::Create(function_type, llvm::Function::ExternalLinkage,
                                             "schedforge_matmul", module);
@@ -189,6 +238,7 @@ void build_register_tiled_function(llvm::Module& module, const Problem& problem,
     llvm::Value* a = arguments++; a->setName("A");
     llvm::Value* b = arguments++; b->setName("B");
     llvm::Value* bias = arguments++; bias->setName("bias");
+    llvm::Value* residual = arguments++; residual->setName("residual");
     llvm::Value* c = arguments++; c->setName("C");
     llvm::Value* m = arguments++; m->setName("M");
     llvm::Value* n = arguments++; n->setName("N");
@@ -278,6 +328,10 @@ void build_register_tiled_function(llvm::Module& module, const Problem& problem,
                         auto* zero = llvm::Constant::getNullValue(vector_type);
                         value = builder.CreateSelect(builder.CreateFCmpOGT(value, zero), value, zero);
                     }
+                    auto* output_index = builder.getInt64(
+                        (row + row_index) * problem.n + column + vector_index * width);
+                    value = apply_graph_epilogue(
+                        module, builder, value, residual, output_index, execution);
                     auto* c_ptr = gep2d(builder, float_type, c,
                         builder.getInt64(row + row_index), n,
                         builder.getInt64(column + vector_index * width));
@@ -293,14 +347,15 @@ void build_register_tiled_function(llvm::Module& module, const Problem& problem,
     builder.CreateRetVoid();
 }
 
-void build_ikj_function(llvm::Module& module, const Problem& problem, int vector_width) {
+void build_ikj_function(llvm::Module& module, const Problem& problem,
+                        const LoopExecutionPlan& execution) {
     auto& context = module.getContext();
     llvm::IRBuilder<> builder(context);
     auto* float_type = builder.getFloatTy();
     auto* i64_type = builder.getInt64Ty();
     auto* pointer_type = builder.getPtrTy();
     auto* function_type = llvm::FunctionType::get(
-        builder.getVoidTy(), {pointer_type, pointer_type, pointer_type, pointer_type,
+        builder.getVoidTy(), {pointer_type, pointer_type, pointer_type, pointer_type, pointer_type,
                               i64_type, i64_type, i64_type}, false);
     auto* function = llvm::Function::Create(function_type, llvm::Function::ExternalLinkage,
                                             "schedforge_matmul", module);
@@ -308,11 +363,12 @@ void build_ikj_function(llvm::Module& module, const Problem& problem, int vector
     llvm::Value* a = arguments++; a->setName("A");
     llvm::Value* b = arguments++; b->setName("B");
     llvm::Value* bias = arguments++; bias->setName("bias");
+    llvm::Value* residual = arguments++; residual->setName("residual");
     llvm::Value* c = arguments++; c->setName("C");
     llvm::Value* m = arguments++; m->setName("M");
     llvm::Value* n = arguments++; n->setName("N");
     llvm::Value* k_size = arguments++; k_size->setName("K");
-    const int width = std::max(1, vector_width);
+    const int width = std::max(1, execution.vector_width);
     auto* vector_type = llvm::FixedVectorType::get(float_type, static_cast<unsigned>(width));
 
     auto* entry = llvm::BasicBlock::Create(context, "entry", function);
@@ -453,6 +509,8 @@ void build_ikj_function(llvm::Module& module, const Problem& problem, int vector
         result = builder.CreateSelect(builder.CreateFCmpOGT(result, llvm::ConstantFP::get(float_type, 0.0)),
                                       result, llvm::ConstantFP::get(float_type, 0.0));
     }
+    auto* output_index = builder.CreateAdd(builder.CreateMul(epilogue_i, n), epilogue_j);
+    result = apply_graph_epilogue(module, builder, result, residual, output_index, execution);
     builder.CreateStore(result, result_ptr);
     auto* epilogue_j_next = builder.CreateAdd(epilogue_j, builder.getInt64(1));
     builder.CreateBr(epilogue_j_header);
@@ -542,8 +600,8 @@ LLVMJITResult LLVMJITBackend::benchmark(const LoopIR& loop, const TensorData& da
         if (can_build_register_kernel(loop.problem, execution))
             build_register_tiled_function(*module, loop.problem, execution);
         else if (execution.vector_width > 1 || execution.order == LoopOrder::IKJ)
-            build_ikj_function(*module, loop.problem, execution.vector_width);
-        else build_ijk_function(*module, loop.problem);
+            build_ikj_function(*module, loop.problem, execution);
+        else build_ijk_function(*module, loop.problem, execution);
         if (llvm::verifyModule(*module, &llvm::errs())) throw std::runtime_error("LLVM module verification failed");
         optimize_module(*module);
         auto kernel = std::make_shared<CachedKernel>();
@@ -574,20 +632,21 @@ LLVMJITResult LLVMJITBackend::benchmark(const LoopIR& loop, const TensorData& da
 
     std::vector<float> output(static_cast<std::size_t>(loop.problem.m) * loop.problem.n);
     for (int iteration = 0; iteration < std::max(0, warmup); ++iteration) {
-        cached->function(data.a.data(), data.b.data(), data.bias.data(), output.data(), loop.problem.m,
-                 loop.problem.n, loop.problem.k);
+        cached->function(data.a.data(), data.b.data(), data.bias.data(), data.residual.data(),
+                         output.data(), loop.problem.m, loop.problem.n, loop.problem.k);
     }
     std::vector<double> timings;
     for (int iteration = 0; iteration < std::max(1, repetitions); ++iteration) {
         const auto start = std::chrono::steady_clock::now();
-        cached->function(data.a.data(), data.b.data(), data.bias.data(), output.data(), loop.problem.m,
-                 loop.problem.n, loop.problem.k);
+        cached->function(data.a.data(), data.b.data(), data.bias.data(), data.residual.data(),
+                         output.data(), loop.problem.m, loop.problem.n, loop.problem.k);
         const auto end = std::chrono::steady_clock::now();
         timings.push_back(std::chrono::duration<double, std::milli>(end - start).count());
     }
     std::sort(timings.begin(), timings.end());
     const double execution_ms = timings[timings.size() / 2];
-    const auto expected = reference(loop.problem, data);
+    std::vector<float> expected;
+    execute(loop, data, expected);
     const double operations = 2.0 * loop.problem.m * loop.problem.n * loop.problem.k;
     const double compile_milliseconds = cache_hit ? 0.0
         : std::chrono::duration<double, std::milli>(compile_end - compile_start).count();

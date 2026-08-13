@@ -88,7 +88,7 @@ flowchart LR
 - **内存与布局编译**：Layout 进入 Tensor Type；支持跨 Dispatch 布局传播、
   Bufferization、生命周期分析、64 字节对齐 Workspace 复用和 Guarded Specialization。
 - **结构化 Kernel Compiler**：Iteration Domain、并行/归约 Iterator、Indexing Map、
-  Transform IR 序列化与回放，以及由实测 Schedule 生成的变换程序。
+  Transform IR 序列化、回放与直接生成 LoopIR，以及由实测 Schedule 生成的变换程序。
 - **显式可执行 LoopIR**：Schedule 会真正 rewrite 出 `scf.for`、
   `scf.parallel`、Pack、Prefetch、Load、Accumulator、Vector FMA、Epilogue
   和 Store。原生执行、Simulator 与 LLVM 都消费 LoopIR，不再读取 Schedule 字段。
@@ -99,11 +99,15 @@ flowchart LR
 - **硬件感知代价模型**：模拟组相联 L1/L2/L3 Cache、DTLB、软件预取、
   寄存器占用、潜在 Spill、数据打包开销和内存带宽。
 - **真机优先自动调优**：所有去重后的合法候选都先在真实硬件运行，再对实测
-  前列随机交错复测；测量数据库可用于 analytical + learned 混合模型。
+  前列随机交错复测；测量数据库可用于 analytical + learned 混合模型，也可通过
+  `schedforge-compile --measurement-db=records.csv` 直接复用实测赢家。
 - **AI Runtime**：可序列化 `.sfe` ExecutablePlan，包含常量、Buffer、Dispatch、
-  Shape Guard、Transform IR、LLVM Kernel Artifact 和 Workspace。
+  Shape Guard、Transform IR、LLVM Kernel Artifact 和 Workspace；MLP 特化会同时
+  具体化动态 Tensor SSA、Buffer、LoopIR 与 LLVM Artifact。
 - **Transformer/推理抽象**：可执行 Dense MLP、MoE、IO-aware Prefill 与
   KV-cache Decode；量化 Tensor 元数据与传播、BF16/INT8 参考路径和动态 Guard。
+- **单一真源图 Epilogue**：原生执行与 LLVM ORC 都消费 Scheduled LoopIR 中显式的
+  GELU/Residual 操作，不再依赖后端外层手写包装逻辑。
 
 ## 快速开始
 

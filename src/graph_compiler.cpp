@@ -144,6 +144,19 @@ std::string GraphOperation::str(const std::vector<GraphValue>& values) const {
     if (!outputs.empty()) out << value_name(outputs.front()) << " = ";
     out << op_name(kind);
     for (const int input : inputs) out << ' ' << value_name(input);
+    if (!attributes.empty()) {
+        out << " {";
+        std::vector<std::pair<std::string, std::string>> sorted_attributes(
+            attributes.begin(), attributes.end());
+        std::sort(sorted_attributes.begin(), sorted_attributes.end());
+        bool first = true;
+        for (const auto& [key, value] : sorted_attributes) {
+            if (!first) out << ", ";
+            out << key << '=' << value;
+            first = false;
+        }
+        out << '}';
+    }
     if (!outputs.empty()) out << " : " << values.at(static_cast<std::size_t>(outputs.front())).type.str();
     return out.str();
 }
@@ -155,6 +168,12 @@ int TensorGraph::addInput(std::string name, GraphTensorType type, bool constant)
     operations_.push_back({constant ? GraphOpKind::Constant : GraphOpKind::Input,
                            values_.back().name, {}, {value_index}, {}});
     return value_index;
+}
+
+int TensorGraph::addConstant(std::string name, GraphTensorType type, std::string literal) {
+    const int value = addInput(std::move(name), std::move(type), true);
+    operations_.back().attributes["value"] = std::move(literal);
+    return value;
 }
 
 int TensorGraph::addOperation(GraphOpKind kind, std::string name, std::vector<int> inputs,
@@ -352,9 +371,15 @@ std::vector<StructuredCompute> StructuredComputeLowering::run(const TensorGraph&
             computes.push_back({operation.name, {"i", "j", "k"},
                 {IteratorKind::Parallel, IteratorKind::Parallel, IteratorKind::Reduction},
                 {"A(i,k)", "B(k,j)", "C(i,j)"}, "C(i,j) += A(i,k) * B(k,j)"});
+        } else if (operation.kind == GraphOpKind::AttentionSdpa) {
+            computes.push_back({operation.name, {"b", "h", "qi", "kj", "d", "dv"},
+                {IteratorKind::Parallel, IteratorKind::Parallel, IteratorKind::Parallel,
+                 IteratorKind::Reduction, IteratorKind::Reduction, IteratorKind::Parallel},
+                {"Q(b,h,qi,d)", "K(b,hkv,kj,d)", "V(b,hkv,kj,dv)", "O(b,h,qi,dv)"},
+                "attention.qk -> reduce.max -> vector.exp -> reduce.sum -> attention.pv"});
         } else if (operation.kind == GraphOpKind::Add || operation.kind == GraphOpKind::Gelu ||
                    operation.kind == GraphOpKind::Softmax || operation.kind == GraphOpKind::Mask ||
-                   operation.kind == GraphOpKind::AttentionSdpa || operation.kind == GraphOpKind::SwiGLU ||
+                   operation.kind == GraphOpKind::SwiGLU ||
                    operation.kind == GraphOpKind::MoeCombine) {
             computes.push_back({operation.name, {"i", "j"},
                 {IteratorKind::Parallel, IteratorKind::Parallel},
@@ -365,12 +390,6 @@ std::vector<StructuredCompute> StructuredComputeLowering::run(const TensorGraph&
                  IteratorKind::Parallel, IteratorKind::Reduction},
                 {"X(offset[e]+i,k)", "W(e,k,j)", "Y(offset[e]+i,j)"},
                 "Y_e(i,j) += X_e(i,k) * W_e(k,j)"});
-        } else if (operation.kind == GraphOpKind::AttentionSdpa) {
-            computes.push_back({operation.name, {"b", "h", "qi", "kj", "d", "dv"},
-                {IteratorKind::Parallel, IteratorKind::Parallel, IteratorKind::Parallel,
-                 IteratorKind::Reduction, IteratorKind::Reduction, IteratorKind::Parallel},
-                {"Q(b,h,qi,d)", "K(b,hkv,kj,d)", "V(b,hkv,kj,dv)", "O(b,h,qi,dv)"},
-                "attention.qk -> reduce.max -> vector.exp -> reduce.sum -> attention.pv"});
         }
     }
     return computes;
@@ -450,6 +469,12 @@ Schedule TransformProgram::replay(Schedule schedule) const {
         }
     }
     return schedule;
+}
+
+LoopIR TransformProgram::apply(const Problem& problem, Schedule seed) const {
+    auto loop = apply_schedule(problem, replay(std::move(seed)));
+    verify_loop_ir(loop);
+    return loop;
 }
 
 std::string TransformProgram::dump() const {
@@ -576,6 +601,8 @@ std::string Dispatch::dump(const TensorGraph& graph) const {
         out << "  " << graph.operations().at(static_cast<std::size_t>(index)).str(graph.values()) << '\n';
     out << "}\n  " << transforms.dump();
     if (intrinsic) out << "\n  intrinsic @" << intrinsic->name;
+    out << "\n tuning<source=" << tuning_source << ", measurements="
+        << hardware_measurements << ", cache=" << (tuning_cache_hit ? "hit" : "miss") << '>';
     out << "\n cost<saved_bytes=" << fusion_cost.saved_memory_bytes
         << ", register_pressure=" << fusion_cost.register_pressure
         << ", speedup=" << fusion_cost.estimated_speedup << ">";
@@ -734,6 +761,82 @@ std::string ExecutablePlan::dump() const {
     return out.str();
 }
 
+ExecutablePlan ExecutablePlan::specializeMLP(const MLPConfig& config,
+                                             const MLPData* data) const {
+    if (config.batch <= 0 || config.sequence <= 0 || config.hidden <= 0 ||
+        config.intermediate <= 0) {
+        throw std::invalid_argument("MLP specialization dimensions must be positive");
+    }
+    ExecutablePlan specialized = *this;
+    const std::int64_t rows = static_cast<std::int64_t>(config.batch) * config.sequence;
+    for (auto& value : specialized.graph.values()) {
+        for (auto& dimension : value.type.shape) {
+            if (dimension.kind == DimensionKind::Static) continue;
+            if (dimension.symbol == "B*S" || dimension.symbol == "?") {
+                dimension = Dimension::fixed(rows);
+            }
+        }
+    }
+    (void)ShapeInferencePass{}.run(specialized.graph);
+    specialized.memory = GraphBufferizer{}.run(specialized.graph, specialized.dispatches);
+    specialized.guards.clear();
+    specialized.guards.push_back({"B*S == " + std::to_string(rows), "mlp_exact"});
+    specialized.scheduled_loops.clear();
+    specialized.llvm_ir.clear();
+    specialized.llvm_compile_milliseconds = 0.0;
+    for (std::size_t index = 0; index < specialized.dispatches.size(); ++index) {
+        auto& dispatch = specialized.dispatches[index];
+        dispatch.kernel_problem = dispatch_problem(specialized.graph, dispatch);
+        auto loop = dispatch.transforms.apply(dispatch.kernel_problem, dispatch.schedule);
+        if (dispatch.epilogue.find("gelu") != std::string::npos) {
+            LoopOperation operation;
+            operation.kind = LoopOpKind::Gelu;
+            operation.result = "acc";
+            operation.source = "%acc";
+            loop.insertEpilogueBeforeStores(std::move(operation));
+        }
+        if (dispatch.epilogue.find("residual") != std::string::npos) {
+            LoopOperation operation;
+            operation.kind = LoopOpKind::AddResidual;
+            operation.result = "acc";
+            operation.source = "%residual";
+            operation.destination = "%acc";
+            loop.insertEpilogueBeforeStores(std::move(operation));
+        }
+        verify_loop_ir(loop);
+        specialized.scheduled_loops.push_back(std::move(loop));
+        const auto& compiled_loop = specialized.scheduled_loops.back();
+        TensorData llvm_data;
+        if (data) {
+            if (index == 0) {
+                llvm_data = {data->input, data->weight1, data->bias1, {}, {}};
+            } else {
+                llvm_data.a.assign(static_cast<std::size_t>(dispatch.kernel_problem.m) *
+                                   dispatch.kernel_problem.k, 0.0F);
+                llvm_data.b = data->weight2;
+                llvm_data.bias = data->bias2;
+                if (analyze_loop_ir(compiled_loop).residual) llvm_data.residual = data->input;
+            }
+        } else {
+            llvm_data.a.assign(static_cast<std::size_t>(dispatch.kernel_problem.m) *
+                               dispatch.kernel_problem.k, 0.0F);
+            llvm_data.b.assign(static_cast<std::size_t>(dispatch.kernel_problem.k) *
+                               dispatch.kernel_problem.n, 0.0F);
+            if (dispatch.kernel_problem.bias)
+                llvm_data.bias.assign(static_cast<std::size_t>(dispatch.kernel_problem.n), 0.0F);
+            if (analyze_loop_ir(compiled_loop).residual)
+                llvm_data.residual.assign(static_cast<std::size_t>(dispatch.kernel_problem.m) *
+                                          dispatch.kernel_problem.n, 0.0F);
+        }
+        const auto jit = LLVMJITBackend{}.benchmark(compiled_loop, llvm_data, 0, 1);
+        if (jit.max_error > 1.0e-3)
+            throw std::runtime_error("specialized LLVM kernel validation failed");
+        specialized.llvm_compile_milliseconds += jit.compile_milliseconds;
+        specialized.llvm_ir.push_back(jit.llvm_ir);
+    }
+    return specialized;
+}
+
 void ExecutablePlan::save(const std::filesystem::path& path) const {
     std::ofstream output(path);
     if (!output) throw std::runtime_error("cannot write executable plan: " + path.string());
@@ -850,13 +953,30 @@ void MeasurementDatabase::add(ScheduleMeasurement measurement) {
 }
 const std::vector<ScheduleMeasurement>& MeasurementDatabase::records() const { return records_; }
 
+std::optional<ScheduleMeasurement> MeasurementDatabase::bestMatch(
+    const Problem& problem, int max_threads) const {
+    std::optional<ScheduleMeasurement> best;
+    for (const auto& record : records_) {
+        if (record.problem.m != problem.m || record.problem.n != problem.n ||
+            record.problem.k != problem.k || record.problem.bias != problem.bias ||
+            record.problem.relu != problem.relu ||
+            record.schedule.threads > max_threads ||
+            record.milliseconds <= 0.0) {
+            continue;
+        }
+        if (!best || record.milliseconds < best->milliseconds) best = record;
+    }
+    return best;
+}
+
 void MeasurementDatabase::saveCsv(const std::filesystem::path& path) const {
     if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path());
     std::ofstream output(path);
     if (!output) throw std::runtime_error("cannot write measurement database: " + path.string());
-    output << "m,n,k,time_ms,l1_miss,llc_miss,dtlb,register_pressure,schedule\n";
+    output << "m,n,k,bias,relu,time_ms,l1_miss,llc_miss,dtlb,register_pressure,schedule\n";
     for (const auto& record : records_) {
         output << record.problem.m << ',' << record.problem.n << ',' << record.problem.k << ','
+               << record.problem.bias << ',' << record.problem.relu << ','
                << record.milliseconds << ',' << record.simulation.l1_miss_rate() << ','
                << record.simulation.llc_miss_rate() << ',' << record.simulation.dtlb_misses << ','
                << record.simulation.register_pressure << ",\""
@@ -881,9 +1001,12 @@ MeasurementDatabase MeasurementDatabase::loadCsv(const std::filesystem::path& pa
         while (std::getline(fields, field, ',')) values.push_back(field);
         if (values.size() < 8) continue;
         ScheduleMeasurement record;
-        record.problem = {std::stoi(values[0]), std::stoi(values[1]), std::stoi(values[2]), true, true};
-        record.milliseconds = std::stod(values[3]);
-        record.simulation.register_pressure = std::stod(values[7]);
+        const bool current_schema = values.size() >= 10;
+        record.problem = {std::stoi(values[0]), std::stoi(values[1]), std::stoi(values[2]),
+                          current_schema ? std::stoi(values[3]) != 0 : true,
+                          current_schema ? std::stoi(values[4]) != 0 : true};
+        record.milliseconds = std::stod(values[current_schema ? 5 : 3]);
+        record.simulation.register_pressure = std::stod(values[current_schema ? 9 : 7]);
         const auto last_quote = line.rfind('"');
         record.schedule = ScheduleDSL::parse(line.substr(quote + 1, last_quote - quote - 1));
         database.add(std::move(record));
@@ -1000,7 +1123,8 @@ TensorGraph StableHLOImporter::importText(const std::string& text) const {
                 if (found != values.end()) operands.push_back(found->second);
             }
             std::optional<GraphOpKind> kind;
-            if (operation_name == "dot_general" || operation_name == "dot") kind = GraphOpKind::MatMul;
+            if (operation_name == "constant") kind = GraphOpKind::Constant;
+            else if (operation_name == "dot_general" || operation_name == "dot") kind = GraphOpKind::MatMul;
             else if (operation_name == "add") kind = GraphOpKind::Add;
             else if (operation_name == "multiply") kind = GraphOpKind::Multiply;
             else if (operation_name == "maximum") kind = GraphOpKind::Maximum;
@@ -1017,7 +1141,11 @@ TensorGraph StableHLOImporter::importText(const std::string& text) const {
                 throw std::invalid_argument("unsupported StableHLO operation: " + operation_name);
             GraphTensorType type;
             if (match[4].matched) type = parse_tensor_type(match[4]);
-            values[result] = graph.addOperation(*kind, result.substr(1), operands, std::move(type));
+            if (*kind == GraphOpKind::Constant) {
+                values[result] = graph.addConstant(result.substr(1), std::move(type), operands_text);
+            } else {
+                values[result] = graph.addOperation(*kind, result.substr(1), operands, std::move(type));
+            }
         } else if (line.find("return") != std::string::npos) {
             const std::regex return_pattern(R"(%[A-Za-z0-9_]+)");
             std::smatch returned;
@@ -1055,6 +1183,11 @@ ExecutablePlan GraphCompiler::compile(TensorGraph graph, const GraphCompileOptio
     plan.dispatches = FusionPlanner{}.run(graph);
     plan.layout_conversions_removed = GraphLayoutPlanner{}.run(graph, plan.dispatches);
     plan.memory = GraphBufferizer{}.run(graph, plan.dispatches);
+    std::optional<MeasurementDatabase> measurement_database;
+    if (!options.measurement_database.empty() &&
+        std::filesystem::exists(options.measurement_database)) {
+        measurement_database = MeasurementDatabase::loadCsv(options.measurement_database);
+    }
     for (const auto& constraint : constraints)
         if (constraint.runtime_guard) plan.guards.push_back({constraint.expression, "specialized_dispatch"});
     if (mlp_config && mlp_config->sequence > 0) {
@@ -1067,6 +1200,14 @@ ExecutablePlan GraphCompiler::compile(TensorGraph graph, const GraphCompileOptio
         dispatch.kernel_problem = dispatch_problem(graph, dispatch);
         dispatch.schedule.threads = std::min(options.max_threads, target_.logical_cpus);
         dispatch.schedule.pin_threads = dispatch.schedule.threads > 1;
+        if (measurement_database) {
+            if (const auto measured = measurement_database->bestMatch(
+                    dispatch.kernel_problem, options.max_threads)) {
+                dispatch.schedule = measured->schedule;
+                dispatch.hardware_measurements = 1;
+                dispatch.tuning_source = "measurement_database";
+            }
+        }
         if (options.autotune && mlp_config && mlp_data && dispatch.kernel_problem.m > 0) {
             TensorData kernel_data;
             if (index == 0) {
@@ -1081,9 +1222,10 @@ ExecutablePlan GraphCompiler::compile(TensorGraph graph, const GraphCompileOptio
             dispatch.tuning_search_space = tuning.search_space;
             dispatch.hardware_measurements = tuning.benchmarked;
             dispatch.tuning_cache_hit = tuning.cache_hit;
+            dispatch.tuning_source = tuning.cache_hit ? "autotune_cache" : "hardware_autotune";
         }
         dispatch.transforms = TransformProgram::fromSchedule(dispatch.schedule);
-        auto kernel_loop = apply_schedule(dispatch.kernel_problem, dispatch.schedule);
+        auto kernel_loop = dispatch.transforms.apply(dispatch.kernel_problem);
         verify_loop_ir(kernel_loop);
         (void)analyze_loop_ir(kernel_loop);
         auto scheduled_loop = kernel_loop;
@@ -1105,6 +1247,7 @@ ExecutablePlan GraphCompiler::compile(TensorGraph graph, const GraphCompileOptio
         verify_loop_ir(scheduled_loop);
         (void)analyze_loop_ir(scheduled_loop);
         plan.scheduled_loops.push_back(std::move(scheduled_loop));
+        const auto& compiled_loop = plan.scheduled_loops.back();
         const auto compute = std::find_if(plan.structured_computes.begin(),
             plan.structured_computes.end(), [&](const StructuredCompute& candidate) {
                 return candidate.name.find("linear") != std::string::npos ||
@@ -1122,7 +1265,13 @@ ExecutablePlan GraphCompiler::compile(TensorGraph graph, const GraphCompileOptio
                 llvm_data.b = mlp_data->weight2;
                 llvm_data.bias = mlp_data->bias2;
             }
-            const auto jit = LLVMJITBackend{}.benchmark(kernel_loop, llvm_data, 0, 1);
+            if (compiled_loop.problem.m == dispatch.kernel_problem.m &&
+                compiled_loop.problem.n == dispatch.kernel_problem.n) {
+                if (analyze_loop_ir(compiled_loop).residual) llvm_data.residual = mlp_data->input;
+            }
+            const auto jit = LLVMJITBackend{}.benchmark(compiled_loop, llvm_data, 0, 1);
+            if (jit.max_error > 1.0e-3)
+                throw std::runtime_error("graph LLVM kernel validation failed");
             plan.llvm_compile_milliseconds += jit.compile_milliseconds;
             plan.llvm_ir.push_back(jit.llvm_ir);
         } else {

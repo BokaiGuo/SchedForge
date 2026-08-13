@@ -2,6 +2,27 @@
 
 All notable changes to SchedForge are documented here.
 
+## [0.6.0] - 2026-08-13
+
+### Added
+
+- Executable MLP shape specialization that rewrites Tensor SSA dimensions,
+  buffer plans, Dispatch problems, Scheduled LoopIR, guards, and LLVM artifacts.
+- Direct `TransformProgram::apply` lowering from replayable Transform IR to
+  verified executable LoopIR.
+- Measurement-database schedule selection through `--measurement-db`, with the
+  selected tuning source serialized into Dispatch IR.
+- StableHLO `constant` import with literal preservation in Tensor SSA.
+
+### Changed
+
+- Graph compilation now lowers kernels from Transform IR instead of bypassing
+  the transformation program with a parallel schedule-to-loop call.
+- LLVM ORC kernels consume the final Scheduled LoopIR graph epilogues, including
+  GELU and residual addition, through the same executable IR used by native code.
+- Dynamic-shape guards are no longer metadata-only for Transformer MLP plans;
+  runtime specialization produces a concrete executable plan.
+
 ## [0.5.0] - 2026-08-13
 
 ### Added

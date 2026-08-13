@@ -93,6 +93,7 @@ struct GraphOperation {
 class TensorGraph {
 public:
     int addInput(std::string name, GraphTensorType type, bool constant = false);
+    int addConstant(std::string name, GraphTensorType type, std::string literal);
     int addOperation(GraphOpKind kind, std::string name, std::vector<int> inputs,
                      GraphTensorType output_type = {});
     void setReturn(int value);
@@ -164,6 +165,7 @@ public:
     void add(TransformOperation operation);
     const std::vector<TransformOperation>& operations() const;
     Schedule replay(Schedule seed = {}) const;
+    LoopIR apply(const Problem& problem, Schedule seed = {}) const;
     std::string dump() const;
     static TransformProgram fromSchedule(const Schedule& schedule);
     static TransformProgram parse(const std::string& text);
@@ -213,6 +215,7 @@ struct Dispatch {
     std::size_t tuning_search_space = 0;
     std::size_t hardware_measurements = 0;
     bool tuning_cache_hit = false;
+    std::string tuning_source = "default";
     std::string epilogue;
     std::string dump(const TensorGraph& graph) const;
 };
@@ -260,6 +263,9 @@ struct ShapeGuard {
     std::string target;
 };
 
+struct MLPConfig;
+struct MLPData;
+
 struct ExecutablePlan {
     TensorGraph graph;
     std::vector<StructuredCompute> structured_computes;
@@ -272,6 +278,8 @@ struct ExecutablePlan {
     double llvm_compile_milliseconds = 0.0;
     std::string target = "native-cpu";
     std::string hardware;
+    ExecutablePlan specializeMLP(const MLPConfig& config,
+                                 const MLPData* data = nullptr) const;
     std::string dump() const;
     void save(const std::filesystem::path& path) const;
 };
@@ -308,6 +316,8 @@ class MeasurementDatabase {
 public:
     void add(ScheduleMeasurement measurement);
     const std::vector<ScheduleMeasurement>& records() const;
+    std::optional<ScheduleMeasurement> bestMatch(const Problem& problem,
+                                                 int max_threads) const;
     void saveCsv(const std::filesystem::path& path) const;
     static MeasurementDatabase loadCsv(const std::filesystem::path& path);
 private:
@@ -356,6 +366,7 @@ struct GraphCompileOptions {
     std::size_t top_k = 8;
     int warmup = 1;
     int repetitions = 5;
+    std::filesystem::path measurement_database;
 };
 
 class GraphCompiler {
