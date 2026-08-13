@@ -254,6 +254,7 @@ struct ExecutablePlan {
     TensorGraph graph;
     std::vector<StructuredCompute> structured_computes;
     std::vector<Dispatch> dispatches;
+    std::vector<LoopIR> scheduled_loops;
     BufferizationResult memory;
     std::vector<ShapeGuard> guards;
     std::vector<std::string> llvm_ir;

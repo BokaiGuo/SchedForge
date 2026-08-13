@@ -2,6 +2,27 @@
 
 All notable changes to SchedForge are documented here.
 
+## [0.3.0] - 2026-08-13
+
+### Added
+
+- Explicit executable LoopIR operations for loops, parallel regions, packing,
+  prefetching, scalar/vector loads, accumulator initialization, broadcast, FMA,
+  graph epilogues, and scalar/vector stores.
+- LoopIR verification and cached read-only execution analysis.
+- Full-size simulation by default with explicit, labeled sampling controls.
+- Compiled Scheduled LoopIR embedded per dispatch in `.sfe` executable plans.
+
+### Changed
+
+- Schedule application now performs an IR rewrite instead of storing Schedule
+  fields inside LoopIR.
+- Native execution, the cache/TLB simulator, LLVM textual lowering, and LLVM
+  ORC accept the same explicit LoopIR as their executable input.
+- Auto-tuning precompiles candidate LoopIR before hardware timing, so rewrite
+  overhead is excluded from kernel latency.
+- Transformer MLP GELU and residual epilogues are explicit runtime IR operations.
+
 ## [0.2.0] - 2026-08-13
 
 ### Added

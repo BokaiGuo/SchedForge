@@ -107,14 +107,23 @@ double SimulationResult::llc_miss_rate() const {
 }
 
 SimulationResult simulate(const LoopIR& loop) {
-    return simulate(loop, TargetInfo::detect());
+    return simulate(loop, TargetInfo::detect(), {});
 }
 
 SimulationResult simulate(const LoopIR& loop, const TargetInfo& target) {
+    return simulate(loop, target, {});
+}
+
+SimulationResult simulate(const LoopIR& loop, const TargetInfo& target,
+                          const SimulationOptions& options) {
+    verify_loop_ir(loop);
+    const auto execution = analyze_loop_ir(loop);
     Hierarchy hierarchy(target);
-    const int m = std::min(loop.problem.m, 64);
-    const int n = std::min(loop.problem.n, 64);
-    const int k_size = std::min(loop.problem.k, 64);
+    const int sample_limit = options.max_extent > 0 ? options.max_extent :
+        std::max({loop.problem.m, loop.problem.n, loop.problem.k});
+    const int m = std::min(loop.problem.m, sample_limit);
+    const int n = std::min(loop.problem.n, sample_limit);
+    const int k_size = std::min(loop.problem.k, sample_limit);
     constexpr std::uint64_t a_base = 0x100000000ULL;
     constexpr std::uint64_t b_base = 0x200000000ULL;
     constexpr std::uint64_t c_base = 0x300000000ULL;
@@ -125,54 +134,55 @@ SimulationResult simulate(const LoopIR& loop, const TargetInfo& target) {
     auto b = [&](int k, int j) { return b_base + 4ULL * static_cast<std::uint64_t>(k * loop.problem.n + j); };
     auto c = [&](int i, int j) { return c_base + 4ULL * static_cast<std::uint64_t>(i * loop.problem.n + j); };
 
-    if (loop.schedule.order == LoopOrder::IJK) {
+    if (execution.order == LoopOrder::IJK && execution.vector_width == 1 &&
+        !execution.pack_a && !execution.pack_b) {
         for (int i = 0; i < m; ++i) for (int j = 0; j < n; ++j) {
             for (int k = 0; k < k_size; ++k) { hierarchy.access(a(i, k)); hierarchy.access(b(k, j)); }
             hierarchy.access(c(i, j));
         }
     } else {
-        const int bm = loop.schedule.tiled ? loop.schedule.bm : m;
-        const int bn = loop.schedule.tiled ? loop.schedule.bn : n;
-        const int bk = loop.schedule.tiled ? loop.schedule.bk : k_size;
+        const int bm = execution.tiled ? execution.bm : m;
+        const int bn = execution.tiled ? execution.bn : n;
+        const int bk = execution.tiled ? execution.bk : k_size;
         for (int ii = 0; ii < m; ii += bm) for (int jj = 0; jj < n; jj += bn) {
             for (int kk = 0; kk < k_size; kk += bk)
                 for (int i = ii; i < std::min(ii + bm, m); ++i)
                     for (int k = kk; k < std::min(kk + bk, k_size); ++k) {
-                        hierarchy.access(loop.schedule.pack_a
+                        hierarchy.access(execution.pack_a
                             ? packed_a_base + 4ULL * static_cast<std::uint64_t>((i - ii) * bk + (k - kk))
                             : a(i, k));
                         for (int j = jj; j < std::min(jj + bn, n); ++j) {
-                            hierarchy.access(loop.schedule.pack_b
+                            hierarchy.access(execution.pack_b
                                 ? packed_b_base + 4ULL * static_cast<std::uint64_t>((k - kk) * bn + (j - jj))
                                 : b(k, j));
                             hierarchy.access(c(i, j)); hierarchy.access(c(i, j));
-                            if (loop.schedule.prefetch_distance > 0 && j + loop.schedule.prefetch_distance < std::min(jj + bn, n)) {
-                                hierarchy.access(b(k, j + loop.schedule.prefetch_distance), true);
+                            if (execution.prefetch_distance > 0 && j + execution.prefetch_distance < std::min(jj + bn, n)) {
+                                hierarchy.access(b(k, j + execution.prefetch_distance), true);
                             }
                         }
                     }
         }
     }
-    if (loop.schedule.pack_a) {
+    if (execution.pack_a) {
         for (int i = 0; i < m; ++i) for (int k = 0; k < k_size; ++k) {
             hierarchy.access(a(i, k));
             hierarchy.access(packed_a_base + 4ULL * static_cast<std::uint64_t>(i * k_size + k));
         }
     }
-    if (loop.schedule.pack_b) {
+    if (execution.pack_b) {
         for (int k = 0; k < k_size; ++k) for (int j = 0; j < n; ++j) {
             hierarchy.access(b(k, j));
             hierarchy.access(packed_b_base + 4ULL * static_cast<std::uint64_t>(k * n + j));
         }
     }
-    if (!loop.schedule.fused && (loop.problem.bias || loop.problem.relu)) {
+    if (!execution.fused && (loop.problem.bias || loop.problem.relu)) {
         for (int i = 0; i < m; ++i) for (int j = 0; j < n; ++j) {
             hierarchy.access(c(i, j)); hierarchy.access(d_base + 4ULL * static_cast<std::uint64_t>(i * loop.problem.n + j));
             if (loop.problem.relu) { hierarchy.access(d_base + 4ULL * static_cast<std::uint64_t>(i * loop.problem.n + j)); hierarchy.access(c(i, j)); }
         }
     }
     auto result = hierarchy.result;
-    const auto pressure = estimate_register_pressure(loop.schedule, target);
+    const auto pressure = estimate_register_pressure(execution, target);
     result.register_pressure = static_cast<double>(pressure.total);
     result.estimated_bandwidth_bytes = static_cast<double>(result.dram_accesses * target.cache_line_bytes);
     const double sampled_memory_cycles = static_cast<double>(result.l1.hits) * target.l1_latency +
@@ -182,15 +192,15 @@ SimulationResult simulate(const LoopIR& loop, const TargetInfo& target) {
     const double scale = (static_cast<double>(loop.problem.m) / m) *
                          (static_cast<double>(loop.problem.n) / n) *
                          (static_cast<double>(loop.problem.k) / k_size);
-    const double vector_lanes = static_cast<double>(std::max(1, loop.schedule.vector_width));
-    const double thread_parallelism = static_cast<double>(std::max(1, loop.schedule.threads));
+    const double vector_lanes = static_cast<double>(std::max(1, execution.vector_width));
+    const double thread_parallelism = static_cast<double>(std::max(1, execution.threads));
     const double fma_throughput = 2.0 * vector_lanes;
     const double compute_cycles = static_cast<double>(loop.problem.m) * loop.problem.n *
                                   loop.problem.k / fma_throughput;
     const double tlb_cycles = static_cast<double>(result.dtlb_misses) * 30.0 * scale;
-    const double packing_bytes = (loop.schedule.pack_b
+    const double packing_bytes = (execution.pack_b
         ? 4.0 * static_cast<double>(loop.problem.k) * loop.problem.n : 0.0) +
-        (loop.schedule.pack_a ? 4.0 * static_cast<double>(loop.problem.m) * loop.problem.k : 0.0);
+        (execution.pack_a ? 4.0 * static_cast<double>(loop.problem.m) * loop.problem.k : 0.0);
     const double packing_cycles = packing_bytes / 32.0;
     const double spill_penalty = pressure.spills ? compute_cycles * 0.75 : 0.0;
     const double bandwidth_cycles = target.memory_bandwidth_gbps > 0.0
@@ -199,6 +209,9 @@ SimulationResult simulate(const LoopIR& loop, const TargetInfo& target) {
     result.estimated_cycles = sampled_memory_cycles * scale / thread_parallelism +
                               compute_cycles / thread_parallelism + tlb_cycles +
                               packing_cycles + spill_penalty + bandwidth_cycles;
+    result.sampled_m = m;
+    result.sampled_n = n;
+    result.sampled_k = k_size;
     return result;
 }
 

@@ -49,10 +49,12 @@ struct CachedKernel {
 std::mutex kernel_cache_mutex;
 std::unordered_map<std::string, std::shared_ptr<CachedKernel>> kernel_cache;
 
-std::string kernel_key(const GraphIR& graph, const Schedule& schedule) {
-    return "llvm-register-v2-" + std::to_string(graph.problem.m) + "x" + std::to_string(graph.problem.n) + "x" +
-           std::to_string(graph.problem.k) + "-bias" + std::to_string(graph.problem.bias) +
-           "-relu" + std::to_string(graph.problem.relu) + "-" + ScheduleDSL::print(schedule);
+std::string kernel_key(const LoopIR& loop) {
+    return "llvm-loopir-v3-" + std::to_string(loop.problem.m) + "x" +
+           std::to_string(loop.problem.n) + "x" + std::to_string(loop.problem.k) +
+           "-bias" + std::to_string(loop.problem.bias) + "-relu" +
+           std::to_string(loop.problem.relu) + "-" +
+           std::to_string(std::hash<std::string>{}(loop.dump()));
 }
 
 std::string error_string(llvm::Error error) {
@@ -160,10 +162,10 @@ void build_ijk_function(llvm::Module& module, const Problem& problem) {
     builder.CreateRetVoid();
 }
 
-bool can_build_register_kernel(const Problem& problem, const Schedule& schedule) {
-    const int width = std::max(1, schedule.vector_width);
-    const int mr = std::max(1, schedule.mr);
-    const int nr = std::max(width, schedule.nr);
+bool can_build_register_kernel(const Problem& problem, const LoopExecutionPlan& execution) {
+    const int width = std::max(1, execution.vector_width);
+    const int mr = std::max(1, execution.mr);
+    const int nr = std::max(width, execution.nr);
     const int vectors = nr / width;
     const std::size_t blocks = static_cast<std::size_t>(problem.m / mr) *
                                static_cast<std::size_t>(problem.n / nr);
@@ -172,7 +174,7 @@ bool can_build_register_kernel(const Problem& problem, const Schedule& schedule)
 }
 
 void build_register_tiled_function(llvm::Module& module, const Problem& problem,
-                                   const Schedule& schedule) {
+                                   const LoopExecutionPlan& execution) {
     auto& context = module.getContext();
     llvm::IRBuilder<> builder(context);
     auto* float_type = builder.getFloatTy();
@@ -193,9 +195,9 @@ void build_register_tiled_function(llvm::Module& module, const Problem& problem,
     llvm::Value* k_size = arguments++; k_size->setName("K");
     (void)m;
 
-    const int width = schedule.vector_width;
-    const int mr = schedule.mr;
-    const int nr = schedule.nr;
+    const int width = execution.vector_width;
+    const int mr = execution.mr;
+    const int nr = execution.nr;
     const int vector_count = nr / width;
     auto* vector_type = llvm::FixedVectorType::get(float_type, static_cast<unsigned>(width));
     auto* vector_fma = llvm::Intrinsic::getDeclaration(&module, llvm::Intrinsic::fma, {vector_type});
@@ -516,11 +518,13 @@ std::string emit_assembly(const llvm::Module& source) {
 
 bool LLVMJITBackend::available() const { return true; }
 
-LLVMJITResult LLVMJITBackend::benchmark(const GraphIR& graph, const TensorData& data,
-                                        const Schedule& schedule, int warmup,
+LLVMJITResult LLVMJITBackend::benchmark(const LoopIR& loop, const TensorData& data,
+                                        int warmup,
                                         int repetitions) const {
     initialize_llvm();
-    const std::string cache_key = kernel_key(graph, schedule);
+    verify_loop_ir(loop);
+    const auto execution = analyze_loop_ir(loop);
+    const std::string cache_key = kernel_key(loop);
     std::shared_ptr<CachedKernel> cached;
     bool cache_hit = false;
     {
@@ -535,10 +539,11 @@ LLVMJITResult LLVMJITBackend::benchmark(const GraphIR& graph, const TensorData& 
     if (!cached) {
         auto context = std::make_unique<llvm::LLVMContext>();
         auto module = std::make_unique<llvm::Module>("schedforge_jit", *context);
-        if (schedule.order == LoopOrder::IKJ && can_build_register_kernel(graph.problem, schedule))
-            build_register_tiled_function(*module, graph.problem, schedule);
-        else if (schedule.order == LoopOrder::IKJ) build_ikj_function(*module, graph.problem, schedule.vector_width);
-        else build_ijk_function(*module, graph.problem);
+        if (can_build_register_kernel(loop.problem, execution))
+            build_register_tiled_function(*module, loop.problem, execution);
+        else if (execution.vector_width > 1 || execution.order == LoopOrder::IKJ)
+            build_ikj_function(*module, loop.problem, execution.vector_width);
+        else build_ijk_function(*module, loop.problem);
         if (llvm::verifyModule(*module, &llvm::errs())) throw std::runtime_error("LLVM module verification failed");
         optimize_module(*module);
         auto kernel = std::make_shared<CachedKernel>();
@@ -567,23 +572,23 @@ LLVMJITResult LLVMJITBackend::benchmark(const GraphIR& graph, const TensorData& 
     }
     const auto compile_end = std::chrono::steady_clock::now();
 
-    std::vector<float> output(static_cast<std::size_t>(graph.problem.m) * graph.problem.n);
+    std::vector<float> output(static_cast<std::size_t>(loop.problem.m) * loop.problem.n);
     for (int iteration = 0; iteration < std::max(0, warmup); ++iteration) {
-        cached->function(data.a.data(), data.b.data(), data.bias.data(), output.data(), graph.problem.m,
-                 graph.problem.n, graph.problem.k);
+        cached->function(data.a.data(), data.b.data(), data.bias.data(), output.data(), loop.problem.m,
+                 loop.problem.n, loop.problem.k);
     }
     std::vector<double> timings;
     for (int iteration = 0; iteration < std::max(1, repetitions); ++iteration) {
         const auto start = std::chrono::steady_clock::now();
-        cached->function(data.a.data(), data.b.data(), data.bias.data(), output.data(), graph.problem.m,
-                 graph.problem.n, graph.problem.k);
+        cached->function(data.a.data(), data.b.data(), data.bias.data(), output.data(), loop.problem.m,
+                 loop.problem.n, loop.problem.k);
         const auto end = std::chrono::steady_clock::now();
         timings.push_back(std::chrono::duration<double, std::milli>(end - start).count());
     }
     std::sort(timings.begin(), timings.end());
     const double execution_ms = timings[timings.size() / 2];
-    const auto expected = reference(graph.problem, data);
-    const double operations = 2.0 * graph.problem.m * graph.problem.n * graph.problem.k;
+    const auto expected = reference(loop.problem, data);
+    const double operations = 2.0 * loop.problem.m * loop.problem.n * loop.problem.k;
     const double compile_milliseconds = cache_hit ? 0.0
         : std::chrono::duration<double, std::milli>(compile_end - compile_start).count();
     return {compile_milliseconds,

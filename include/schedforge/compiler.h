@@ -127,9 +127,8 @@ struct LLVMJITResult {
 class LLVMJITBackend {
 public:
     bool available() const;
-    LLVMJITResult benchmark(const GraphIR& graph, const TensorData& data,
-                            const Schedule& schedule, int warmup,
-                            int repetitions) const;
+    LLVMJITResult benchmark(const LoopIR& loop, const TensorData& data,
+                            int warmup, int repetitions) const;
 };
 
 struct CostBreakdown {

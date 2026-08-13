@@ -656,7 +656,12 @@ std::string ExecutablePlan::dump() const {
     out << "structured_compute {\n";
     for (const auto& compute : structured_computes) out << "  " << compute.dump() << '\n';
     out << "}\ndispatches {\n";
-    for (const auto& dispatch : dispatches) out << dispatch.dump(graph) << '\n';
+    for (std::size_t index = 0; index < dispatches.size(); ++index) {
+        out << dispatches[index].dump(graph) << '\n';
+        if (index < scheduled_loops.size())
+            out << "  scheduled_loop @dispatch_" << index << " {\n"
+                << scheduled_loops[index].dump() << "  }\n";
+    }
     out << "}\nlayout_conversions_removed=" << layout_conversions_removed << '\n'
         << memory.dump() << "shape_guards {\n";
     for (const auto& guard : guards) out << "  if " << guard.expression << " -> " << guard.target << '\n';
@@ -757,17 +762,15 @@ std::vector<float> reference_mlp(const MLPConfig& config, const MLPData& data) {
 
 GraphBenchmarkResult execute_mlp(const ExecutablePlan& plan, const MLPConfig& config,
                                  const MLPData& data, int warmup, int repetitions) {
-    if (plan.dispatches.size() != 2) throw std::invalid_argument("MLP plan requires two dispatches");
-    const int rows = config.batch * config.sequence;
+    if (plan.dispatches.size() != 2 || plan.scheduled_loops.size() != 2)
+        throw std::invalid_argument("MLP plan requires two compiled dispatch loops");
     std::vector<float> hidden;
     std::vector<float> output;
     auto run = [&] {
-        TensorData first{data.input, data.weight1, data.bias1, {}};
-        execute({{rows, config.intermediate, config.hidden, true, false}, plan.dispatches[0].schedule}, first, hidden);
-        for (float& value : hidden) value = gelu(value);
-        TensorData second{hidden, data.weight2, data.bias2, {}};
-        execute({{rows, config.hidden, config.intermediate, true, false}, plan.dispatches[1].schedule}, second, output);
-        for (std::size_t index = 0; index < output.size(); ++index) output[index] += data.input[index];
+        TensorData first{data.input, data.weight1, data.bias1, {}, {}};
+        execute(plan.scheduled_loops[0], first, hidden);
+        TensorData second{hidden, data.weight2, data.bias2, {}, data.input};
+        execute(plan.scheduled_loops[1], second, output);
     };
     for (int iteration = 0; iteration < std::max(0, warmup); ++iteration) run();
     std::vector<double> timings;
@@ -1006,10 +1009,10 @@ ExecutablePlan GraphCompiler::compile(TensorGraph graph, const GraphCompileOptio
         if (options.autotune && mlp_config && mlp_data && dispatch.kernel_problem.m > 0) {
             TensorData kernel_data;
             if (index == 0) {
-                kernel_data = {mlp_data->input, mlp_data->weight1, mlp_data->bias1, {}};
+                kernel_data = {mlp_data->input, mlp_data->weight1, mlp_data->bias1, {}, {}};
             } else {
                 std::vector<float> hidden(static_cast<std::size_t>(dispatch.kernel_problem.m * dispatch.kernel_problem.k));
-                kernel_data = {std::move(hidden), mlp_data->weight2, mlp_data->bias2, {}};
+                kernel_data = {std::move(hidden), mlp_data->weight2, mlp_data->bias2, {}, {}};
             }
             const auto tuning = autoschedule({dispatch.kernel_problem}, kernel_data, target_,
                 options.max_threads, options.top_k, options.warmup, options.repetitions);
@@ -1019,6 +1022,28 @@ ExecutablePlan GraphCompiler::compile(TensorGraph graph, const GraphCompileOptio
             dispatch.tuning_cache_hit = tuning.cache_hit;
         }
         dispatch.transforms = TransformProgram::fromSchedule(dispatch.schedule);
+        auto kernel_loop = apply_schedule(dispatch.kernel_problem, dispatch.schedule);
+        verify_loop_ir(kernel_loop);
+        (void)analyze_loop_ir(kernel_loop);
+        auto scheduled_loop = kernel_loop;
+        if (dispatch.epilogue.find("gelu") != std::string::npos) {
+            LoopOperation operation;
+            operation.kind = LoopOpKind::Gelu;
+            operation.result = "acc";
+            operation.source = "%acc";
+            scheduled_loop.insertEpilogueBeforeStores(std::move(operation));
+        }
+        if (dispatch.epilogue.find("residual") != std::string::npos) {
+            LoopOperation operation;
+            operation.kind = LoopOpKind::AddResidual;
+            operation.result = "acc";
+            operation.source = "%residual";
+            operation.destination = "%acc";
+            scheduled_loop.insertEpilogueBeforeStores(std::move(operation));
+        }
+        verify_loop_ir(scheduled_loop);
+        (void)analyze_loop_ir(scheduled_loop);
+        plan.scheduled_loops.push_back(std::move(scheduled_loop));
         const auto compute = std::find_if(plan.structured_computes.begin(),
             plan.structured_computes.end(), [&](const StructuredCompute& candidate) {
                 return candidate.name.find("linear") != std::string::npos ||
@@ -1029,15 +1054,14 @@ ExecutablePlan GraphCompiler::compile(TensorGraph graph, const GraphCompileOptio
         if (mlp_data) {
             TensorData llvm_data;
             if (index == 0) {
-                llvm_data = {mlp_data->input, mlp_data->weight1, mlp_data->bias1, {}};
+                llvm_data = {mlp_data->input, mlp_data->weight1, mlp_data->bias1, {}, {}};
             } else {
                 llvm_data.a.assign(static_cast<std::size_t>(dispatch.kernel_problem.m) *
                                    dispatch.kernel_problem.k, 0.0F);
                 llvm_data.b = mlp_data->weight2;
                 llvm_data.bias = mlp_data->bias2;
             }
-            const auto jit = LLVMJITBackend{}.benchmark(
-                {dispatch.kernel_problem}, llvm_data, dispatch.schedule, 0, 1);
+            const auto jit = LLVMJITBackend{}.benchmark(kernel_loop, llvm_data, 0, 1);
             plan.llvm_compile_milliseconds += jit.compile_milliseconds;
             plan.llvm_ir.push_back(jit.llvm_ir);
         } else {

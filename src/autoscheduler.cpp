@@ -20,6 +20,7 @@ namespace {
 
 struct Candidate {
     Schedule schedule;
+    LoopIR loop;
     double screening_milliseconds = std::numeric_limits<double>::infinity();
 };
 
@@ -173,14 +174,14 @@ SearchResult autoschedule(const GraphIR& graph, const TensorData& data,
     for (const auto& schedule : all) {
         if (!valid(schedule)) continue;
         if (!execution_keys.insert(execution_key(schedule)).second) continue;
-        candidates.push_back({schedule});
+        candidates.push_back({schedule, apply_schedule(graph.problem, schedule)});
     }
     const auto expected = reference(graph.problem, data);
     std::vector<float> screening_output;
     std::set<int> warmed_thread_counts;
     for (const auto& candidate : candidates) {
         if (warmed_thread_counts.insert(candidate.schedule.threads).second) {
-            execute({graph.problem, candidate.schedule}, data, screening_output);
+            execute(candidate.loop, data, screening_output);
         }
     }
 
@@ -190,7 +191,7 @@ SearchResult autoschedule(const GraphIR& graph, const TensorData& data,
     std::shuffle(screening_order.begin(), screening_order.end(), generator);
     for (const std::size_t index : screening_order) {
         const auto start = std::chrono::steady_clock::now();
-        execute({graph.problem, candidates[index].schedule}, data, screening_output);
+        execute(candidates[index].loop, data, screening_output);
         const auto end = std::chrono::steady_clock::now();
         if (max_abs_error(expected, screening_output) <= 1.0e-3) {
             candidates[index].screening_milliseconds =
@@ -210,7 +211,7 @@ SearchResult autoschedule(const GraphIR& graph, const TensorData& data,
     std::vector<std::vector<float>> outputs(finalist_count);
     for (int iteration = 0; iteration < std::max(0, warmup); ++iteration) {
         for (std::size_t slot = 0; slot < finalist_count; ++slot) {
-            execute({graph.problem, candidates[slot].schedule}, data, outputs[slot]);
+            execute(candidates[slot].loop, data, outputs[slot]);
         }
     }
     std::vector<std::vector<double>> timings(finalist_count);
@@ -220,7 +221,7 @@ SearchResult autoschedule(const GraphIR& graph, const TensorData& data,
         std::shuffle(order.begin(), order.end(), generator);
         for (const std::size_t slot : order) {
             const auto start = std::chrono::steady_clock::now();
-            execute({graph.problem, candidates[slot].schedule}, data, outputs[slot]);
+            execute(candidates[slot].loop, data, outputs[slot]);
             const auto end = std::chrono::steady_clock::now();
             timings[slot].push_back(
                 std::chrono::duration<double, std::milli>(end - start).count());
@@ -243,7 +244,7 @@ SearchResult autoschedule(const GraphIR& graph, const TensorData& data,
             max_abs_error(expected, outputs[slot])};
         if (measured.max_error <= 1.0e-3 && measured.milliseconds < best.benchmark.milliseconds) {
             best.schedule = candidates[slot].schedule;
-            best.simulation = simulate({graph.problem, candidates[slot].schedule}, target);
+            best.simulation = simulate(candidates[slot].loop, target);
             best.benchmark = measured;
             best.measurement_rank = slot + 1;
         }

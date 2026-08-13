@@ -29,7 +29,7 @@ dispatch @dispatch_0 [epilogue=bias+gelu] {
 }
   transform.sequence {
   match tensor.matmul
-  tile [32,32,16]
+  tile [16,64,16]
   interchange [0,2,1]
   register_tile [4,16]
   vectorize width=8
@@ -39,6 +39,30 @@ dispatch @dispatch_0 [epilogue=bias+gelu] {
 }
   intrinsic @avx2_f32_m4n16
  cost<saved_bytes=16384, register_pressure=6.5, speedup=1.135>
+  scheduled_loop @dispatch_0 {
+func @matmul(%A, %B, %bias, %C) {
+  scf.for %ii = 0 to M step 16 {
+    scf.for %jj = 0 to N step 64 {
+      scf.for %i = 0 to min(ii+16,M) step 4 {
+        scf.for %j = 0 to min(jj+64,N) step 16 {
+          %acc = vector.accumulator.init : vector<8xf32>
+          scf.for %kk = 0 to K step 16 {
+            scf.for %k = 0 to min(kk+16,K) step 1 {
+              %a = memref.load %A[%i,%k]
+              %b = vector.load %B[%k,%j] : vector<8xf32>
+              %a_vec = vector.broadcast %a : vector<8xf32>
+              %acc = vector.fma %a_vec,%b,%acc : vector<8xf32>
+            }
+          }
+          %acc = epilogue.add_bias %bias[%j] : vector<8xf32>
+          %acc = epilogue.gelu %acc
+          vector.store %acc -> %C[%i,%j] : vector<8xf32>
+        }
+      }
+    }
+  }
+}
+  }
 dispatch @dispatch_1 [epilogue=bias+residual] {
   %v8 = tensor.matmul %v7 %v3 : tensor<16x64xf32, layout=row_major>
   %v9 = tensor.add %v8 %v4 : tensor<16x64xf32, layout=row_major>
@@ -56,6 +80,30 @@ dispatch @dispatch_1 [epilogue=bias+residual] {
 }
   intrinsic @avx2_f32_m4n16
  cost<saved_bytes=8192, register_pressure=6.5, speedup=1.04611>
+  scheduled_loop @dispatch_1 {
+func @matmul(%A, %B, %bias, %C) {
+  scf.for %ii = 0 to M step 32 {
+    scf.for %jj = 0 to N step 64 {
+      scf.for %i = 0 to min(ii+32,M) step 4 {
+        scf.for %j = 0 to min(jj+64,N) step 16 {
+          %acc = vector.accumulator.init : vector<8xf32>
+          scf.for %kk = 0 to K step 16 {
+            scf.for %k = 0 to min(kk+16,K) step 1 {
+              %a = memref.load %A[%i,%k]
+              %b = vector.load %B[%k,%j] : vector<8xf32>
+              %a_vec = vector.broadcast %a : vector<8xf32>
+              %acc = vector.fma %a_vec,%b,%acc : vector<8xf32>
+            }
+          }
+          %acc = epilogue.add_bias %bias[%j] : vector<8xf32>
+          %acc = epilogue.add_residual %residual -> %acc
+          vector.store %acc -> %C[%i,%j] : vector<8xf32>
+        }
+      }
+    }
+  }
+}
+  }
 }
 layout_conversions_removed=1
 bufferization naive=32768 workspace=8192
@@ -71,7 +119,7 @@ shape_guards {
   if S <= 256 -> mlp_medium
   if otherwise -> mlp_large
 }
-llvm_kernels=2 compile_ms=120.991
+llvm_kernels=2 compile_ms=119.089
 llvm.kernel @dispatch_0 {
 ; ModuleID = 'schedforge_jit'
 source_filename = "schedforge_jit"

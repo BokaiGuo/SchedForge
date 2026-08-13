@@ -39,4 +39,17 @@ RegisterPressure estimate_register_pressure(const Schedule& schedule,
     return pressure;
 }
 
+RegisterPressure estimate_register_pressure(const LoopExecutionPlan& execution,
+                                             const TargetInfo& target) {
+    RegisterPressure pressure;
+    pressure.accumulators = execution.mr *
+        std::max(1, (execution.nr + std::max(1, execution.vector_width) - 1) /
+                    std::max(1, execution.vector_width));
+    pressure.broadcasts = execution.vector_width > 1 ? 1 : 0;
+    pressure.temporaries = 2 + (execution.prefetch_distance > 0 ? 1 : 0);
+    pressure.total = pressure.accumulators + pressure.broadcasts + pressure.temporaries;
+    pressure.spills = pressure.total > target.vector_registers - 1;
+    return pressure;
+}
+
 }  // namespace schedforge

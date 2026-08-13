@@ -164,12 +164,12 @@ int preferred_cpu(int worker_index) {
 }
 #endif
 
-PackedMatrices pack_matrices(const Problem& problem, const Schedule& schedule,
+PackedMatrices pack_matrices(const Problem& problem, const LoopExecutionPlan& execution,
                              const TensorData& data) {
     PackedMatrices packed;
-    packed.mr = std::max(1, schedule.mr);
-    packed.nr = std::max(1, schedule.nr);
-    if (schedule.pack_a) {
+    packed.mr = std::max(1, execution.mr);
+    packed.nr = std::max(1, execution.nr);
+    if (execution.pack_a) {
         const int panels = (problem.m + packed.mr - 1) / packed.mr;
         packed.a.assign(static_cast<std::size_t>(panels) * problem.k * packed.mr, 0.0F);
         for (int i = 0; i < problem.m; ++i) for (int k = 0; k < problem.k; ++k) {
@@ -179,7 +179,7 @@ PackedMatrices pack_matrices(const Problem& problem, const Schedule& schedule,
                 data.a[static_cast<std::size_t>(i) * problem.k + k];
         }
     }
-    if (schedule.pack_b) {
+    if (execution.pack_b) {
         const int panels = (problem.n + packed.nr - 1) / packed.nr;
         packed.b.assign(static_cast<std::size_t>(panels) * problem.k * packed.nr, 0.0F);
         for (int j = 0; j < problem.n; ++j) for (int k = 0; k < problem.k; ++k) {
@@ -209,7 +209,27 @@ void apply_epilogue_range(const Problem& problem, const TensorData& data,
     }
 }
 
-void execute_ijk(const Problem& problem, const Schedule& schedule, const TensorData& data,
+float gelu_value(float value) {
+    constexpr float factor = 0.7978845608F;
+    return 0.5F * value *
+        (1.0F + std::tanh(factor * (value + 0.044715F * value * value * value)));
+}
+
+void apply_explicit_graph_epilogues(const LoopExecutionPlan& execution,
+                                    const TensorData& data,
+                                    std::vector<float>& output) {
+    if (execution.gelu) {
+        for (float& value : output) value = gelu_value(value);
+    }
+    if (execution.residual) {
+        if (data.residual.size() != output.size())
+            throw std::invalid_argument("residual epilogue requires matching residual data");
+        for (std::size_t index = 0; index < output.size(); ++index)
+            output[index] += data.residual[index];
+    }
+}
+
+void execute_ijk(const Problem& problem, const LoopExecutionPlan& execution, const TensorData& data,
                  std::vector<float>& output, int row_begin, int row_end) {
     for (int i = row_begin; i < row_end; ++i) {
         for (int j = 0; j < problem.n; ++j) {
@@ -218,14 +238,14 @@ void execute_ijk(const Problem& problem, const Schedule& schedule, const TensorD
                 sum += data.a[static_cast<std::size_t>(i) * problem.k + k] *
                        data.b[static_cast<std::size_t>(k) * problem.n + j];
             }
-            if (schedule.fused) {
+            if (execution.fused) {
                 if (problem.bias) sum += data.bias[static_cast<std::size_t>(j)];
                 if (problem.relu) sum = std::max(0.0F, sum);
             }
             output[static_cast<std::size_t>(i) * problem.n + j] = sum;
         }
     }
-    if (!schedule.fused) {
+    if (!execution.fused) {
         apply_epilogue_range(problem, data, output, row_begin, row_end, 0, problem.n);
     }
 }
@@ -256,7 +276,7 @@ void update_row(float* output, const float* b, float a, int count, int vector_wi
 
 #if defined(__AVX2__)
 template <int Rows>
-void register_kernel_8(const Problem& problem, const Schedule& schedule,
+void register_kernel_8(const Problem& problem, const LoopExecutionPlan& execution,
                        const TensorData& data, std::vector<float>& output,
                        int row, int column) {
     __m256 accumulators[Rows];
@@ -279,13 +299,13 @@ void register_kernel_8(const Problem& problem, const Schedule& schedule,
         }
     }
 
-    if (schedule.fused && problem.bias) {
+    if (execution.fused && problem.bias) {
         const __m256 bias = _mm256_loadu_ps(data.bias.data() + column);
         for (int lane = 0; lane < Rows; ++lane) {
             accumulators[lane] = _mm256_add_ps(accumulators[lane], bias);
         }
     }
-    if (schedule.fused && problem.relu) {
+    if (execution.fused && problem.relu) {
         const __m256 zero = _mm256_setzero_ps();
         for (int lane = 0; lane < Rows; ++lane) {
             accumulators[lane] = _mm256_max_ps(accumulators[lane], zero);
@@ -299,7 +319,7 @@ void register_kernel_8(const Problem& problem, const Schedule& schedule,
 }
 
 template <int Rows>
-void register_kernel_16(const Problem& problem, const Schedule& schedule,
+void register_kernel_16(const Problem& problem, const LoopExecutionPlan& execution,
                         const TensorData& data, std::vector<float>& output,
                         int row, int column) {
     __m256 low[Rows];
@@ -326,7 +346,7 @@ void register_kernel_16(const Problem& problem, const Schedule& schedule,
         }
     }
 
-    if (schedule.fused && problem.bias) {
+    if (execution.fused && problem.bias) {
         const __m256 bias_low = _mm256_loadu_ps(data.bias.data() + column);
         const __m256 bias_high = _mm256_loadu_ps(data.bias.data() + column + 8);
         for (int lane = 0; lane < Rows; ++lane) {
@@ -334,7 +354,7 @@ void register_kernel_16(const Problem& problem, const Schedule& schedule,
             high[lane] = _mm256_add_ps(high[lane], bias_high);
         }
     }
-    if (schedule.fused && problem.relu) {
+    if (execution.fused && problem.relu) {
         const __m256 zero = _mm256_setzero_ps();
         for (int lane = 0; lane < Rows; ++lane) {
             low[lane] = _mm256_max_ps(low[lane], zero);
@@ -349,28 +369,28 @@ void register_kernel_16(const Problem& problem, const Schedule& schedule,
     }
 }
 
-void dispatch_register_kernel_8(const Problem& problem, const Schedule& schedule,
+void dispatch_register_kernel_8(const Problem& problem, const LoopExecutionPlan& execution,
                                 const TensorData& data, std::vector<float>& output,
                                 int row, int rows, int column) {
     switch (rows) {
-        case 8: register_kernel_8<8>(problem, schedule, data, output, row, column); break;
-        case 7: register_kernel_8<7>(problem, schedule, data, output, row, column); break;
-        case 6: register_kernel_8<6>(problem, schedule, data, output, row, column); break;
-        case 5: register_kernel_8<5>(problem, schedule, data, output, row, column); break;
-        case 4: register_kernel_8<4>(problem, schedule, data, output, row, column); break;
-        case 3: register_kernel_8<3>(problem, schedule, data, output, row, column); break;
-        case 2: register_kernel_8<2>(problem, schedule, data, output, row, column); break;
-        default: register_kernel_8<1>(problem, schedule, data, output, row, column); break;
+        case 8: register_kernel_8<8>(problem, execution, data, output, row, column); break;
+        case 7: register_kernel_8<7>(problem, execution, data, output, row, column); break;
+        case 6: register_kernel_8<6>(problem, execution, data, output, row, column); break;
+        case 5: register_kernel_8<5>(problem, execution, data, output, row, column); break;
+        case 4: register_kernel_8<4>(problem, execution, data, output, row, column); break;
+        case 3: register_kernel_8<3>(problem, execution, data, output, row, column); break;
+        case 2: register_kernel_8<2>(problem, execution, data, output, row, column); break;
+        default: register_kernel_8<1>(problem, execution, data, output, row, column); break;
     }
 }
 #endif
 
-void execute_register_blocked(const Problem& problem, const Schedule& schedule,
+void execute_register_blocked(const Problem& problem, const LoopExecutionPlan& execution,
                               const TensorData& data, std::vector<float>& output,
                               int row_begin, int row_end) {
-    const int bm = schedule.tiled ? std::max(1, schedule.bm) : row_end - row_begin;
-    const int bn = schedule.tiled ? std::max(8, schedule.bn) : problem.n;
-    const int mr = std::clamp(schedule.mr, 1, 8);
+    const int bm = execution.tiled ? std::max(1, execution.bm) : row_end - row_begin;
+    const int bn = execution.tiled ? std::max(8, execution.bn) : problem.n;
+    const int mr = std::clamp(execution.mr, 1, 8);
 
     for (int ii = row_begin; ii < row_end; ii += bm) {
         const int i_end = std::min(ii + bm, row_end);
@@ -383,17 +403,17 @@ void execute_register_blocked(const Problem& problem, const Schedule& schedule,
                 if (rows <= 6) {
                     for (; j + 16 <= j_end; j += 16) {
                         switch (rows) {
-                            case 6: register_kernel_16<6>(problem, schedule, data, output, i0, j); break;
-                            case 5: register_kernel_16<5>(problem, schedule, data, output, i0, j); break;
-                            case 4: register_kernel_16<4>(problem, schedule, data, output, i0, j); break;
-                            case 3: register_kernel_16<3>(problem, schedule, data, output, i0, j); break;
-                            case 2: register_kernel_16<2>(problem, schedule, data, output, i0, j); break;
-                            default: register_kernel_16<1>(problem, schedule, data, output, i0, j); break;
+                            case 6: register_kernel_16<6>(problem, execution, data, output, i0, j); break;
+                            case 5: register_kernel_16<5>(problem, execution, data, output, i0, j); break;
+                            case 4: register_kernel_16<4>(problem, execution, data, output, i0, j); break;
+                            case 3: register_kernel_16<3>(problem, execution, data, output, i0, j); break;
+                            case 2: register_kernel_16<2>(problem, execution, data, output, i0, j); break;
+                            default: register_kernel_16<1>(problem, execution, data, output, i0, j); break;
                         }
                     }
                 }
                 for (; j + 8 <= j_end; j += 8) {
-                    dispatch_register_kernel_8(problem, schedule, data, output,
+                    dispatch_register_kernel_8(problem, execution, data, output,
                                                i0, rows, j);
                 }
 #endif
@@ -404,26 +424,26 @@ void execute_register_blocked(const Problem& problem, const Schedule& schedule,
                             value += data.a[static_cast<std::size_t>(i0 + lane) * problem.k + k] *
                                      data.b[static_cast<std::size_t>(k) * problem.n + j];
                         }
-                        if (schedule.fused && problem.bias) value += data.bias[static_cast<std::size_t>(j)];
-                        if (schedule.fused && problem.relu) value = std::max(0.0F, value);
+                        if (execution.fused && problem.bias) value += data.bias[static_cast<std::size_t>(j)];
+                        if (execution.fused && problem.relu) value = std::max(0.0F, value);
                         output[static_cast<std::size_t>(i0 + lane) * problem.n + j] = value;
                     }
                 }
             }
-            if (!schedule.fused) {
+            if (!execution.fused) {
                 apply_epilogue_range(problem, data, output, ii, i_end, jj, j_end);
             }
         }
     }
 }
 
-void execute_ikj(const Problem& problem, const Schedule& schedule,
+void execute_ikj(const Problem& problem, const LoopExecutionPlan& execution,
                  const TensorData& data, std::vector<float>& output,
                  int row_begin, int row_end) {
-    const int bm = schedule.tiled ? schedule.bm : std::max(1, row_end - row_begin);
-    const int bn = schedule.tiled ? schedule.bn : problem.n;
-    const int bk = schedule.tiled ? schedule.bk : problem.k;
-    const int mr = std::max(1, schedule.mr);
+    const int bm = execution.tiled ? execution.bm : std::max(1, row_end - row_begin);
+    const int bn = execution.tiled ? execution.bn : problem.n;
+    const int bk = execution.tiled ? execution.bk : problem.k;
+    const int mr = std::max(1, execution.mr);
 
     for (int ii = row_begin; ii < row_end; ii += bm) {
         const int i_end = std::min(ii + bm, row_end);
@@ -438,33 +458,33 @@ void execute_ikj(const Problem& problem, const Schedule& schedule,
                         for (int i = i0; i < micro_end; ++i) {
                             float* c_ptr = output.data() + static_cast<std::size_t>(i) * problem.n + jj;
                             const float a_value = data.a[static_cast<std::size_t>(i) * problem.k + k];
-                            update_row(c_ptr, b_ptr, a_value, j_end - jj, schedule.vector_width);
+                            update_row(c_ptr, b_ptr, a_value, j_end - jj, execution.vector_width);
                         }
                     }
                 }
             }
-            if (schedule.fused) {
+            if (execution.fused) {
                 apply_epilogue_range(problem, data, output, ii, i_end, jj, j_end);
             }
         }
     }
-    if (!schedule.fused) {
+    if (!execution.fused) {
         apply_epilogue_range(problem, data, output, row_begin, row_end, 0, problem.n);
     }
 }
 
-void execute_packed(const Problem& problem, const Schedule& schedule,
+void execute_packed(const Problem& problem, const LoopExecutionPlan& execution,
                     const TensorData& data, const PackedMatrices& packed,
                     std::vector<float>& output,
                     int row_begin, int row_end) {
-    const int mc = std::max(schedule.bm, schedule.mc);
-    const int nc = std::max(schedule.bn, schedule.nc);
-    const int kc = std::max(schedule.bk, schedule.kc);
-    const int bm = std::max(1, schedule.bm);
-    const int bn = std::max(1, schedule.bn);
-    const int bk = std::max(1, schedule.bk);
-    const int mr = std::max(1, schedule.mr);
-    const int nr = std::max(1, schedule.nr);
+    const int mc = std::max(execution.bm, execution.mc);
+    const int nc = std::max(execution.bn, execution.nc);
+    const int kc = std::max(execution.bk, execution.kc);
+    const int bm = std::max(1, execution.bm);
+    const int bn = std::max(1, execution.bn);
+    const int bk = std::max(1, execution.bk);
+    const int mr = std::max(1, execution.mr);
+    const int nr = std::max(1, execution.nr);
     for (int jc = 0; jc < problem.n; jc += nc) {
         const int n_size = std::min(nc, problem.n - jc);
         for (int pc = 0; pc < problem.k; pc += kc) {
@@ -479,37 +499,37 @@ void execute_packed(const Problem& problem, const Schedule& schedule,
                             const int m_block = std::min(bm, m_size - ii);
                             for (int jr = 0; jr < n_block;) {
                                 const int global_j = jc + jj + jr;
-                                const int panel_remaining = schedule.pack_b
+                                const int panel_remaining = execution.pack_b
                                     ? packed.nr - global_j % packed.nr
                                     : nr;
                                 const int n_micro = std::min(panel_remaining, n_block - jr);
                                 for (int ir = 0; ir < m_block; ir += mr) {
                                     const int m_micro = std::min(mr, m_block - ir);
-                                    const int unroll = std::max(1, schedule.unroll_k);
+                                    const int unroll = std::max(1, execution.unroll_k);
                                     for (int k0 = 0; k0 < k_block; k0 += unroll) {
                                         const int k_end = std::min(k0 + unroll, k_block);
                                         for (int k = k0; k < k_end; ++k) {
                                             const int global_k = pc + kk + k;
                                             const int b_panel = global_j / packed.nr;
                                             const int b_lane = global_j % packed.nr;
-                                            const float* b_ptr = schedule.pack_b
+                                            const float* b_ptr = execution.pack_b
                                                 ? packed.b.data() + (static_cast<std::size_t>(b_panel) * problem.k + global_k) * packed.nr + b_lane
                                                 : data.b.data() + static_cast<std::size_t>(global_k) * problem.n + global_j;
-                                            if (schedule.prefetch_distance > 0 && k + schedule.prefetch_distance < k_block) {
-                                                const int prefetch_k = global_k + schedule.prefetch_distance;
-                                                const float* next_b = schedule.pack_b
+                                            if (execution.prefetch_distance > 0 && k + execution.prefetch_distance < k_block) {
+                                                const int prefetch_k = global_k + execution.prefetch_distance;
+                                                const float* next_b = execution.pack_b
                                                     ? packed.b.data() + (static_cast<std::size_t>(b_panel) * problem.k + prefetch_k) * packed.nr + b_lane
                                                     : data.b.data() + static_cast<std::size_t>(prefetch_k) * problem.n + global_j;
                                                 __builtin_prefetch(next_b, 0, 2);
                                             }
                                             for (int i = 0; i < m_micro; ++i) {
                                                 const int global_i = ic + ii + ir + i;
-                                                const float a_value = schedule.pack_a
+                                                const float a_value = execution.pack_a
                                                     ? packed.a[(static_cast<std::size_t>(global_i / packed.mr) * problem.k + global_k) * packed.mr + global_i % packed.mr]
                                                     : data.a[static_cast<std::size_t>(global_i) * problem.k + global_k];
                                                 float* c_ptr = output.data() +
                                                     static_cast<std::size_t>(global_i) * problem.n + global_j;
-                                                update_row(c_ptr, b_ptr, a_value, n_micro, schedule.vector_width);
+                                                update_row(c_ptr, b_ptr, a_value, n_micro, execution.vector_width);
                                             }
                                         }
                                     }
@@ -521,12 +541,12 @@ void execute_packed(const Problem& problem, const Schedule& schedule,
                 }
             }
         }
-        if (schedule.fused) {
+        if (execution.fused) {
             apply_epilogue_range(problem, data, output, row_begin, row_end, jc,
                                  std::min(jc + nc, problem.n));
         }
     }
-    if (!schedule.fused) {
+    if (!execution.fused) {
         apply_epilogue_range(problem, data, output, row_begin, row_end, 0, problem.n);
     }
 }
@@ -552,19 +572,21 @@ TensorData make_data(const Problem& problem, std::uint32_t seed) {
 
 std::vector<float> reference(const Problem& problem, const TensorData& data) {
     std::vector<float> output(static_cast<std::size_t>(problem.m) * problem.n, 0.0F);
-    Schedule schedule;
-    schedule.fused = true;
-    execute_ijk(problem, schedule, data, output, 0, problem.m);
+    LoopExecutionPlan execution;
+    execution.fused = true;
+    execute_ijk(problem, execution, data, output, 0, problem.m);
     return output;
 }
 
 void execute(const LoopIR& loop, const TensorData& data, std::vector<float>& output) {
+    verify_loop_ir(loop);
+    const auto execution = analyze_loop_ir(loop);
     output.resize(static_cast<std::size_t>(loop.problem.m) * loop.problem.n);
-    const PackedMatrices packed = pack_matrices(loop.problem, loop.schedule, data);
-    const int thread_count = std::clamp(loop.schedule.threads, 1, loop.problem.m);
+    const PackedMatrices packed = pack_matrices(loop.problem, execution, data);
+    const int thread_count = std::clamp(execution.threads, 1, loop.problem.m);
     auto worker = [&](int begin, int end, int cpu) {
 #if defined(__linux__)
-        if (loop.schedule.pin_threads) {
+        if (execution.pin_threads) {
             cpu_set_t cpu_set;
             CPU_ZERO(&cpu_set);
             CPU_SET(preferred_cpu(cpu), &cpu_set);
@@ -576,30 +598,31 @@ void execute(const LoopIR& loop, const TensorData& data, std::vector<float>& out
 #else
         (void)cpu;
 #endif
-        if (loop.schedule.order == LoopOrder::IJK) {
-            execute_ijk(loop.problem, loop.schedule, data, output, begin, end);
-        } else if (loop.schedule.pack_a || loop.schedule.pack_b) {
+        if (execution.pack_a || execution.pack_b) {
             std::fill(output.begin() + static_cast<std::size_t>(begin) * loop.problem.n,
                       output.begin() + static_cast<std::size_t>(end) * loop.problem.n, 0.0F);
-            execute_packed(loop.problem, loop.schedule, data, packed, output, begin, end);
-        } else if (loop.schedule.vector_width >= 8) {
-            execute_register_blocked(loop.problem, loop.schedule, data, output, begin, end);
+            execute_packed(loop.problem, execution, data, packed, output, begin, end);
+        } else if (execution.vector_width >= 8) {
+            execute_register_blocked(loop.problem, execution, data, output, begin, end);
+        } else if (execution.order == LoopOrder::IJK) {
+            execute_ijk(loop.problem, execution, data, output, begin, end);
         } else {
             std::fill(output.begin() + static_cast<std::size_t>(begin) * loop.problem.n,
                       output.begin() + static_cast<std::size_t>(end) * loop.problem.n, 0.0F);
-            execute_ikj(loop.problem, loop.schedule, data, output, begin, end);
+            execute_ikj(loop.problem, execution, data, output, begin, end);
         }
     };
     if (thread_count == 1) {
         worker(0, loop.problem.m, 0);
-        return;
+    } else {
+        const int rows_per_thread = (loop.problem.m + thread_count - 1) / thread_count;
+        thread_team(thread_count).run([&](int thread_index) {
+            const int begin = thread_index * rows_per_thread;
+            const int end = std::min(begin + rows_per_thread, loop.problem.m);
+            if (begin < end) worker(begin, end, thread_index);
+        });
     }
-    const int rows_per_thread = (loop.problem.m + thread_count - 1) / thread_count;
-    thread_team(thread_count).run([&](int thread_index) {
-        const int begin = thread_index * rows_per_thread;
-        const int end = std::min(begin + rows_per_thread, loop.problem.m);
-        if (begin < end) worker(begin, end, thread_index);
-    });
+    apply_explicit_graph_epilogues(execution, data, output);
 }
 
 double max_abs_error(const std::vector<float>& lhs, const std::vector<float>& rhs) {

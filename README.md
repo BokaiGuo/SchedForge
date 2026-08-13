@@ -56,8 +56,10 @@ flowchart TD
 - **Structured kernel compiler:** iteration domains, parallel/reduction
   iterators, indexing maps, Transform IR serialization/replay, and schedule
   programs generated from measured winners.
-- **Tensor-to-loop lowering:** separate computation semantics from scheduling;
-  both the simulator and code generators consume the same Loop IR.
+- **Explicit executable LoopIR:** Schedule programs rewrite concrete
+  `scf.for`, `scf.parallel`, pack, prefetch, load, accumulator, vector FMA,
+  epilogue, and store operations. Native execution, simulation, and LLVM
+  consume LoopIR rather than reading Schedule fields.
 - **CPU scheduling:** multi-level tiling, MR/NR register blocks, K unrolling,
   PackA/PackB, prefetching, vectorization, fusion, affinity, and threading.
 - **Generated micro-kernels:** native AVX2/FMA and LLVM 18 ORC paths both support
@@ -145,12 +147,18 @@ kernel schedules, generated LLVM kernels, runtime latency, and validation error.
 
 ## Schedule DSL
 
-Schedules are reusable compiler objects rather than backend-only flags:
+Schedules are reusable transformation programs, not executable backend
+configuration. Applying one produces explicit Scheduled LoopIR; execution
+backends do not accept Schedule:
 
 ```text
 order=ikj;outer=64,128,64;tile=32,64,32;micro=4,8;
 vector=8;unroll=4;threads=8;pack=ab;prefetch=4;fuse=true;pin=true
 ```
+
+The rewritten IR makes loop nesting, parallelism, packing, prefetching,
+register-resident reduction, vector width, epilogue placement, and stores
+inspectable and verifiable before target lowering.
 
 | Field | Meaning |
 |---|---|
@@ -190,8 +198,8 @@ The checked-in `examples/transformer_mlp.mlir` currently produces:
 - naive intermediate tensors: 32,768 bytes
 - planned workspace: 8,192 bytes
 - 2 LLVM kernel artifacts with Transform IR and AVX2 tensor intrinsics
-- 2,295 hardware measurements per dispatch from 9,720 generated candidates
-- native scheduled-loop runtime: 0.020 ms on the recorded host
+- 3,825 hardware measurements per dispatch from 16,200 generated candidates
+- native scheduled-loop runtime: 0.021 ms on the recorded host
 - validated end-to-end MLP execution with maximum error below `1e-3`
 
 See `results/transformer_mlp_compile.txt` and
@@ -205,6 +213,7 @@ universal performance claims.
 | Experiment | Recorded result |
 |---|---:|
 | Native hardware auto-tuning, fused 192³ | **374.402 GFLOPS** |
+| Explicit LoopIR fresh validation, fused 192³ | **369.728 GFLOPS** |
 | Native hardware auto-tuning, fused 256³ | **390.772 GFLOPS** |
 | Native hardware auto-tuning, fused 512³ | **434.863 GFLOPS** |
 | LLVM ORC JIT, fused 192³ | **31.216 GFLOPS** |
@@ -253,6 +262,7 @@ scripts/               Hardware-counter helpers
 
 - [Architecture](docs/ARCHITECTURE.md)
 - [Graph compiler and `.sfe` format](docs/GRAPH_COMPILER.md)
+- [Explicit Scheduled LoopIR](docs/LOOP_IR.md)
 - [Experiment design](docs/EXPERIMENT.md)
 - [Final experiment report](results/FINAL_REPORT.md)
 - [Architecture decisions](docs/decisions/)

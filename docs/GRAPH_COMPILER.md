@@ -56,13 +56,16 @@ The text `.sfe` artifact contains:
 - Structured Tensor Compute descriptions
 - fused Dispatch IR
 - Transform IR and tensor intrinsic selection
+- explicit Scheduled LoopIR per dispatch
 - layout and buffer plans
 - dynamic shape guards
 - LLVM IR kernel artifacts
 
-The current runtime executes the Transformer MLP plan through the native
-scheduled-loop dispatch path selected by hardware auto-tuning. LLVM ORC kernels
-are generated and validated during compilation and embedded in the plan, but
-the graph runtime does not yet load those embedded kernels back from `.sfe`.
+The current runtime executes the Transformer MLP plan through the compiled
+Scheduled LoopIR selected by hardware auto-tuning. GELU and residual are
+explicit LoopIR epilogues rather than hand-written wrapper steps. LLVM ORC
+kernels lower the MatMul/bias portion of the same dispatch LoopIR and are
+embedded in the plan, but the graph runtime does not yet load those embedded
+kernels back from `.sfe`.
 Other imported graphs can already be compiled and serialized even when a
 graph-specific runtime executor is not yet available.

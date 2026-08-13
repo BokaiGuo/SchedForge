@@ -180,16 +180,19 @@ std::size_t MemoryPlanner::peakBytes(const std::vector<BufferPlan>& buffers) con
 LoopIR TensorToLoopLowering::lower(const GraphIR& graph) const { return LowerToLoopsPass{}.run(graph); }
 void LoopPassManager::run(LoopIR& loop) { for (const auto& pass : passes_) pass->run(loop); }
 ApplySchedulePass::ApplySchedulePass(Schedule schedule) : schedule_(std::move(schedule)) {}
-void ApplySchedulePass::run(LoopIR& loop) { loop.schedule = schedule_; }
+void ApplySchedulePass::run(LoopIR& loop) { loop = apply_schedule(loop.problem, schedule_); }
 
 std::string LLVMTextCodeGen::lower(const LoopIR& loop, const TargetInfo& target) const {
-    const int width = std::max(1, loop.schedule.vector_width);
+    verify_loop_ir(loop);
+    const auto execution = analyze_loop_ir(loop);
+    const int width = std::max(1, execution.vector_width);
     std::ostringstream out;
     out << "; SchedForge LLVM-compatible textual IR\n"
         << "; target = " << target.str() << "\n"
-        << "; schedule = " << ScheduleDSL::print(loop.schedule) << "\n"
-        << "; register_tile = " << loop.schedule.mr << "x" << loop.schedule.nr << "\n"
-        << "; tensorization = avx2_f32_m" << loop.schedule.mr << "n" << loop.schedule.nr << "\n"
+        << "; source = explicit scheduled LoopIR\n"
+        << "; register_tile = " << execution.mr << "x" << execution.nr << "\n"
+        << "; tensorization = avx2_f32_m" << execution.mr << "n" << execution.nr << "\n"
+        << "; loopir follows\n; " << loop.dump() << "\n"
         << "; vector.contract lowered to llvm.fma with register-resident accumulators\n"
         << "define void @matmul(ptr noalias %A, ptr noalias %B, ptr noalias %bias, ptr noalias %C, i64 %M, i64 %N, i64 %K) {\n"
         << "entry:\n  br label %i.loop\n"
@@ -214,18 +217,20 @@ std::string LLVMTextCodeGen::lower(const LoopIR& loop, const TargetInfo& target)
 
 CostBreakdown CostModel::evaluate(const LoopIR& loop, const SimulationResult& simulation,
                                   const TargetInfo& target) const {
+    const auto execution = analyze_loop_ir(loop);
     CostBreakdown cost;
-    const double lanes = static_cast<double>(std::max(1, loop.schedule.vector_width));
-    const double threads = static_cast<double>(std::max(1, loop.schedule.threads));
+    const double lanes = static_cast<double>(std::max(1, execution.vector_width));
+    const double threads = static_cast<double>(std::max(1, execution.threads));
     cost.compute_cycles = static_cast<double>(loop.problem.m) * loop.problem.n * loop.problem.k / (2.0 * lanes * threads);
     cost.memory_cycles = static_cast<double>(simulation.l1.hits) * 4.0 +
                          static_cast<double>(simulation.l2.hits) * 12.0 +
                          static_cast<double>(simulation.l3.hits) * 40.0 +
                          static_cast<double>(simulation.dram_accesses) * 200.0;
     cost.tlb_cycles = static_cast<double>(simulation.dtlb_misses) * 30.0;
-    cost.packing_cycles = ((loop.schedule.pack_a ? 4.0 * loop.problem.m * loop.problem.k : 0.0) +
-                           (loop.schedule.pack_b ? 4.0 * loop.problem.k * loop.problem.n : 0.0)) / 32.0;
-    cost.spill_cycles = estimate_register_pressure(loop.schedule, target).spills ? cost.compute_cycles * 0.75 : 0.0;
+    cost.packing_cycles = ((execution.pack_a ? 4.0 * loop.problem.m * loop.problem.k : 0.0) +
+                           (execution.pack_b ? 4.0 * loop.problem.k * loop.problem.n : 0.0)) / 32.0;
+    cost.spill_cycles = estimate_register_pressure(execution, target).spills
+        ? cost.compute_cycles * 0.75 : 0.0;
     cost.total_cycles = (cost.compute_cycles + cost.memory_cycles + cost.tlb_cycles +
                          cost.packing_cycles + cost.spill_cycles) * calibration_factor_;
     return cost;
@@ -380,7 +385,7 @@ SearchResult Compiler::compileAndTune(const GraphIR& graph, const TensorData& da
     tuning_key_schedule.bm = static_cast<int>(top_k);
     const auto cache_key = cache_.key(graph.problem, tuning_key_schedule, target_);
     if (const auto cached = cache_.lookup(cache_key)) {
-        LoopIR loop{graph.problem, *cached};
+        const LoopIR loop = apply_schedule(graph.problem, *cached);
         return {*cached, simulate(loop, target_), benchmark(loop, data, warmup, repetitions),
                 1, 1, 1, 1, true};
     }

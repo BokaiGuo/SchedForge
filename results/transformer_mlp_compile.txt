@@ -16,20 +16,20 @@ naive temporary memory: 32768 bytes
 planned workspace: 8192 bytes
 
 [Kernel Compiler]
-dispatch #0: ikj-tile32x32x16-v8-mr4-fused micro=4x16 threads=1
+dispatch #0: ikj-tile16x64x16-v8-mr4-fused micro=4x16 threads=1
 dispatch #1: ikj-tile32x64x16-v8-mr4-fused micro=4x16 threads=1
 
 [AutoScheduler]
-dispatch #0: candidates=9720 hardware measured=2295 cache=miss
-dispatch #1: candidates=9720 hardware measured=2295 cache=miss
+dispatch #0: candidates=16200 hardware measured=3825 cache=miss
+dispatch #1: candidates=16200 hardware measured=3825 cache=miss
 
 [LLVM]
 kernels generated: 2
-JIT compile: 120.991 ms
+JIT compile: 119.089 ms
 
 [Runtime]
 backend: native scheduled-loop dispatch
-execution: 0.020 ms
+execution: 0.021 ms
 
 [Validation]
 max error: 0.000

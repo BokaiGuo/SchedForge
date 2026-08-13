@@ -18,14 +18,36 @@ void test_ir_passes() {
     schedforge::GraphIR graph{{17, 19, 13, true, true}};
     schedforge::LowerToLoopsPass lower;
     auto loop = lower.run(graph);
-    require(loop.schedule.order == schedforge::LoopOrder::IJK, "lowering order");
+    require(schedforge::analyze_loop_ir(loop).order == schedforge::LoopOrder::IJK,
+            "lowering order");
     schedforge::LoopInterchangePass{}.run(loop);
+    require(schedforge::analyze_loop_ir(loop).order == schedforge::LoopOrder::IKJ,
+            "interchange");
     schedforge::LoopTilingPass{}.run(loop, 8, 16, 4);
     schedforge::VectorizePass{}.run(loop, 8);
     schedforge::FusionPass{}.run(loop);
-    require(loop.schedule.order == schedforge::LoopOrder::IKJ, "interchange");
-    require(loop.schedule.tiled && loop.schedule.bn == 16, "tiling");
-    require(loop.schedule.vector_width == 8 && loop.schedule.fused, "vector/fusion");
+    const auto execution = schedforge::analyze_loop_ir(loop);
+    require(execution.tiled && execution.bn == 16, "tiling");
+    require(execution.vector_width == 8 && execution.fused, "vector/fusion");
+    const auto text = loop.dump();
+    require(text.find("scf.for %ii") != std::string::npos &&
+            text.find("vector.accumulator.init") != std::string::npos &&
+            text.find("vector.load") != std::string::npos &&
+            text.find("vector.fma") != std::string::npos &&
+            text.find("vector.store") != std::string::npos,
+            "explicit scheduled loop operations");
+    require(text.find("vector.fma") < text.find("epilogue.add_bias") &&
+            text.find("epilogue.add_bias") < text.find("vector.store"),
+            "reduction epilogue store scope");
+    schedforge::LoopIR invalid;
+    invalid.problem = graph.problem;
+    bool rejected_invalid = false;
+    try {
+        schedforge::verify_loop_ir(invalid);
+    } catch (const std::invalid_argument&) {
+        rejected_invalid = true;
+    }
+    require(rejected_invalid, "loop ir verifier");
 }
 
 class RenamePass final : public schedforge::OperationPass {
@@ -81,7 +103,9 @@ void test_correctness_non_multiple() {
     schedforge::LoopIR packed_loop{graph.problem, schedule};
     schedforge::execute(packed_loop, data, actual);
     require(schedforge::max_abs_error(expected, actual) < 1.0e-3, "packed correctness");
-    require(packed_loop.dump().find("pack_a,pack_b") != std::string::npos, "packing in loop ir");
+    require(packed_loop.dump().find("buffer.pack %A -> %packedA") != std::string::npos &&
+            packed_loop.dump().find("buffer.pack %B -> %packedB") != std::string::npos,
+            "packing in loop ir");
 
     schedule.pack_a = false;
     schedule.pack_b = false;
@@ -104,7 +128,12 @@ void test_simulator_and_search() {
     const auto data = schedforge::make_data(graph.problem, 13);
     schedforge::LoopIR loop{graph.problem, {}};
     const auto simulation = schedforge::simulate(loop);
-    require(simulation.memory_accesses > 0 && simulation.estimated_cycles > 0.0, "simulation stats");
+    require(simulation.memory_accesses > 0 && simulation.estimated_cycles > 0.0 &&
+            simulation.sampled_m == graph.problem.m && simulation.sampled_n == graph.problem.n &&
+            simulation.sampled_k == graph.problem.k, "full-size simulation stats");
+    const auto sampled = schedforge::simulate(loop, schedforge::TargetInfo::detect(), {16});
+    require(sampled.sampled_m == 16 && sampled.sampled_n == 16 && sampled.sampled_k == 16,
+            "explicit simulation sampling");
     const auto result = schedforge::autoschedule(graph, data, 2, 3, 0, 1);
     require(result.search_space > result.benchmarked, "search pruning");
     require(result.benchmark.max_error < 1.0e-3, "search correctness");
@@ -122,7 +151,10 @@ void test_compiler_architecture() {
     schedforge::Compiler compiler(schedforge::TargetInfo::detect(), "build/test-kernel-cache");
     const auto compiled = compiler.compile(graph, schedule);
     require(compiled.tensor_module.dump().find("tensor.matmul") != std::string::npos, "tensor module");
-    require(compiled.loop.dump().find("pack_b") != std::string::npos, "scheduled loop module");
+    require(compiled.loop.dump().find("buffer.pack %B -> %packedB") != std::string::npos &&
+            compiled.loop.dump().find("memref.prefetch") != std::string::npos &&
+            compiled.loop.dump().find("vector.fma") != std::string::npos,
+            "scheduled loop module");
     require(compiled.llvm_ir.find("define void @matmul") != std::string::npos, "llvm text lowering");
     require(compiled.layouts.at(1).layout == schedforge::Layout::PackedB, "layout propagation");
     require(!compiled.buffers.empty() && compiled.buffers.front().alignment == 64, "memory planning");
@@ -153,11 +185,19 @@ void test_compiler_architecture() {
 
     const schedforge::GraphIR jit_graph{{9, 11, 7, true, true}};
     const auto jit_data = schedforge::make_data(jit_graph.problem, 23);
-    const auto jit_result = schedforge::LLVMJITBackend{}.benchmark(jit_graph, jit_data, schedule, 0, 1);
+    const auto jit_result = schedforge::LLVMJITBackend{}.benchmark(
+        schedforge::apply_schedule(jit_graph.problem, schedule), jit_data, 0, 1);
     require(jit_result.max_error < 1.0e-3 && jit_result.llvm_ir.find("<8 x float>") != std::string::npos &&
             !jit_result.assembly.empty(),
             "llvm orc jit");
-    const auto jit_cached = schedforge::LLVMJITBackend{}.benchmark(jit_graph, jit_data, schedule, 0, 1);
+    std::vector<float> native_output;
+    const auto shared_loop = schedforge::apply_schedule(jit_graph.problem, schedule);
+    schedforge::execute(shared_loop, jit_data, native_output);
+    require(schedforge::max_abs_error(native_output, schedforge::reference(jit_graph.problem, jit_data)) < 1.0e-3 &&
+            schedforge::simulate(shared_loop, compiler.target()).memory_accesses > 0,
+            "single loop ir native simulator agreement");
+    const auto jit_cached = schedforge::LLVMJITBackend{}.benchmark(
+        schedforge::apply_schedule(jit_graph.problem, schedule), jit_data, 0, 1);
     require(jit_cached.compile_milliseconds < jit_result.compile_milliseconds, "jit kernel cache");
 
     schedforge::Schedule register_schedule;
@@ -167,7 +207,7 @@ void test_compiler_architecture() {
     const schedforge::GraphIR register_graph{{8, 16, 8, true, false}};
     const auto register_data = schedforge::make_data(register_graph.problem, 29);
     const auto register_jit = schedforge::LLVMJITBackend{}.benchmark(
-        register_graph, register_data, register_schedule, 0, 1);
+        schedforge::apply_schedule(register_graph.problem, register_schedule), register_data, 0, 1);
     require(register_jit.max_error < 1.0e-3 &&
             register_jit.assembly_report.fma_instructions > 0 &&
             !register_jit.assembly_report.has_spill_pattern,
@@ -219,9 +259,22 @@ void test_graph_compiler() {
     schedforge::GraphCompileOptions options;
     options.max_threads = 2;
     const auto plan = schedforge::GraphCompiler{}.compile(graph, options, &config, &data);
-    require(plan.dispatches.size() == 2 && plan.llvm_ir.size() == 2 &&
+    require(plan.dispatches.size() == 2 && plan.scheduled_loops.size() == 2 &&
+            plan.llvm_ir.size() == 2 &&
             plan.llvm_ir.front().find("llvm.fma") != std::string::npos,
             "graph llvm kernel compilation");
+    require(plan.scheduled_loops.front().dump().find("vector.accumulator.init") != std::string::npos &&
+            plan.scheduled_loops.front().dump().find("epilogue.gelu") != std::string::npos &&
+            plan.scheduled_loops.back().dump().find("epilogue.add_residual") != std::string::npos &&
+            plan.dump().find("scheduled_loop @dispatch_0") != std::string::npos,
+            "graph executable embeds scheduled loop ir");
+    const auto first_loop_dump = plan.scheduled_loops.front().dump();
+    const auto second_loop_dump = plan.scheduled_loops.back().dump();
+    require(first_loop_dump.find("vector.fma") < first_loop_dump.find("epilogue.gelu") &&
+            first_loop_dump.find("epilogue.gelu") < first_loop_dump.find("vector.store") &&
+            second_loop_dump.find("vector.fma") < second_loop_dump.find("epilogue.add_residual") &&
+            second_loop_dump.find("epilogue.add_residual") < second_loop_dump.find("vector.store"),
+            "graph epilogues execute before stores");
     require(plan.layout_conversions_removed == 1 &&
             plan.llvm_compile_milliseconds >= 0.0 && !plan.hardware.empty(),
             "graph compilation statistics");

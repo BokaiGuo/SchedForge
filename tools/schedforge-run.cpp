@@ -22,7 +22,8 @@ int main(int argc, char** argv) {
     const auto schedule = schedforge::ScheduleDSL::parse(schedule_text);
     const auto data = schedforge::make_data(problem);
     if (llvm_jit) {
-        const auto measured = schedforge::LLVMJITBackend{}.benchmark({problem}, data, schedule, 1, 5);
+        const auto measured = schedforge::LLVMJITBackend{}.benchmark(
+            schedforge::apply_schedule(problem, schedule), data, 1, 5);
         std::cout << "backend: llvm-orc-jit\n"
                   << "compile_ms: " << measured.compile_milliseconds << '\n'
                   << "time_ms: " << measured.execution_milliseconds << '\n'

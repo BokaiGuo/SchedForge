@@ -96,7 +96,18 @@ int main(int argc, char** argv) {
             schedforge::FusionPass fusion;
             auto loop = lower.run(graph);
             interchange.run(loop); tiling.run(loop, 32, 64, 32); vectorize.run(loop, 8); fusion.run(loop);
-            loop.schedule.threads = options.threads;
+            auto execution = schedforge::analyze_loop_ir(loop);
+            schedforge::Schedule display_schedule;
+            display_schedule.order = execution.order;
+            display_schedule.bm = execution.bm; display_schedule.bn = execution.bn; display_schedule.bk = execution.bk;
+            display_schedule.mr = execution.mr; display_schedule.nr = execution.nr;
+            display_schedule.vector_width = execution.vector_width;
+            display_schedule.threads = options.threads;
+            display_schedule.unroll_k = execution.unroll_k;
+            display_schedule.tiled = execution.tiled; display_schedule.fused = execution.fused;
+            display_schedule.pack_a = execution.pack_a; display_schedule.pack_b = execution.pack_b;
+            display_schedule.prefetch_distance = execution.prefetch_distance;
+            loop = schedforge::apply_schedule(graph.problem, display_schedule);
             std::cout << "Optimized Loop IR:\n" << loop.dump() << '\n';
         }
         if (options.experiment) {

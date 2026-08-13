@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iosfwd>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -66,11 +67,85 @@ struct GraphIR {
     std::string dump() const;
 };
 
-struct LoopIR {
-    Problem problem;
-    Schedule schedule;
-    std::string dump() const;
+enum class LoopOpKind {
+    For,
+    ParallelFor,
+    BufferAlloc,
+    Pack,
+    Prefetch,
+    ScalarLoad,
+    VectorLoad,
+    Broadcast,
+    AccumulatorInit,
+    Fma,
+    AddBias,
+    Relu,
+    Gelu,
+    AddResidual,
+    ScalarStore,
+    VectorStore
 };
+
+struct LoopOperation {
+    LoopOpKind kind = LoopOpKind::For;
+    std::string result;
+    std::string induction;
+    std::string lower;
+    std::string upper;
+    int step = 1;
+    int width = 1;
+    int distance = 0;
+    int threads = 1;
+    bool pinned = false;
+    std::string source;
+    std::string destination;
+    std::vector<std::string> indices;
+    std::vector<LoopOperation> body;
+    std::string dump(int indent = 0) const;
+};
+
+struct LoopExecutionPlan {
+    LoopOrder order = LoopOrder::IJK;
+    int bm = 1;
+    int bn = 1;
+    int bk = 1;
+    int mr = 1;
+    int nr = 1;
+    int vector_width = 1;
+    int threads = 1;
+    int mc = 1;
+    int nc = 1;
+    int kc = 1;
+    int unroll_k = 1;
+    int prefetch_distance = 0;
+    bool tiled = false;
+    bool fused = false;
+    bool pack_a = false;
+    bool pack_b = false;
+    bool pin_threads = false;
+    bool gelu = false;
+    bool residual = false;
+};
+
+struct LoopIR {
+    LoopIR() = default;
+    LoopIR(Problem problem, const Schedule& schedule);
+    Problem problem;
+    const std::vector<LoopOperation>& operations() const;
+    void appendOperation(LoopOperation operation);
+    void insertEpilogueBeforeStores(LoopOperation operation);
+    std::string dump() const;
+private:
+    std::vector<LoopOperation> operations_;
+    mutable std::optional<LoopExecutionPlan> execution_plan_;
+    friend LoopIR apply_schedule(const Problem&, const Schedule&);
+    friend LoopExecutionPlan analyze_loop_ir(const LoopIR&);
+    friend void verify_loop_ir(const LoopIR&);
+};
+
+LoopIR apply_schedule(const Problem& problem, const Schedule& schedule);
+LoopExecutionPlan analyze_loop_ir(const LoopIR& loop);
+void verify_loop_ir(const LoopIR& loop);
 
 class LowerToLoopsPass {
 public:
@@ -102,6 +177,7 @@ struct TensorData {
     std::vector<float> b;
     std::vector<float> bias;
     std::vector<float> output;
+    std::vector<float> residual;
 };
 
 TensorData make_data(const Problem& problem, std::uint32_t seed = 7);
@@ -140,12 +216,21 @@ struct SimulationResult {
     double estimated_bandwidth_bytes = 0.0;
     double register_pressure = 0.0;
     double estimated_cycles = 0.0;
+    int sampled_m = 0;
+    int sampled_n = 0;
+    int sampled_k = 0;
     double l1_miss_rate() const;
     double llc_miss_rate() const;
 };
 
+struct SimulationOptions {
+    int max_extent = 0;
+};
+
 SimulationResult simulate(const LoopIR& loop);
 SimulationResult simulate(const LoopIR& loop, const TargetInfo& target);
+SimulationResult simulate(const LoopIR& loop, const TargetInfo& target,
+                          const SimulationOptions& options);
 
 struct RegisterPressure {
     int accumulators = 0;
@@ -156,6 +241,8 @@ struct RegisterPressure {
 };
 
 RegisterPressure estimate_register_pressure(const Schedule& schedule,
+                                             const TargetInfo& target);
+RegisterPressure estimate_register_pressure(const LoopExecutionPlan& execution,
                                              const TargetInfo& target);
 
 struct SearchResult {

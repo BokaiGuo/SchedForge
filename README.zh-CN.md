@@ -69,8 +69,9 @@ flowchart LR
   Bufferization、生命周期分析、64 字节对齐 Workspace 复用和 Guarded Specialization。
 - **结构化 Kernel Compiler**：Iteration Domain、并行/归约 Iterator、Indexing Map、
   Transform IR 序列化与回放，以及由实测 Schedule 生成的变换程序。
-- **Tensor IR 与 Loop IR 分层**：Tensor IR 描述“算什么”，Loop IR 描述
-  “具体怎么执行”，调度策略独立于计算语义。
+- **显式可执行 LoopIR**：Schedule 会真正 rewrite 出 `scf.for`、
+  `scf.parallel`、Pack、Prefetch、Load、Accumulator、Vector FMA、Epilogue
+  和 Store。原生执行、Simulator 与 LLVM 都消费 LoopIR，不再读取 Schedule 字段。
 - **CPU 循环优化**：支持多级分块、MR/NR 寄存器分块、K 维展开、A/B 矩阵
   数据打包、软件预取、SIMD 向量化、尾部处理、算子融合和多线程执行。
 - **生成式微内核后端**：原生 AVX2 与 LLVM ORC 都支持寄存器驻留 MR×NR
@@ -150,13 +151,16 @@ cmake -S . -B build -G Ninja \
 
 ## 调度描述语言
 
-SchedForge 使用一段紧凑文本描述执行方案。它不是某个后端的临时参数，而是
-循环变换、模拟器、代码生成器和自动调优器共同使用的编译器对象。
+SchedForge 使用一段紧凑文本描述变换方案。Schedule 不是最终执行配置；应用
+之后会生成显式 Scheduled LoopIR，执行后端不再接收 Schedule。
 
 ```text
 order=ikj;outer=64,128,64;tile=32,64,32;micro=4,8;
 vector=8;unroll=4;threads=8;pack=ab;prefetch=4;fuse=true;pin=true
 ```
+
+重写后的 IR 会明确表达循环嵌套、并行、Packing、Prefetch、寄存器驻留归约、
+向量宽度、Epilogue 作用域与 Store，进入目标后端前即可检查和验证。
 
 | 字段 | 作用 |
 |---|---|
@@ -195,8 +199,8 @@ vector=8;unroll=4;threads=8;pack=ab;prefetch=4;fuse=true;pin=true
 - 跨 Dispatch 的 `blocked<6x16>` Layout 传播
 - 朴素中间张量 32,768 字节，规划后 Workspace 8,192 字节
 - 2 个携带 Transform IR 与 AVX2 Tensor Intrinsic 的 LLVM Kernel Artifact
-- 每个 Dispatch 从 9,720 个生成候选中完成 2,295 次真机测量
-- 当前记录主机上的原生 Scheduled Loop Runtime 为 0.020 ms
+- 每个 Dispatch 从 16,200 个生成候选中完成 3,825 次真机测量
+- 当前记录主机上的原生 Scheduled Loop Runtime 为 0.021 ms
 - 端到端 MLP 执行验证，最大误差低于 `1e-3`
 
 可复现输出见 `results/transformer_mlp_compile.txt` 和
@@ -210,6 +214,7 @@ vector=8;unroll=4;threads=8;pack=ab;prefetch=4;fuse=true;pin=true
 | 测试项目 | 实测结果 |
 |---|---:|
 | 原生后端真机自动调优，融合 192³ 矩阵乘 | **374.402 GFLOPS** |
+| 显式 LoopIR 新鲜重测，融合 192³ 矩阵乘 | **369.728 GFLOPS** |
 | 原生后端真机自动调优，融合 256³ 矩阵乘 | **390.772 GFLOPS** |
 | 原生后端真机自动调优，融合 512³ 矩阵乘 | **434.863 GFLOPS** |
 | `LLVM ORC JIT` 后端，融合 192³ 矩阵乘 | **31.216 GFLOPS** |
@@ -255,6 +260,7 @@ scripts/              性能计数器辅助脚本
 
 - [架构说明](docs/ARCHITECTURE.md)
 - [Graph Compiler 与 `.sfe` 格式](docs/GRAPH_COMPILER.md)
+- [显式 Scheduled LoopIR](docs/LOOP_IR.md)
 - [实验方法](docs/EXPERIMENT.md)
 - [最终实验报告](results/FINAL_REPORT.md)
 - [架构决策记录](docs/decisions/)
