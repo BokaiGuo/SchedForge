@@ -27,6 +27,7 @@ int main(int argc, char** argv) {
         schedforge::AttentionPlanOptions options;
         options.schedule.threads = 8;
         bool automatic = true;
+        bool fused_llvm = false;
         int repetitions = 5;
         std::string output = "results/attention_prefill.sfe";
         std::string experiment_csv;
@@ -48,6 +49,7 @@ int main(int argc, char** argv) {
             else if (argument.starts_with("--experiment-csv=")) experiment_csv = argument.substr(17);
             else if (argument.starts_with("--scaling-csv=")) scaling_csv = argument.substr(14);
             else if (argument == "--causal") config.causal = true;
+            else if (argument == "--fused-llvm") fused_llvm = true;
             else if (argument == "--strategy=auto") automatic = true;
             else if (argument.starts_with("--strategy=")) {
                 options.strategy = parse_strategy(argument.substr(11));
@@ -57,6 +59,7 @@ int main(int argc, char** argv) {
                 std::cout << "schedforge-attention [--batch=1 --q-heads=8 --kv-heads=8]\n"
                              "  [--sq=128 --sk=128 --head-dim=64 --value-dim=64]\n"
                              "  [--causal --threads=8 --qtile=32 --kvtile=64]\n"
+                             "  [--fused-llvm]\n"
                              "  [--strategy=auto|materialized|tiled|io-aware|auto-io-aware|decode]\n"
                              "  [--experiment-csv=results/attention.csv]\n"
                              "  [--scaling-csv=results/attention_scaling.csv] [-o plan.sfe]\n";
@@ -68,6 +71,26 @@ int main(int argc, char** argv) {
             config, data, schedforge::TargetInfo::detect(), options.schedule.threads, 1, 2);
         const auto plan = schedforge::AttentionCompiler{}.compile(config, options);
         plan.save(output);
+        if (fused_llvm) {
+            const auto measured = schedforge::execute_fused_attention_llvm(
+                plan, data, 1, repetitions);
+            std::cout << "[Fused LLVM Attention]\nstrategy: online-softmax\n"
+                      << "shape: B=" << config.batch << " Hq=" << config.query_heads
+                      << " Hkv=" << config.kv_heads << " Sq=" << config.sequence_query
+                      << " Sk=" << config.sequence_kv << " D=" << config.head_dim << '\n'
+                      << std::fixed << std::setprecision(3)
+                      << "compile_ms: " << measured.compile_milliseconds << '\n'
+                      << "P50 execution: " << measured.execution_milliseconds << " ms\n"
+                      << "P95 execution: " << measured.p95_milliseconds << " ms\n"
+                      << "max error: " << measured.max_error << '\n'
+                      << "threads: " << measured.threads << '\n'
+                      << "instructions: " << measured.assembly_report.instructions << '\n'
+                      << "vector_instructions: " << measured.assembly_report.vector_instructions << '\n'
+                      << "branches: " << measured.assembly_report.branches << '\n'
+                      << "stack_accesses: " << measured.assembly_report.stack_accesses << '\n'
+                      << "spill_pattern: " << measured.assembly_report.has_spill_pattern << '\n';
+            return measured.max_error <= 1.0e-3 ? 0 : 1;
+        }
         schedforge::AttentionBenchmarkResult measured;
         if (options.strategy == schedforge::AttentionLoweringStrategy::SplitKVDecode) {
             auto cache = schedforge::make_kv_cache(config);

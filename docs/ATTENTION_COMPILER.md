@@ -66,10 +66,31 @@ tile.pipeline @attention {
 ```
 
 QK and PV also lower into ordinary scheduled LoopIR and LLVM 18 ORC artifacts.
-The native attention runtime currently uses specialized AVX2 dot products and
-vectorized weighted-value accumulation; the embedded LLVM kernels are compiled
-and numerically validated building blocks, not yet one monolithic fused LLVM
-attention function.
+The native attention runtime uses specialized AVX2 dot products and vectorized
+weighted-value accumulation. Version 0.10 additionally lowers the complete
+online-softmax pipeline into one executable LLVM 18 ORC function.
+
+## Fused LLVM Function
+
+`execute_fused_attention_llvm` specializes a complete Attention configuration
+and emits one function with four pointer operands plus a query-row range. The
+function computes QK, applies the causal legal-key bound, updates exact online
+maximum and denominator state, rescales and accumulates the PV numerator, and
+normalizes the final output. Independent query rows are split across the
+Attention plan's worker count. No `Sq x Sk` score or probability matrix is
+allocated.
+
+The recorded Intel Core i5-14600K results are:
+
+- MHA causal Prefill `S=128`: native 0.340 ms, fused LLVM 0.791 ms
+- GQA causal Prefill `S=128`: native 0.255 ms, fused LLVM 0.786 ms
+- GQA Decode `Sk=1024`: native 0.099 ms, fused LLVM 0.214 ms
+
+Maximum error is below `5e-8`. The emitted function is real executable machine
+code, but it remains 2.1-3.1x slower than the native specialized algorithms and
+the current assembly report detects vector stack spills. Thus v0.10 establishes
+the fused codegen seam and a reproducible quality diagnosis; it does not claim
+native parity.
 
 ## Exact Online Softmax
 
@@ -142,4 +163,4 @@ Not yet claimed:
 - BF16/INT8 attention
 - dropout, backward, or training kernels
 - distributed or NUMA-aware attention
-- one fully fused LLVM-generated attention machine-code function
+- spill-free or native-parity fused LLVM Attention

@@ -114,3 +114,16 @@ jobs:
             --output=build/decoder_optimizer.csv
           grep -q "optimizer_baseline_ms" build/decoder_optimizer.csv
           grep -q "analytical_score" build/decoder_optimizer_candidates.csv
+
+      - name: Smoke test production LLVM and fused Attention
+        run: |
+          ./build/schedforge-run --backend=llvm --M=17 --N=19 --K=13 \
+            '--schedule=order=ikj;outer=64,128,64;tile=32,64,32;micro=4,8;vector=8;unroll=1;threads=3;pack=none;prefetch=0;fuse=true'
+          ./build/schedforge-attention --fused-llvm --batch=1 \
+            --q-heads=4 --kv-heads=2 --sq=5 --sk=7 \
+            --head-dim=8 --value-dim=8 --threads=2 \
+            --strategy=io-aware --repetitions=1 -o build/fused_attention.sfe
+          ./build/schedforge-codegen-study --threads=2 --repetitions=1 \
+            --output=build/codegen.csv --attention-output=build/fused_attention.csv
+          grep -q "native_gflops_over_llvm" build/codegen.csv
+          grep -q "llvm_speed_fraction" build/fused_attention.csv

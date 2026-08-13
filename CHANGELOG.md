@@ -2,6 +2,31 @@
 
 All notable changes to SchedForge are documented here.
 
+## [0.10.0] - 2026-08-13
+
+### Added
+
+- Parallel LLVM ORC execution that preserves Scheduled LoopIR thread counts and
+  uses MR-aligned row partitions with correct irregular tails.
+- Expanded machine-code quality reports covering total/vector/FMA instructions,
+  loads, stores, branches, address-generation proxies, stack accesses, and
+  vector spill patterns.
+- `schedforge-codegen-study` for measured same-LoopIR Native-versus-LLVM and
+  native-versus-fused-Attention studies with checked-in CSV evidence.
+- One executable LLVM Attention function containing QK, causal masking through
+  legal key limits, exact online max/denominator rescaling, PV accumulation,
+  and final normalization for MHA and GQA.
+
+### Changed
+
+- LLVM MatMul now consumes LoopIR parallel semantics instead of silently
+  benchmarking the same scheduled program with one worker.
+- The recorded 192/256/512 cubic study reaches 103-153 GFLOPS in LLVM versus
+  238-367 GFLOPS native; the remaining 1.8-2.5x gap is preserved explicitly.
+- Fused LLVM Attention validates below `5e-8` error but remains 2.1-3.1x slower
+  than the specialized native IO-aware/Split-KV runtime and still shows a
+  vector spill pattern in emitted assembly.
+
 ## [0.9.0] - 2026-08-13
 
 ### Added

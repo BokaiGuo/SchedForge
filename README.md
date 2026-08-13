@@ -83,7 +83,11 @@ flowchart TD
   routing traces, and load-aware expert task scheduling.
 - **Attention compiler:** SDPA graph fusion, MHA/GQA/MQA types, causal tiled
   execution, exact online softmax, TilePipelineIR, materialized and IO-aware
-  prefill, growable KV cache, and parallel Split-KV decode.
+  prefill, growable KV cache, parallel Split-KV decode, and one executable
+  fused LLVM online-softmax function.
+- **Production LLVM study:** Scheduled LoopIR threads are preserved by ORC
+  execution; assembly reports expose instructions, branches, address work,
+  stack traffic, and spills, with a reproducible Native-versus-LLVM matrix.
 - **Memory and layout compiler:** layout is part of tensor type; graph layout
   propagation, dispatch-boundary materialization, bufferization, lifetime
   analysis, aligned workspace reuse, and guarded shape specialization.
@@ -273,6 +277,7 @@ inspectable and verifiable before target lowering.
 | `schedforge-attention` | Compile, tune, simulate, and execute attention plans |
 | `schedforge-decoder` | Compile and execute a complete Dense or MoE Decoder Layer |
 | `schedforge-decoder-bench` | Run realistic Decoder and whole-plan studies |
+| `schedforge-codegen-study` | Compare Native and LLVM code quality from identical LoopIR |
 
 ## Decoder Layer Compiler Demo
 
@@ -313,6 +318,24 @@ non-materializing Split-KV plan at a confirmed **1.400×** over the default.
 See `results/decoder_realistic.csv`,
 `results/decoder_plan_optimizer.csv`, and
 `results/decoder_plan_optimizer_candidates.csv`.
+
+## Production LLVM and Fused Attention CodeGen
+
+SchedForge 0.10 carries the `threads` decision from the same Scheduled LoopIR
+into LLVM ORC execution with MR-aligned row partitions. The checked-in
+`192/256/512³` study records LLVM at **103-153 GFLOPS** and native at
+**238-367 GFLOPS**. This reduces the earlier order-of-magnitude mismatch, but
+LLVM remains **1.8-2.5× slower** on these rows; the gap is not claimed closed.
+
+The Attention backend can also emit and execute one LLVM function that performs
+QK, exact online max/sum rescaling, PV accumulation, and final normalization
+without materializing `Sq×Sk`. At `B=1, Hq=8, D=64`, fused LLVM records
+**0.791 ms** for MHA Prefill `S=128`, **0.786 ms** for GQA Prefill `S=128`, and
+**0.214 ms** for GQA Decode `Sk=1024`, with maximum error below `5e-8`.
+The specialized native paths remain **2.1-3.1× faster**, and the emitted fused
+Attention assembly still contains a vector spill pattern. These negative code-
+quality results are first-class evidence, not hidden limitations. See
+`results/llvm_codegen_study.csv` and `results/fused_attention_llvm.csv`.
 
 ## MoE Compiler Demo
 
@@ -425,7 +448,7 @@ scripts/               Hardware-counter helpers
 - Attention is a CPU cache-hierarchy adaptation of Flash-style exact attention,
   not an implementation or performance claim for GPU FlashAttention-2.
 - Paged KV allocation, BF16/INT8 attention, dropout/backward, distributed
-  attention, and production fused LLVM attention machine code remain future work.
+  attention, and spill-free native-parity fused LLVM code remain future work.
 - The simulator is a diagnostic model, not a performance-selection oracle or a
   cycle-accurate Intel out-of-order simulator.
 - Performance numbers depend on CPU, frequency policy, compiler, workload, and

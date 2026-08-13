@@ -1,0 +1,4 @@
+shape,threads,schedule,native_ms,native_gflops,llvm_ms,llvm_gflops,native_gflops_over_llvm,compile_ms,instructions,vector_instructions,fma_instructions,loads,stores,branches,address_instructions,stack_accesses,spill,max_error
+192x192x192,8,"order=ikj;outer=64,128,64;tile=32,64,32;micro=6,16;vector=8;unroll=1;threads=8;pack=;prefetch=0;fuse=true;pin=false",0.059435,238.172390,0.126929,111.525152,2.135594,175.241531,4258,3289,576,672,691,96,318,170,0,0.000000
+256x256x256,8,"order=ikj;outer=64,128,64;tile=32,64,32;micro=6,16;vector=8;unroll=1;threads=8;pack=;prefetch=0;fuse=true;pin=false",0.126218,265.845062,0.228711,146.711055,1.812032,678.345012,8530,6577,1152,1344,1375,192,619,358,0,0.000000
+512x512x512,8,"order=ikj;outer=64,128,64;tile=32,64,32;micro=6,16;vector=8;unroll=1;threads=8;pack=;prefetch=0;fuse=true;pin=false",0.731294,367.069135,1.854180,144.773137,2.535478,33.582278,132,16,3,9,24,14,9,17,0,0.000000

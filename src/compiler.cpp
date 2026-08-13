@@ -309,12 +309,31 @@ AssemblyReport AssemblyAnalyzer::analyze(const std::string& assembly) const {
     std::stringstream input(assembly);
     std::string line;
     while (std::getline(input, line)) {
-        if (line.find("ymm") != std::string::npos || line.find("xmm") != std::string::npos) ++report.vector_instructions;
-        if (line.find("vfmadd") != std::string::npos || line.find("fmadd") != std::string::npos) ++report.fma_instructions;
-        if (line.find("vmov") != std::string::npos || line.find(" mov") != std::string::npos) ++report.loads;
-        if (line.find("(%rsp)") != std::string::npos && (line.find("ymm") != std::string::npos || line.find("xmm") != std::string::npos))
-            report.has_spill_pattern = true;
-        if (line.find("store") != std::string::npos || line.find("vmovups") != std::string::npos) ++report.stores;
+        const auto first = line.find_first_not_of(" \t");
+        if (first == std::string::npos || line[first] == '.' || line[first] == '#' ||
+            line[first] == ';' || line[first] == '_') continue;
+        if (line.find(':', first) != std::string::npos && line.find('\t') == std::string::npos)
+            continue;
+        ++report.instructions;
+        const bool vector = line.find("%ymm") != std::string::npos ||
+                            line.find("%xmm") != std::string::npos ||
+                            line.find("%zmm") != std::string::npos;
+        if (vector) ++report.vector_instructions;
+        if (line.find("vfmadd") != std::string::npos || line.find("fmadd") != std::string::npos)
+            ++report.fma_instructions;
+        if (line.find(" mov") != std::string::npos || line.find("vmov") != std::string::npos)
+            ++report.loads;
+        if (line.find("vmovups") != std::string::npos || line.find("vmovaps") != std::string::npos ||
+            line.find("movl\t%") != std::string::npos || line.find("movq\t%") != std::string::npos)
+            ++report.stores;
+        if (line.find("jmp") != std::string::npos || line.find("\tj") != std::string::npos)
+            ++report.branches;
+        if (line.find("lea") != std::string::npos || line.find("imul") != std::string::npos)
+            ++report.address_instructions;
+        if (line.find("(%rsp)") != std::string::npos) {
+            ++report.stack_accesses;
+            if (vector) report.has_spill_pattern = true;
+        }
     }
     return report;
 }

@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <stdexcept>
 
@@ -572,6 +573,50 @@ std::string emit_assembly(const llvm::Module& source) {
     return std::string(storage.begin(), storage.end());
 }
 
+std::shared_ptr<CachedKernel> compile_kernel(const LoopIR& loop, bool& cache_hit) {
+    const std::string cache_key = kernel_key(loop);
+    {
+        std::lock_guard lock(kernel_cache_mutex);
+        const auto found = kernel_cache.find(cache_key);
+        if (found != kernel_cache.end()) {
+            cache_hit = true;
+            return found->second;
+        }
+    }
+    cache_hit = false;
+    const auto execution = analyze_loop_ir(loop);
+    auto context = std::make_unique<llvm::LLVMContext>();
+    auto module = std::make_unique<llvm::Module>("schedforge_jit", *context);
+    if (can_build_register_kernel(loop.problem, execution))
+        build_register_tiled_function(*module, loop.problem, execution);
+    else if (execution.vector_width > 1 || execution.order == LoopOrder::IKJ)
+        build_ikj_function(*module, loop.problem, execution);
+    else build_ijk_function(*module, loop.problem, execution);
+    if (llvm::verifyModule(*module, &llvm::errs()))
+        throw std::runtime_error("LLVM module verification failed");
+    optimize_module(*module);
+    auto kernel = std::make_shared<CachedKernel>();
+    llvm::raw_string_ostream stream(kernel->llvm_ir);
+    module->print(stream, nullptr);
+    stream.flush();
+    kernel->assembly = emit_assembly(*module);
+    kernel->assembly_report = AssemblyAnalyzer{}.analyze(kernel->assembly);
+    if (const char* dump_path = std::getenv("SCHEDFORGE_JIT_ASM"))
+        std::ofstream(dump_path) << kernel->assembly;
+    auto jit_expected = llvm::orc::LLJITBuilder().create();
+    if (!jit_expected) throw std::runtime_error(error_string(jit_expected.takeError()));
+    kernel->jit = std::move(*jit_expected);
+    if (auto error = kernel->jit->addIRModule(
+            llvm::orc::ThreadSafeModule(std::move(module), std::move(context))))
+        throw std::runtime_error(error_string(std::move(error)));
+    auto symbol = kernel->jit->lookup("schedforge_matmul");
+    if (!symbol) throw std::runtime_error(error_string(symbol.takeError()));
+    kernel->function = symbol->toPtr<MatMulFunction>();
+    std::lock_guard lock(kernel_cache_mutex);
+    const auto [iterator, inserted] = kernel_cache.emplace(cache_key, kernel);
+    return inserted ? kernel : iterator->second;
+}
+
 }  // namespace
 
 bool LLVMJITBackend::available() const { return true; }
@@ -582,64 +627,63 @@ LLVMJITResult LLVMJITBackend::benchmark(const LoopIR& loop, const TensorData& da
     initialize_llvm();
     verify_loop_ir(loop);
     const auto execution = analyze_loop_ir(loop);
-    const std::string cache_key = kernel_key(loop);
-    std::shared_ptr<CachedKernel> cached;
-    bool cache_hit = false;
-    {
-        std::lock_guard lock(kernel_cache_mutex);
-        const auto found = kernel_cache.find(cache_key);
-        if (found != kernel_cache.end()) {
-            cached = found->second;
-            cache_hit = true;
-        }
-    }
+    const int row_grain = execution.vector_width > 1 ? std::max(1, execution.mr) : 1;
+    const int row_blocks = (loop.problem.m + row_grain - 1) / row_grain;
+    const int thread_count = std::clamp(execution.threads, 1, row_blocks);
     const auto compile_start = std::chrono::steady_clock::now();
-    if (!cached) {
-        auto context = std::make_unique<llvm::LLVMContext>();
-        auto module = std::make_unique<llvm::Module>("schedforge_jit", *context);
-        if (can_build_register_kernel(loop.problem, execution))
-            build_register_tiled_function(*module, loop.problem, execution);
-        else if (execution.vector_width > 1 || execution.order == LoopOrder::IKJ)
-            build_ikj_function(*module, loop.problem, execution);
-        else build_ijk_function(*module, loop.problem, execution);
-        if (llvm::verifyModule(*module, &llvm::errs())) throw std::runtime_error("LLVM module verification failed");
-        optimize_module(*module);
-        auto kernel = std::make_shared<CachedKernel>();
-        llvm::raw_string_ostream stream(kernel->llvm_ir);
-        module->print(stream, nullptr);
-        stream.flush();
-        kernel->assembly = emit_assembly(*module);
-        kernel->assembly_report = AssemblyAnalyzer{}.analyze(kernel->assembly);
-        if (const char* dump_path = std::getenv("SCHEDFORGE_JIT_ASM")) {
-            std::ofstream(dump_path) << kernel->assembly;
-        }
-        auto jit_expected = llvm::orc::LLJITBuilder().create();
-        if (!jit_expected) throw std::runtime_error(error_string(jit_expected.takeError()));
-        kernel->jit = std::move(*jit_expected);
-        if (auto error = kernel->jit->addIRModule(
-                llvm::orc::ThreadSafeModule(std::move(module), std::move(context))))
-            throw std::runtime_error(error_string(std::move(error)));
-        auto symbol = kernel->jit->lookup("schedforge_matmul");
-        if (!symbol) throw std::runtime_error(error_string(symbol.takeError()));
-        kernel->function = symbol->toPtr<MatMulFunction>();
-        {
-            std::lock_guard lock(kernel_cache_mutex);
-            const auto [iterator, inserted] = kernel_cache.emplace(cache_key, kernel);
-            cached = inserted ? kernel : iterator->second;
-        }
+    std::vector<std::pair<int, int>> row_ranges;
+    row_ranges.reserve(static_cast<std::size_t>(thread_count));
+    const int full_blocks = loop.problem.m / row_grain;
+    const int tail_rows = loop.problem.m % row_grain;
+    int row_cursor = 0;
+    for (int thread = 0; thread < thread_count; ++thread) {
+        const int blocks = full_blocks / thread_count +
+            (thread < full_blocks % thread_count ? 1 : 0);
+        int rows = blocks * row_grain;
+        if (thread == thread_count - 1) rows += tail_rows;
+        row_ranges.emplace_back(row_cursor, row_cursor + rows);
+        row_cursor += rows;
+    }
+    std::vector<std::shared_ptr<CachedKernel>> kernels(static_cast<std::size_t>(thread_count));
+    bool any_compile = false;
+    for (int thread = 0; thread < thread_count; ++thread) {
+        const auto [begin, end] = row_ranges[static_cast<std::size_t>(thread)];
+        if (begin >= end) continue;
+        auto problem = loop.problem;
+        problem.m = end - begin;
+        bool cache_hit = false;
+        kernels[static_cast<std::size_t>(thread)] = compile_kernel(loop.specialize(problem), cache_hit);
+        any_compile = any_compile || !cache_hit;
     }
     const auto compile_end = std::chrono::steady_clock::now();
 
     std::vector<float> output(static_cast<std::size_t>(loop.problem.m) * loop.problem.n);
+    const auto invoke = [&] {
+        std::vector<std::thread> workers;
+        workers.reserve(static_cast<std::size_t>(thread_count));
+        for (int thread = 0; thread < thread_count; ++thread) {
+            const auto [begin, end] = row_ranges[static_cast<std::size_t>(thread)];
+            if (begin >= end) continue;
+            workers.emplace_back([&, thread, begin, end] {
+                const auto& kernel = kernels[static_cast<std::size_t>(thread)];
+                kernel->function(
+                    data.a.data() + static_cast<std::size_t>(begin) * loop.problem.k,
+                    data.b.data(), data.bias.data(),
+                    data.residual.empty() ? nullptr : data.residual.data() +
+                        static_cast<std::size_t>(begin) * loop.problem.n,
+                    output.data() + static_cast<std::size_t>(begin) * loop.problem.n,
+                    end - begin, loop.problem.n, loop.problem.k);
+            });
+        }
+        for (auto& worker : workers) worker.join();
+    };
     for (int iteration = 0; iteration < std::max(0, warmup); ++iteration) {
-        cached->function(data.a.data(), data.b.data(), data.bias.data(), data.residual.data(),
-                         output.data(), loop.problem.m, loop.problem.n, loop.problem.k);
+        invoke();
     }
     std::vector<double> timings;
     for (int iteration = 0; iteration < std::max(1, repetitions); ++iteration) {
         const auto start = std::chrono::steady_clock::now();
-        cached->function(data.a.data(), data.b.data(), data.bias.data(), data.residual.data(),
-                         output.data(), loop.problem.m, loop.problem.n, loop.problem.k);
+        invoke();
         const auto end = std::chrono::steady_clock::now();
         timings.push_back(std::chrono::duration<double, std::milli>(end - start).count());
     }
@@ -648,12 +692,13 @@ LLVMJITResult LLVMJITBackend::benchmark(const LoopIR& loop, const TensorData& da
     std::vector<float> expected;
     execute(loop, data, expected);
     const double operations = 2.0 * loop.problem.m * loop.problem.n * loop.problem.k;
-    const double compile_milliseconds = cache_hit ? 0.0
+    const double compile_milliseconds = !any_compile ? 0.0
         : std::chrono::duration<double, std::milli>(compile_end - compile_start).count();
+    const auto& representative = kernels.front();
     return {compile_milliseconds,
             execution_ms, operations / (execution_ms * 1.0e6),
-            max_abs_error(expected, output), cached->llvm_ir, cached->assembly,
-            cached->assembly_report};
+            max_abs_error(expected, output), representative->llvm_ir, representative->assembly,
+            representative->assembly_report, thread_count};
 }
 
 }  // namespace schedforge

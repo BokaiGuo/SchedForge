@@ -1,56 +1,58 @@
-# Spec: SchedForge Realistic Decoder and Whole-Graph Planning
+# Spec: SchedForge v0.10 Production LLVM and Fused CodeGen
 
 ## Objective
-Upgrade SchedForge from tiny Decoder integration validation to a realistic-shape
-AI compiler benchmark and a whole-graph execution planner. One StableHLO Decoder
-must still produce one inspectable plan and one runtime call. Results must label
-real execution, compile-only feasibility, and analytical estimates separately.
+Close the largest remaining backend gap after the v0.8 realistic Decoder suite
+and v0.9 whole-graph planner. The same Scheduled LoopIR must carry its thread
+semantics into native and LLVM execution, expose comparable machine-code quality
+metrics, and lower exact IO-aware Attention into one executable LLVM function.
 
 ## Tech Stack
-C++20, CMake, LLVM 18 ORC, existing Tensor SSA/Transform IR/Scheduled LoopIR,
-Attention compiler, MoE compiler, and native AVX2 runtime.
+C++20, CMake, LLVM 18 IRBuilder/O3/ORC LLJIT, existing Scheduled LoopIR,
+Attention TilePipelineIR, AVX2 native runtime, and CSV evidence artifacts.
 
 ## Commands
-Build: `cmake -S . -B build-v09 -DCMAKE_BUILD_TYPE=Release && cmake --build build-v09 --parallel`
-Test: `ctest --test-dir build-v09 --output-on-failure`
-Benchmark: `./build-v09/schedforge-decoder-bench --suite=realistic --output=results/decoder_realistic.csv`
-Plan study: `./build-v09/schedforge-decoder-bench --suite=optimizer --output=results/decoder_plan_optimizer.csv`
+Build: `cmake -S . -B build-v010 -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build-v010 --parallel`
+Test: `ctest --test-dir build-v010 --output-on-failure`
+Codegen study: `./build-v010/schedforge-codegen-study --output=results/llvm_codegen_study.csv`
+Attention study: `./build-v010/schedforge-attention --fused-llvm --sequence=128 --repetitions=5`
+Sanitizers: `cmake -S . -B build-v010-asan -DSCHEDFORGE_ENABLE_SANITIZERS=ON -DCMAKE_BUILD_TYPE=Debug`
 
 ## Project Structure
-`include/schedforge/decoder_compiler.h`: Decoder plan, metrics, optimizer API.
-`src/decoder_compiler.cpp`: plan generation, execution, stage timing, optimization.
-`tools/schedforge-decoder-bench.cpp`: benchmark matrix and CSV/report emission.
-`tests/test_schedforge.cpp`: optimizer and benchmark-schema regression tests.
-`docs/`: architecture and benchmark methodology.
-`results/`: curated host-specific measured evidence.
+`src/llvm_backend.cpp`: LoopIR LLVM compilation, parallel invocation, assembly analysis.
+`src/attention_llvm_backend.cpp`: fused exact online-softmax Attention LLVM backend.
+`include/schedforge/compiler.h`: backend quality result APIs.
+`include/schedforge/attention_compiler.h`: fused Attention LLVM result API.
+`tools/schedforge-codegen-study.cpp`: same-LoopIR native/LLVM comparison.
+`tests/test_schedforge.cpp`: backend semantics, quality metrics, fused Attention correctness.
+`results/`: host-specific measured codegen evidence.
 
 ## Code Style
-Use existing C++20 value types and explicit ownership. Planner decisions are
-typed enums/structs, serialized in `.sfe`, and never inferred from display names.
+Use typed value objects and RAII. Generated code decisions must derive from
+LoopIR or TilePipelineIR, not duplicated display strings. Preserve explicit
+measured versus analytical evidence boundaries.
 
 ## Testing Strategy
-Unit-test candidate generation, cost accounting, winner selection, stage timing,
-and CSV schema at small shapes. Run Release and ASan/UBSan. Execute feasible
-realistic shapes on hardware. Compile-only rows must never carry measured latency.
+Unit-test parallel LLVM correctness, cache behavior, assembly metrics, and fused
+Attention correctness at small shapes. Run Release and ASan/UBSan. Run measured
+native/LLVM and Attention studies on the current host. Do not claim performance
+for paths that only emit text.
 
 ## Boundaries
-- Always: distinguish measured, compile-only, and analytical evidence.
-- Always: optimize end-to-end Decoder latency, not independent kernel scores.
-- Always: report workspace, compile/JIT time, stage percentages, and tokens/s.
-- Never: claim Large prefill latency without completing the real execution.
-- Never: use simulator output as the optimizer's measured winner.
-- Future: LLVM quality, AOT, reduced precision, Paged KV, heterogeneous cores,
-  NEON, and active tuning remain roadmap items after this release.
+- Always: compare native and LLVM from the same Scheduled LoopIR.
+- Always: measure complete execution and validate against independent references.
+- Always: report thread count, instruction metrics, spills, compile time, and speed ratio.
+- Never: call emitted-but-unexecuted LLVM IR a production kernel.
+- Never: claim LLVM parity if the checked-in measurements do not show it.
+- Future: portable object-file AOT, Paged KV, BF16/INT8 Decoder, transfer tuning,
+  NEON hardware validation, and compiler fuzzing remain v0.11-v0.16 work.
 
 ## Success Criteria
-1. Benchmark profiles cover Tiny, Medium, and Large architecture shapes plus
-   prefill/decode scenarios and Dense/MoE metadata.
-2. Feasible rows run on the CPU and record end-to-end/stage latency; infeasible
-   rows are explicitly compile-only with memory/FLOP/JIT feasibility data.
-3. `ExecutablePlanOptimizer` enumerates cross-dispatch plan candidates covering
-   attention strategy, intermediate layout/materialization, schedule family,
-   workspace reuse, and thread placement.
-4. Candidate selection can use real end-to-end measurements and records the
-   winner, baseline, speedup, and number of hardware measurements.
-5. `.sfe`, CLI, README, architecture docs, tests, results, changelog, and version
-   metadata are updated; Release, sanitizers, install audit, and GitHub CI pass.
+1. LLVM execution honors LoopIR thread count with disjoint row partitions.
+2. Assembly reports include total instructions, branches, loads/stores, address
+   generation proxies, stack accesses, FMA count, and spill detection.
+3. A reproducible CLI compares native and LLVM on identical LoopIR and writes CSV.
+4. IO-aware Attention can compile and execute as one LLVM function containing
+   QK, online max/sum rescaling, PV accumulation, and final normalization.
+5. All new paths validate below `1e-3`; Release, sanitizers, install, and CI pass.
+6. README, architecture, changelog, report, version, raw results, and claim
+   boundaries are updated and pushed to GitHub.

@@ -1,0 +1,4 @@
+profile,batch,q_heads,kv_heads,sq,sk,head_dim,threads,native_ms,llvm_ms,llvm_speed_fraction,compile_ms,instructions,vector_instructions,branches,stack_accesses,spill,max_error
+mha-prefill-s128,1,8,8,128,128,64,8,0.340107,0.791450,0.429726,11.815570,113,35,6,26,1,0.000000
+gqa-prefill-s128,1,8,2,128,128,64,8,0.254616,0.785729,0.324051,9.550286,113,35,6,26,1,0.000000
+gqa-decode-kv1024,1,8,2,1,1024,64,8,0.099184,0.213935,0.463617,9.653984,109,35,6,24,1,0.000000

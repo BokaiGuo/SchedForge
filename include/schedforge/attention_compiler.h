@@ -126,6 +126,18 @@ struct AttentionBenchmarkResult {
     std::vector<float> output;
 };
 
+struct FusedAttentionLLVMResult {
+    double compile_milliseconds = 0.0;
+    double execution_milliseconds = 0.0;
+    double p95_milliseconds = 0.0;
+    double max_error = 0.0;
+    std::string llvm_ir;
+    std::string assembly;
+    AssemblyReport assembly_report;
+    int threads = 1;
+    std::vector<float> output;
+};
+
 struct KVCache {
     int batch = 1;
     int kv_heads = 1;
@@ -177,6 +189,9 @@ AttentionBenchmarkResult execute_attention(const AttentionExecutablePlan& plan,
                                            int runtime_sequence_query,
                                            int runtime_sequence_kv,
                                            int warmup, int repetitions);
+FusedAttentionLLVMResult execute_fused_attention_llvm(
+    const AttentionExecutablePlan& plan, const AttentionData& data,
+    int warmup = 1, int repetitions = 5);
 KVCache make_kv_cache(const AttentionConfig& config, int capacity = 0);
 void append_kv(KVCache& cache, const std::vector<float>& keys,
                const std::vector<float>& values, int tokens);

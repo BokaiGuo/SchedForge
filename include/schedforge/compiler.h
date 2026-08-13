@@ -107,10 +107,14 @@ public:
 };
 
 struct AssemblyReport {
+    std::size_t instructions = 0;
     std::size_t vector_instructions = 0;
     std::size_t fma_instructions = 0;
     std::size_t loads = 0;
     std::size_t stores = 0;
+    std::size_t branches = 0;
+    std::size_t address_instructions = 0;
+    std::size_t stack_accesses = 0;
     bool has_spill_pattern = false;
 };
 
@@ -122,6 +126,7 @@ struct LLVMJITResult {
     std::string llvm_ir;
     std::string assembly;
     AssemblyReport assembly_report;
+    int threads = 1;
 };
 
 class LLVMJITBackend {

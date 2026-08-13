@@ -29,8 +29,15 @@ int main(int argc, char** argv) {
                   << "time_ms: " << measured.execution_milliseconds << '\n'
                   << "gflops: " << measured.gflops << '\n'
                   << "max_error: " << measured.max_error << '\n'
+                  << "threads: " << measured.threads << '\n'
+                  << "instructions: " << measured.assembly_report.instructions << '\n'
                   << "vector_instructions: " << measured.assembly_report.vector_instructions << '\n'
                   << "fma_instructions: " << measured.assembly_report.fma_instructions << '\n'
+                  << "loads: " << measured.assembly_report.loads << '\n'
+                  << "stores: " << measured.assembly_report.stores << '\n'
+                  << "branches: " << measured.assembly_report.branches << '\n'
+                  << "address_instructions: " << measured.assembly_report.address_instructions << '\n'
+                  << "stack_accesses: " << measured.assembly_report.stack_accesses << '\n'
                   << "spill_pattern: " << measured.assembly_report.has_spill_pattern << '\n';
         return measured.max_error <= 1.0e-3 ? 0 : 1;
     }

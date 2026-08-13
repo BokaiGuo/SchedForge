@@ -1,0 +1,8 @@
+192^3 native=238.172 LLVM=111.525 GFLOPS gap=2.13559x error=0
+256^3 native=265.845 LLVM=146.711 GFLOPS gap=1.81203x error=0
+512^3 native=367.069 LLVM=144.773 GFLOPS gap=2.53548x error=0
+output="results/llvm_codegen_study.csv"
+mha-prefill-s128 native=0.340107 ms LLVM=0.79145 ms ratio=0.429726 error=3.35276e-08
+gqa-prefill-s128 native=0.254616 ms LLVM=0.785729 ms ratio=0.324051 error=4.47035e-08
+gqa-decode-kv1024 native=0.099184 ms LLVM=0.213935 ms ratio=0.463617 error=2.04891e-08
+attention_output="results/fused_attention_llvm.csv"

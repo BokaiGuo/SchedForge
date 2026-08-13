@@ -1,7 +1,7 @@
 # Plan
 
-1. Extend Decoder plan policy and timing schema.
-2. Add whole-graph candidate generation and evaluation.
-3. Add realistic benchmark profiles and CSV artifacts.
-4. Run feasible real hardware matrix and preserve compile-only boundaries.
-5. Update tests, docs, version, CI, and release evidence.
+1. Carry LoopIR thread semantics into LLVM invocation.
+2. Expand assembly quality analysis and study tooling.
+3. Add fused exact Attention LLVM lowering and execution.
+4. Measure native/LLVM and fused Attention performance.
+5. Update v0.10 docs, tests, CI, and release evidence.

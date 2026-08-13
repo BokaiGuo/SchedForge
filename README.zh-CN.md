@@ -96,7 +96,9 @@ flowchart LR
   Routing Trace 与 Load-aware Expert Task Scheduler。
 - **Attention Compiler**：SDPA 结构融合、MHA/GQA/MQA、Causal Tile、精确在线
   Softmax、TilePipelineIR、Materialized/IO-aware Prefill、可增长 KV Cache 与
-  并行 Split-KV Decode。
+  并行 Split-KV Decode，以及单函数可执行 LLVM Online-Softmax Attention。
+- **Production LLVM 研究**：ORC 执行保留 Scheduled LoopIR 的线程语义；汇编
+  报告覆盖指令、分支、地址计算、栈访问和 Spill，并提供可复现双后端矩阵。
 - **内存与布局编译**：Layout 进入 Tensor Type；支持跨 Dispatch 布局传播、
   Bufferization、生命周期分析、64 字节对齐 Workspace 复用和 Guarded Specialization。
 - **结构化 Kernel Compiler**：Iteration Domain、并行/归约 Iterator、Indexing Map、
@@ -273,6 +275,7 @@ vector=8;unroll=4;threads=8;pack=ab;prefetch=4;fuse=true;pin=true
 | `schedforge-attention` | 编译、调优、模拟并执行 Attention Plan |
 | `schedforge-decoder` | 编译并执行完整 Dense 或 MoE Decoder Layer |
 | `schedforge-decoder-bench` | 运行真实规模 Decoder 与全图计划实验 |
+| `schedforge-codegen-study` | 从相同 LoopIR 对比 Native 与 LLVM 代码质量 |
 
 ## Decoder Layer Compiler 实测 Demo
 
@@ -308,6 +311,21 @@ Tiny Prefill 仍由默认计划获胜（**1.000×**）；Tiny Decode `KV=512` �
 完整证据见
 `results/decoder_realistic.csv`、`results/decoder_plan_optimizer.csv` 与
 `results/decoder_plan_optimizer_candidates.csv`。
+
+## Production LLVM 与 Fused Attention CodeGen
+
+SchedForge 0.10 将同一份 Scheduled LoopIR 中的 `threads` 决策带入 LLVM ORC
+执行，并使用 MR 对齐的行分区。仓库记录的 `192/256/512³` 实验中，LLVM 达到
+**103-153 GFLOPS**，Native 为 **238-367 GFLOPS**。相比此前数量级差距已经明显
+缩小，但这些行上 LLVM 仍慢 **1.8-2.5×**，项目不宣称已经达到 Native Parity。
+
+Attention 后端现在也能生成并执行单个 LLVM Function，在不物化 `Sq×Sk` 的
+情况下完成 QK、精确在线 Max/Sum Rescale、PV Accumulation 与最终归一化。在
+`B=1, Hq=8, D=64` 下，Fused LLVM 的 MHA Prefill `S=128` 为 **0.791 ms**，
+GQA Prefill `S=128` 为 **0.786 ms**，GQA Decode `Sk=1024` 为 **0.214 ms**，
+最大误差低于 `5e-8`。专门化 Native 路径仍快 **2.1-3.1×**，而且融合 LLVM
+汇编仍存在 Vector Spill Pattern。这些负结果被明确保留。详见
+`results/llvm_codegen_study.csv` 与 `results/fused_attention_llvm.csv`。
 
 ## MoE Compiler 实测 Demo
 
@@ -411,8 +429,8 @@ scripts/              性能计数器辅助脚本
   Lowering 与分布式 Expert Parallelism 尚未实现。
 - Attention 是面向 CPU Cache Hierarchy 的 Flash-style 精确 Attention，不是
   GPU FlashAttention-2 的实现或性能声明。
-- Paged KV、BF16/INT8 Attention、Dropout/Backward、分布式 Attention 与生产级
-  LLVM Fused Attention Machine Code 尚未实现。
+- Paged KV、BF16/INT8 Attention、Dropout/Backward、分布式 Attention，以及
+  无 Spill 且达到 Native Parity 的 LLVM Fused Attention 尚未实现。
 - 模拟器只提供诊断信息，既不是性能选择裁判，也不会逐周期复现 Intel
   处理器的乱序执行。
 - 性能会受到 CPU 型号、频率策略、编译器版本、输入规模和后台负载影响，

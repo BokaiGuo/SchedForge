@@ -206,6 +206,45 @@ The raw matrix, winner summary, and complete candidate table are stored in
 `results/decoder_realistic.csv`, `results/decoder_plan_optimizer.csv`, and
 `results/decoder_plan_optimizer_candidates.csv`.
 
+## Production LLVM and Fused Attention CodeGen
+
+SchedForge 0.10 makes the same-LoopIR backend comparison fairer by carrying the
+Scheduled LoopIR thread count into LLVM ORC execution. Workers receive disjoint,
+MR-aligned row partitions; irregular tails use a separately compiled safe
+specialization. The assembly report now includes total/vector/FMA instructions,
+loads, stores, branches, address-generation proxies, stack accesses, and vector
+spill detection.
+
+The recorded 8-thread cubic matrix is:
+
+| Shape | Native GFLOPS | LLVM GFLOPS | Native / LLVM | Error |
+|---|---:|---:|---:|---:|
+| 192³ | 238.172 | 111.525 | 2.136x | 0.000 |
+| 256³ | 265.845 | 146.711 | 1.812x | 0.000 |
+| 512³ | 367.069 | 144.773 | 2.535x | 0.000 |
+
+This is a substantial improvement over the previous 31.216 GFLOPS LLVM record,
+but it is not parity. The raw per-run values and assembly categories are stored
+in `results/llvm_codegen_study.csv`.
+
+Version 0.10 also lowers the complete exact online-softmax Attention algorithm
+into one LLVM function. The function performs QK, causal bounds, running max and
+denominator rescaling, PV numerator accumulation, and final normalization. It
+does not materialize the score/probability matrix and executes MHA/GQA rows in
+parallel.
+
+| Profile | Native P50 | Fused LLVM P50 | LLVM speed fraction | Error |
+|---|---:|---:|---:|---:|
+| MHA Prefill S=128 | 0.340 ms | 0.791 ms | 0.430 | <5e-8 |
+| GQA Prefill S=128 | 0.255 ms | 0.786 ms | 0.324 | <5e-8 |
+| GQA Decode KV=1024 | 0.099 ms | 0.214 ms | 0.464 | <5e-8 |
+
+The fused function is correct and executable, but it remains 2.1-3.1x slower
+than the specialized native path and its emitted assembly still shows a vector
+spill pattern. This negative result is retained in
+`results/fused_attention_llvm.csv` and is the primary remaining v0.10 code-
+quality boundary.
+
 ## MoE Compiler Validation
 
 SchedForge 0.4 adds a single-host FP32 Top-2 MoE MLP compiler/runtime path. MoE
@@ -299,10 +338,12 @@ only selection and are preserved in `results/top_resolution_*`.
   lowering, and distributed expert parallelism are outside this release.
 - Attention is a CPU cache-hierarchy Flash-style lowering, not GPU
   FlashAttention-2. Paged KV, reduced-precision attention, backward/dropout,
-  distributed attention, and one fused LLVM attention function are outside this release.
+  distributed attention, and native-parity spill-free fused LLVM code are outside this release.
 - Decoder Layer execution is FP32. Compile-time weight concatenation is
   implemented, while portable AOT object caching and true BF16/INT8 Decoder
-  kernels remain outside v0.9.
+  kernels remain outside v0.10.
+- Portable ELF object caching and standalone AOT `.sfe` loading remain v0.11
+  work; v0.10 uses in-process LLVM ORC JIT.
 - Large Decoder profiles and expensive Prefill profiles are compile-only under
   the checked-in 1.2 GFLOP/256 MiB execution budget; no latency is claimed for
   those rows.

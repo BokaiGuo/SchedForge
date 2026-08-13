@@ -206,6 +206,18 @@ void test_compiler_architecture() {
         schedforge::apply_schedule(jit_graph.problem, schedule), jit_data, 0, 1);
     require(jit_cached.compile_milliseconds < jit_result.compile_milliseconds, "jit kernel cache");
 
+    auto parallel_schedule = schedule;
+    parallel_schedule.threads = 3;
+    const schedforge::Problem parallel_problem{17, 19, 13, true, true};
+    const auto parallel_data = schedforge::make_data(parallel_problem, 27);
+    const auto parallel_jit = schedforge::LLVMJITBackend{}.benchmark(
+        schedforge::apply_schedule(parallel_problem, parallel_schedule),
+        parallel_data, 1, 2);
+    require(parallel_jit.threads == 3 && parallel_jit.max_error < 1.0e-3 &&
+            parallel_jit.assembly_report.instructions > 0 &&
+            parallel_jit.assembly_report.branches > 0,
+            "parallel llvm loopir execution and assembly metrics");
+
     schedforge::Schedule register_schedule;
     register_schedule.mr = 4;
     register_schedule.nr = 8;
@@ -614,6 +626,22 @@ void test_attention_compiler() {
             mqa_config, schedforge::TargetInfo::detect(), 4));
     const auto mqa_result = schedforge::execute_attention(mqa_plan, mqa_data, 0, 1);
     require(mqa_result.max_error < 1.0e-4, "mqa attention execution");
+
+    const auto fused_gqa = schedforge::execute_fused_attention_llvm(
+        small_io_plan, small_data, 0, 1);
+    require(fused_gqa.max_error < 1.0e-3 &&
+            fused_gqa.llvm_ir.find("schedforge_fused_attention") != std::string::npos &&
+            fused_gqa.llvm_ir.find("llvm.exp") != std::string::npos &&
+            fused_gqa.assembly_report.instructions > 0,
+            "fused llvm gqa attention execution");
+    auto fused_mha_config = small_config;
+    fused_mha_config.kv_heads = fused_mha_config.query_heads;
+    const auto fused_mha_data = schedforge::make_attention_data(fused_mha_config, 51);
+    const auto fused_mha_plan = schedforge::AttentionCompiler{}.compile(
+        fused_mha_config, small_io_options);
+    require(schedforge::execute_fused_attention_llvm(
+                fused_mha_plan, fused_mha_data, 0, 1).max_error < 1.0e-3,
+            "fused llvm mha attention execution");
 }
 
 void test_decoder_compiler() {

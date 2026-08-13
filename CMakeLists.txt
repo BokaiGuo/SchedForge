@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(SchedForge VERSION 0.9.0 LANGUAGES CXX)
+project(SchedForge VERSION 0.10.0 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -33,6 +33,7 @@ add_library(schedforge
     src/graph_compiler.cpp
     src/moe_compiler.cpp
     src/attention_compiler.cpp
+    src/attention_llvm_backend.cpp
     src/decoder_compiler.cpp
     src/llvm_backend.cpp
     src/runtime.cpp
@@ -79,6 +80,8 @@ add_executable(schedforge-decoder tools/schedforge-decoder.cpp)
 target_link_libraries(schedforge-decoder PRIVATE schedforge)
 add_executable(schedforge-decoder-bench tools/schedforge-decoder-bench.cpp)
 target_link_libraries(schedforge-decoder-bench PRIVATE schedforge)
+add_executable(schedforge-codegen-study tools/schedforge-codegen-study.cpp)
+target_link_libraries(schedforge-codegen-study PRIVATE schedforge)
 
 enable_testing()
 add_executable(schedforge-tests tests/test_schedforge.cpp)
@@ -107,6 +110,7 @@ install(TARGETS
     schedforge-attention
     schedforge-decoder
     schedforge-decoder-bench
+    schedforge-codegen-study
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 install(DIRECTORY include/schedforge DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})

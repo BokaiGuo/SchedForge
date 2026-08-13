@@ -1,15 +1,15 @@
-- [x] Add typed Decoder plan policy and stage metrics
-  - Acceptance: plan serializes layout, materialization, schedule, placement.
-  - Verify: unit test plan dump and metric accounting.
-- [x] Implement ExecutablePlanOptimizer
-  - Acceptance: enumerates candidates and selects by end-to-end measured latency.
-  - Verify: small-shape optimizer test beats or matches baseline.
-- [x] Implement realistic Decoder benchmark CLI
-  - Acceptance: Tiny/Medium/Large and prefill/decode rows with evidence labels.
-  - Verify: CSV schema test and CLI smoke.
-- [x] Run real feasible benchmark and optimizer study
-  - Acceptance: checked-in raw CSV/report with claim-safe status fields.
-  - Verify: rows marked measured have nonzero latency and zero validation error.
-- [x] Complete v0.9 release validation
-  - Acceptance: Release, ASan/UBSan, install, CI, commit, push all pass.
+- [x] Parallel LLVM execution from one LoopIR
+  - Acceptance: LLVM uses the LoopIR thread count and validates for uneven row tails.
+  - Verify: unit test compares multi-thread LLVM output with scalar reference.
+- [x] Machine-code quality report and CLI
+  - Acceptance: same-loop native/LLVM CSV records latency, GFLOPS, ratio, instruction classes, and spills.
+  - Verify: CLI smoke produces measured rows and non-empty assembly metrics.
+- [x] Fused LLVM Attention function
+  - Acceptance: one ORC function performs QK, online softmax, PV, and normalization.
+  - Verify: MHA/GQA small-shape outputs remain below 1e-3 error.
+- [x] Run v0.10 hardware studies
+  - Acceptance: checked-in raw results preserve measured gaps or gains without extrapolation.
+  - Verify: CSV rows have nonzero latency and validation error below threshold.
+- [ ] Complete v0.10 release validation
+  - Acceptance: Release, ASan/UBSan, install, CI, commit, and push pass.
   - Verify: clean git status and green GitHub Actions.
