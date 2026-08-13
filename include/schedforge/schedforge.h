@@ -165,7 +165,8 @@ struct SearchResult {
     std::size_t search_space = 0;
     std::size_t after_static_pruning = 0;
     std::size_t benchmarked = 0;
-    std::size_t simulator_rank = 0;
+    std::size_t measurement_rank = 0;
+    bool cache_hit = false;
 };
 
 SearchResult autoschedule(const GraphIR& graph, const TensorData& data,

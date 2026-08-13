@@ -85,10 +85,12 @@ std::string DynamicProblem::signature() const {
 Schedule ScheduleDSL::parse(const std::string& text) {
     Schedule schedule;
     for (const auto& command : split(text, ';')) {
-        const auto assignment = split(command, '=');
-        if (assignment.size() != 2) throw std::invalid_argument("invalid schedule command: " + command);
-        const auto& key = assignment[0];
-        const auto& value = assignment[1];
+        const auto separator = command.find('=');
+        if (separator == std::string::npos || separator == 0) {
+            throw std::invalid_argument("invalid schedule command: " + command);
+        }
+        const std::string key = command.substr(0, separator);
+        const std::string value = command.substr(separator + 1);
         if (key == "order") schedule.order = value == "ijk" ? LoopOrder::IJK : LoopOrder::IKJ;
         else if (key == "tile") {
             const auto values = split(value, ',');
@@ -233,7 +235,9 @@ double CostModel::calibrationFactor() const { return calibration_factor_; }
 
 KernelCache::KernelCache(std::filesystem::path root) : root_(std::move(root)) {}
 std::string KernelCache::key(const Problem& problem, const Schedule& schedule, const TargetInfo& target) const {
-    return std::to_string(problem.m) + "x" + std::to_string(problem.n) + "x" + std::to_string(problem.k) +
+    constexpr const char* cache_version = "runtime-v2-register-blocked";
+    return std::string(cache_version) + "-" + std::to_string(problem.m) + "x" +
+           std::to_string(problem.n) + "x" + std::to_string(problem.k) +
            "-" + target.architecture + "-" + std::to_string(target.vector_width) + "-" +
            std::to_string(std::hash<std::string>{}(ScheduleDSL::print(schedule)));
 }
@@ -374,7 +378,8 @@ SearchResult Compiler::compileAndTune(const GraphIR& graph, const TensorData& da
     const auto cache_key = cache_.key(graph.problem, tuning_key_schedule, target_);
     if (const auto cached = cache_.lookup(cache_key)) {
         LoopIR loop{graph.problem, *cached};
-        return {*cached, simulate(loop, target_), benchmark(loop, data, warmup, repetitions), 1, 1, 1, 1};
+        return {*cached, simulate(loop, target_), benchmark(loop, data, warmup, repetitions),
+                1, 1, 1, 1, true};
     }
     auto result = autoschedule(graph, data, target_, max_threads, top_k, warmup, repetitions);
     cache_.store(cache_key, result.schedule);

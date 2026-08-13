@@ -81,6 +81,21 @@ void test_correctness_non_multiple() {
     schedforge::execute(packed_loop, data, actual);
     require(schedforge::max_abs_error(expected, actual) < 1.0e-3, "packed correctness");
     require(packed_loop.dump().find("pack_a,pack_b") != std::string::npos, "packing in loop ir");
+
+    schedule.pack_a = false;
+    schedule.pack_b = false;
+    schedule.mr = 6;
+    schedule.threads = 4;
+    schedule.pin_threads = true;
+    schedforge::execute({graph.problem, schedule}, data, actual);
+    require(schedforge::max_abs_error(expected, actual) < 1.0e-3,
+            "dual-vector kernel correctness");
+
+    schedule.pin_threads = false;
+    schedule.fused = false;
+    schedforge::execute({graph.problem, schedule}, data, actual);
+    require(schedforge::max_abs_error(expected, actual) < 1.0e-3,
+            "thread affinity reset correctness");
 }
 
 void test_simulator_and_search() {
@@ -99,6 +114,10 @@ void test_compiler_architecture() {
     const auto schedule = schedforge::ScheduleDSL::parse(
         "order=ikj;outer=64,128,32;tile=16,32,16;micro=4,8;vector=8;unroll=4;threads=2;pack=b;prefetch=4;fuse=true");
     require(schedule.pack_b && schedule.prefetch_distance == 4, "schedule dsl");
+    schedforge::Schedule unpacked;
+    const auto round_trip = schedforge::ScheduleDSL::parse(
+        schedforge::ScheduleDSL::print(unpacked));
+    require(!round_trip.pack_a && !round_trip.pack_b, "empty packing round trip");
     schedforge::Compiler compiler(schedforge::TargetInfo::detect(), "build/test-kernel-cache");
     const auto compiled = compiler.compile(graph, schedule);
     require(compiled.tensor_module.dump().find("tensor.matmul") != std::string::npos, "tensor module");

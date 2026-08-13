@@ -156,6 +156,7 @@ vector=8;unroll=4;threads=8;pack=ab;prefetch=4;fuse=true;pin=true
 | `schedforge-calibrate` | Calibrate memory bandwidth and model scale |
 | `schedforge-search` | Compare schedule-search strategies |
 | `schedforge-study` | Run packing crossover and prediction studies |
+| `schedforge-resolution` | Measure tuning noise and candidate-resolution limits |
 
 ## Recorded Results
 
@@ -164,12 +165,18 @@ universal performance claims.
 
 | Experiment | Recorded result |
 |---|---:|
-| Calibrated native auto-schedule, fused 192³ | **84.584 GFLOPS** |
+| Native hardware auto-tuning, fused 192³ | **374.402 GFLOPS** |
+| Native hardware auto-tuning, fused 256³ | **390.772 GFLOPS** |
+| Native hardware auto-tuning, fused 512³ | **434.863 GFLOPS** |
 | LLVM ORC JIT, fused 192³ | **31.216 GFLOPS** |
-| Simulator/hardware schedule Spearman | **0.968** |
-| Simulator Top-5 / Top-10 recall | **0.40 / 0.70** |
 | BF16 max error vs. FP32, 128³ | **0.0303** |
 | INT8 max error vs. FP32, 128³ | **0.0805** |
+
+Fresh auto-tuning statically rejects invalid schedules, deduplicates schedules
+that execute identically in the current runtime, runs every remaining candidate
+on the host CPU once, and then repeatedly benchmarks the measured finalists in
+randomized order. Simulator metrics are reported for diagnosis only; they do
+not select the winning schedule.
 
 See [the final experiment report](results/FINAL_REPORT.md) for methodology,
 negative results, raw artifact pointers, and claim boundaries.
@@ -194,8 +201,8 @@ scripts/               Hardware-counter helpers
   abstractions but are not validated code-generation backends in this release.
 - NUMA-aware partitioning is implemented, but experiments were run on one NUMA
   node; cross-socket claims are intentionally excluded.
-- The simulator targets relative schedule ranking, not cycle-accurate Intel
-  out-of-order execution.
+- The simulator is a diagnostic model, not a performance-selection oracle or a
+  cycle-accurate Intel out-of-order simulator.
 - Performance numbers depend on CPU, frequency policy, compiler, workload, and
   background activity. Re-run the experiments on your own host.
 

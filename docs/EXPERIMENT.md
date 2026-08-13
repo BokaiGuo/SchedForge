@@ -6,8 +6,8 @@
 
 ### Research Question
 
-Can a target-aware compiler rank and select faster CPU schedules for the same
-fused tensor computation before exhaustively benchmarking the search space?
+Can a target-aware compiler generate, execute, and robustly select faster CPU
+schedules for the same fused tensor computation using real host measurements?
 
 ### Workload
 
@@ -40,14 +40,15 @@ paths validate datatype plumbing but are not presented as optimized ISA kernels.
 1. Generate deterministic random inputs.
 2. Lower the same tensor computation into each scheduled Loop IR candidate.
 3. Reject statically invalid schedules, including estimated register spills.
-4. Rank remaining candidates using the target-aware simulator and cost model.
-5. Benchmark only the selected top-k candidates unless running a prediction study.
-6. Compare every executed candidate with the scalar reference.
-7. Report medians and preserve negative results such as packing regressions.
+4. Deduplicate schedules that map to the same current runtime execution path.
+5. Execute every remaining candidate once on the host CPU and reject incorrect results.
+6. Re-benchmark the measured top-k finalists over randomized, interleaved rounds.
+7. Select the lowest correct median; compute simulator metrics only for diagnosis.
+8. Report medians and preserve negative results such as packing regressions.
 
 ### Claim Boundaries
 
-- The simulator targets relative ranking, not cycle-accurate Intel execution.
+- The simulator does not select the winner and is not cycle-accurate Intel execution.
 - Recorded performance is host-specific and must not be generalized across CPUs.
 - Simulated cache or TLB statistics are never reported as measured PMU counters.
 - AVX-512, NEON, and multi-node NUMA behavior require validation on matching hardware.
@@ -56,8 +57,8 @@ paths validate datatype plumbing but are not presented as optimized ISA kernels.
 
 ### 研究问题
 
-对于同一个融合 Tensor 计算，目标感知编译器能否在穷举所有真机 Benchmark
-之前，预测并选择更快的 CPU Schedule？
+对于同一个融合 Tensor 计算，目标感知编译器能否生成候选、真实执行候选，
+并通过稳健的真机测量选择更快的 CPU Schedule？
 
 ### 工作负载
 
@@ -90,14 +91,15 @@ paths validate datatype plumbing but are not presented as optimized ISA kernels.
 1. 使用固定随机种子生成输入。
 2. 将同一个 Tensor 计算 Lower 为不同 Schedule 对应的 Loop IR。
 3. 静态剔除不合法配置，包括预测会发生寄存器 Spill 的方案。
-4. 使用目标感知 Simulator 和 Cost Model 排序剩余候选。
-5. 除预测误差研究外，仅对 Top-k 候选执行真机 Benchmark。
-6. 每个执行候选都与标量 Reference 比较正确性。
-7. 报告中位数，并保留 Packing 退化等负结果。
+4. 合并在当前 Runtime 中对应相同执行路径的 Schedule。
+5. 将每个剩余候选在真实 CPU 上运行一轮，并剔除错误结果。
+6. 对实测 Top-k 候选执行随机顺序、多轮交错复测。
+7. 按正确候选的最低中位数选择结果，Simulator 只提供诊断指标。
+8. 报告中位数，并保留 Packing 退化等负结果。
 
 ### 声明边界
 
-- Simulator 用于相对排序，不是 cycle-accurate Intel CPU 模拟器。
+- Simulator 不参与最终选择，也不是 cycle-accurate Intel CPU 模拟器。
 - 仓库记录的性能仅属于实验主机，不可直接推广到其他 CPU。
 - 模拟 Cache/TLB 指标不得描述成真实 PMU 测量结果。
 - AVX-512、NEON 和跨 NUMA Node 行为需要匹配硬件进一步验证。

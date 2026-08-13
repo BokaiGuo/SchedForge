@@ -1,144 +1,110 @@
-# SchedForge Final Experiment Report
+# SchedForge Performance and Validation Report
 
-**Experiment date:** August 12, 2026
+**Experiment date:** August 13, 2026
 
 ## Verdict
 
-The requested CPU Tensor Compiler architecture is implemented end to end rather
-than as a collection of independent MatMul kernels. Tensor/Loop IR, scheduling,
-packing, micro-kernel execution, LLVM ORC JIT, hardware simulation, runtime,
-auto-tuning, dynamic shapes, data types, calibration, and research evaluation
-all have executable code paths and tests.
+SchedForge now uses real CPU execution as the authority for auto-tuning. The
+simulator remains available for cache, TLB, bandwidth, and register-pressure
+diagnostics, but it does not rank finalists or select the winning schedule.
 
-## Final Native Auto-Schedule
+The native FP32 path was upgraded from a memory-updating `i-k-j` loop to AVX2
+register-resident micro-kernels, a reusable worker team, and topology-aware CPU
+affinity. These changes improve both throughput and small-matrix launch latency.
 
-Workload: fused FP32 `MatMul + Bias + ReLU`, `192 x 192 x 192`.
+## Hardware Auto-Tuning Protocol
 
-- Calibrated target bandwidth during this run: 12.579 GB/s
-- Generated schedules: 10,368
-- Statically valid schedules: 3,564
-- Hardware-benchmarked candidates: 12
-- Selected schedule: `i-k-j`
-- Outer tile: `64 x 128 x 64`
-- L1 tile: `16 x 64 x 64`
-- Register block: `8 x 8`
-- Vector width: 8 FP32 lanes
-- Threads: 8
-- Packing: disabled
-- Median execution: 0.167 ms
-- Throughput: **84.584 GFLOPS**
-- Maximum absolute error: below `1e-3`
-- Simulator rank of hardware winner: 2
+For a fresh tuning run:
 
-## LLVM ORC JIT
+1. Generate the schedule space.
+2. Statically reject illegal schedules and predicted register spills.
+3. Deduplicate schedules that map to the same current runtime execution path.
+4. Warm reusable worker teams for each candidate thread count.
+5. Execute every remaining candidate once on the host CPU.
+6. Check measured candidates against the scalar FP32 reference.
+7. Sort by measured screening time.
+8. Re-run the measured top-k finalists in randomized, interleaved rounds.
+9. Select the correct candidate with the lowest median time.
 
-For the recorded 192³ run:
+The tuning cache key includes a runtime implementation version. This prevents a
+schedule selected for an older micro-kernel from being silently reused after a
+runtime performance rewrite. CLI output explicitly reports cache hit or miss.
 
-- Compile time: 13.906 ms
-- Median execution: 0.453 ms
-- Throughput: **31.216 GFLOPS**
-- Maximum absolute error: `4.77e-6`
-- Assembly contains AVX2 vector FMA (`vfmadd213ps`)
-- No vector stack-spill pattern detected
-- The second identical compilation uses the process-local JIT cache
+## Final Native Results
 
-## Search and Prediction
+Host: Intel Core i5-14600K, AVX2/FMA, one NUMA node. Workload: fused FP32
+`MatMul + Bias + ReLU`. Search used up to 12 threads, top-16 repeated finalists,
+2 warmups, and 11 interleaved repetitions.
 
-The final crossover/prediction study reports:
+| Shape | Fresh-search candidates measured | Selected micro-kernel | Threads | Median time | Throughput |
+|---|---:|---:|---:|---:|---:|
+| 192³ | 5,355 | 6 x 16 | 6 | 0.038 ms | **374.402 GFLOPS** |
+| 256³ | 5,355 | 6 x 16 | 6 | 0.086 ms | **390.772 GFLOPS** |
+| 512³ | 5,355 | 6 x 16 | 6 | 0.617 ms | **434.863 GFLOPS** |
 
-- Spearman schedule-ranking correlation: **0.968**
-- Top-5 recall: **0.40**
-- Top-10 recall: **0.70**
+All three winners used unpacked row-major inputs, fused Bias/ReLU, AVX2 width 8,
+and topology-aware thread pinning. The exact tile shape remains workload-specific
+and is selected by real execution rather than simulator rank.
 
-With 12 hardware measurements on the 128³ comparison workload:
+The previous recorded 192³ result was 84.584 GFLOPS. The new 374.402 GFLOPS
+measurement is a **4.43x throughput increase** on the same host and workload
+shape. This comparison is host-specific and not a portable speedup claim.
 
-| Strategy | Best GFLOPS |
-|---|---:|
-| Cost-model grid ranking | 39.84 |
-| Random | 28.54 |
-| Greedy neighborhood | 37.26 |
-| Evolutionary | 36.52 |
+Raw result snapshots:
 
-The simulator is useful for ranking but not perfect. The Top-5 result remains a
-clear limitation and motivates calibration/prefetch/parallel-model refinement.
+- `results/performance_192_autotune.txt`
+- `results/performance_256_autotune.txt`
+- `results/performance_512_autotune.txt`
 
-## Packing Result
+## Runtime Optimizations
 
-Packing is fully implemented with MR/NR-oriented panels and multi-level tiling,
-but it is not automatically claimed as a speedup. On this workload family the
-scheduler generally chose no packing; copy and panel traversal costs exceeded
-reuse benefits. At 32³ PackB occasionally matched or slightly exceeded the
-unpacked path, while larger tested squares favored the contiguous unpacked
-`i-k-j` kernel. This negative result is preserved because packing must remain a
-compiler decision rather than a hard-coded optimization.
+- AVX2 8-column and 16-column register-resident micro-kernels
+- 4x16 and 6x16 kernels that use available YMM registers without spilling
+- Bias and ReLU applied in registers before the final output stores
+- Full-K accumulation without loading and storing C on every K iteration
+- Reusable thread teams instead of per-invocation thread construction
+- Linux topology-aware affinity that uses distinct physical cores before SMT siblings
+- Explicit affinity reset for unpinned schedules
+- Scalar tail handling for non-vector-divisible N and partial M blocks
 
-## Data Types
+## Correctness and Safety
 
-Recorded 128³ runs:
+- Release CTest suite passes.
+- ASan and UBSan CTest suite passes.
+- Non-divisible shapes 31x29x27, 127x131x113, and 193x197x181 pass against the
+  scalar reference.
+- Packed and scalar fallback paths remain covered.
+- Fused and non-fused epilogues remain covered.
+- Maximum absolute error for the final tuned square workloads is below `1e-3`.
 
-| Data type | Time | Throughput | Error vs FP32 |
-|---|---:|---:|---:|
-| BF16 inputs / FP32 accumulation | 0.824 ms | 5.09 GOPS | 0.0303 |
-| INT8 inputs / INT32 accumulation | 0.786 ms | 5.33 GOPS | 0.0805 |
+## LLVM and Data Types
 
-These are correctness-oriented reference kernels, not ISA-specialized VNNI or
-AVX-512 BF16 implementations.
+The existing LLVM ORC JIT result for fused 192³ remains 31.216 GFLOPS. It is a
+separate code-generation path and did not receive the native intrinsic
+micro-kernel rewrite in this increment.
 
-## Hardware Counters
+BF16 and INT8 paths remain correctness-oriented reference kernels rather than
+ISA-specialized AVX-512 BF16 or VNNI implementations.
 
-Linux `perf` was enabled for user-space counters. The recorded LLVM 256³ run
-contains core/atom cycles, instructions, cache references/misses, branches, and
-branch misses in `final_perf_llvm.csv`. Hybrid P-core/E-core aggregation makes a
-single IPC or miss-rate number potentially misleading, so raw per-PMU values
-are retained instead of presenting an oversimplified combined metric.
+## Simulator Boundary
 
-## Requirements Matrix
+The simulator is still useful for explaining predicted cache misses, DTLB
+behavior, bandwidth traffic, and register pressure. It is not used to decide
+which candidates receive hardware execution, and it is not used to select the
+winner. Prediction studies remain research diagnostics only.
 
-| Requirement | Status |
-|---|---|
-| SSA Value/Operation/Block/Module/IRBuilder | Implemented and tested |
-| Tensor IR / Loop IR separation | Implemented |
-| Tensor and Loop PassManagers | Implemented |
-| Canonical lowering and schedule transforms | Implemented |
-| Multi-level tiling | Implemented in native backend |
-| PackA / PackB decisions | Implemented and searched |
-| Generated MR/NR micro-kernel shapes | Implemented |
-| Register-pressure and spill model | Implemented and assembly-checked |
-| AVX2 explicit vectorization and tails | Implemented |
-| LLVM 18 IRBuilder/O3/ORC JIT | Implemented and executed |
-| Assembly generation and analysis | Implemented |
-| Cache associativity / LRU | Implemented |
-| TLB and prefetch simulation | Implemented |
-| Bandwidth and hardware calibration | Implemented |
-| Grid/random/greedy/evolutionary search | Implemented and compared |
-| Schedule DSL | Implemented |
-| Bias/ReLU fusion | Implemented in execution and IR |
-| Layout propagation | Implemented |
-| Lifetime memory planning/reuse | Implemented |
-| Dynamic-shape specialization | Implemented |
-| Persistent kernel/schedule/IR cache | Implemented |
-| FP32/BF16/INT8 paths | Implemented |
-| ISA abstraction | Scalar, AVX2 implemented; AVX-512/NEON represented |
-| Thread affinity / NUMA topology | Implemented; single-node validation only |
-| Performance portability | Architecture supported; one physical CPU validated |
-| Prediction error analysis | Implemented with correlation and top-k recall |
-| Linux perf validation | Implemented and recorded |
-
-## Validation
-
-- Release build completes without compiler warnings.
-- All CTest tests pass.
-- ASan, UBSan, and leak detection pass.
-- Tests cover non-tile and non-vector-divisible dimensions.
-- Every hardware candidate is checked against a scalar FP32 reference.
-- Real LLVM ORC execution and generated assembly are validated.
+The refreshed 192³ resolution study measured 12 simulator-leading candidates
+over 20 randomized rounds. All 11 adjacent predicted pairs were tied in the
+model. Confidence intervals overlapped for 86.4% of candidate pairs with
+topology pinning and 51.5% without it; the predicted first candidate had 192.9%
+and 92.7% median regret respectively. These are negative results for simulator-
+only selection and are preserved in `results/top_resolution_*`.
 
 ## Claim Boundaries
 
-- This is a CPU Tensor Compiler prototype, not a replacement for oneDNN/BLIS.
-- The native micro-kernel is generated from schedule parameters but not yet an
-  LLVM-generated packed MR-by-NR kernel.
-- AVX-512 and NEON are target abstractions, not validated backends on this host.
-- NUMA-aware execution is implemented at topology/partition/affinity level but
-  cross-node performance cannot be measured on a single NUMA node.
-- Performance portability across CPUs requires additional machines.
+- Results belong to this Intel Core i5-14600K host and current frequency/load state.
+- SchedForge is a compiler prototype, not a replacement for BLIS or oneDNN.
+- AVX2 is validated; AVX-512 and NEON remain target abstractions on this host.
+- The machine has one NUMA node, so cross-node performance is not validated.
+- Full fresh tuning is deliberately expensive because every deduplicated candidate
+  is executed on hardware; cached runs are much faster and are labeled as cache hits.

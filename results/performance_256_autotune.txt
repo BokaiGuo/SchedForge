@@ -1,0 +1,25 @@
+Search space: 22680 schedules
+Static pruning + runtime deduplication: 22680 -> 5355
+Hardware-screened candidates: 5355
+Tuning cache: miss
+
+Best schedule:
+  ikj-tile64x64x16-v8-mr6-t6-fused
+  tile = 64x64x16
+  register block = 6x16
+  outer tile = 128x128x32
+  vector width = 8
+  packing = none
+  prefetch distance = 0
+  threads = 6
+
+Performance:
+  execution = 0.086 ms
+  GFLOPS = 390.772
+  max error = 0.000
+  simulated L1 miss = 0.194%
+  simulated LLC miss = 100.000%
+  simulated DTLB misses = 48
+  register pressure = 15.000
+  hardware screening rank = #4
+wall_seconds=13.25

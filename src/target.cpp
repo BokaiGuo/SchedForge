@@ -32,7 +32,7 @@ RegisterPressure estimate_register_pressure(const Schedule& schedule,
     pressure.accumulators = schedule.mr *
         std::max(1, (schedule.nr + std::max(1, schedule.vector_width) - 1) /
                     std::max(1, schedule.vector_width));
-    pressure.broadcasts = std::min(schedule.mr, 2);
+    pressure.broadcasts = schedule.vector_width > 1 ? 1 : 0;
     pressure.temporaries = 2 + (schedule.prefetch_distance > 0 ? 1 : 0);
     pressure.total = pressure.accumulators + pressure.broadcasts + pressure.temporaries;
     pressure.spills = pressure.total > target.vector_registers - 1;

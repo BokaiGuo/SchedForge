@@ -1,0 +1,18 @@
+workload=192^3 rounds=20 candidates=12 threads=8 pin=1
+rank,predicted_cycles,median_ms,mean_ms,cv_percent,ci95_half_ms,win_probability,schedule
+1,1.12646e+07,0.154176,0.159436,29.379089,0.020529,0.000000,order=ikj;outer=64,128,32;tile=16,64,16;micro=1,16;vector=8;unroll=1;threads=8;pack=;prefetch=0;fuse=true;pin=true
+2,11264616.000000,0.167620,0.268060,129.915231,0.152628,0.000000,order=ikj;outer=64,128,32;tile=16,64,16;micro=1,16;vector=8;unroll=4;threads=8;pack=;prefetch=0;fuse=true;pin=true
+3,11264616.000000,0.098025,0.176978,210.032483,0.162909,0.000000,order=ikj;outer=64,128,32;tile=16,64,16;micro=4,16;vector=8;unroll=1;threads=8;pack=;prefetch=0;fuse=true;pin=true
+4,11264616.000000,0.054328,0.232480,192.526621,0.196163,0.100000,order=ikj;outer=64,128,32;tile=16,64,16;micro=4,16;vector=8;unroll=4;threads=8;pack=;prefetch=0;fuse=true;pin=true
+5,11264616.000000,0.069817,0.134747,118.574695,0.070025,0.250000,order=ikj;outer=64,128,32;tile=16,64,16;micro=6,16;vector=8;unroll=1;threads=8;pack=;prefetch=0;fuse=true;pin=true
+6,11264616.000000,0.120830,0.270638,251.571999,0.298396,0.000000,order=ikj;outer=64,128,32;tile=16,64,16;micro=6,16;vector=8;unroll=4;threads=8;pack=;prefetch=0;fuse=true;pin=true
+7,11264616.000000,0.101284,0.121271,88.972037,0.047288,0.050000,order=ikj;outer=64,128,32;tile=16,64,16;micro=8,8;vector=8;unroll=1;threads=8;pack=;prefetch=0;fuse=true;pin=true
+8,11264616.000000,0.078059,0.107292,53.586980,0.025198,0.050000,order=ikj;outer=64,128,32;tile=16,64,16;micro=8,8;vector=8;unroll=4;threads=8;pack=;prefetch=0;fuse=true;pin=true
+9,11264616.000000,0.165143,0.169853,33.629951,0.025035,0.000000,order=ikj;outer=64,128,32;tile=16,64,32;micro=1,16;vector=8;unroll=1;threads=8;pack=;prefetch=0;fuse=true;pin=true
+10,11264616.000000,0.172609,0.166291,30.973544,0.022574,0.000000,order=ikj;outer=64,128,32;tile=16,64,32;micro=1,16;vector=8;unroll=4;threads=8;pack=;prefetch=0;fuse=true;pin=true
+11,11264616.000000,0.052636,0.101455,61.773530,0.027467,0.300000,order=ikj;outer=64,128,32;tile=16,64,32;micro=4,16;vector=8;unroll=1;threads=8;pack=;prefetch=0;fuse=true;pin=true
+12,11264616.000000,0.104972,0.100456,50.400233,0.022190,0.250000,order=ikj;outer=64,128,32;tile=16,64,32;micro=4,16;vector=8;unroll=4;threads=8;pack=;prefetch=0;fuse=true;pin=true
+predicted_adjacent_ties=11
+unresolved_pair_fraction=0.863636
+predicted_best_regret_percent=192.912578
+samples_csv=results/top_resolution_pinned.csv

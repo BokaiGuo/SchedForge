@@ -54,6 +54,8 @@ add_executable(schedforge-calibrate tools/schedforge-calibrate.cpp)
 target_link_libraries(schedforge-calibrate PRIVATE schedforge)
 add_executable(schedforge-search tools/schedforge-search.cpp)
 target_link_libraries(schedforge-search PRIVATE schedforge)
+add_executable(schedforge-resolution tools/schedforge-resolution.cpp)
+target_link_libraries(schedforge-resolution PRIVATE schedforge)
 
 enable_testing()
 add_executable(schedforge-tests tests/test_schedforge.cpp)
@@ -74,6 +76,7 @@ install(TARGETS
     schedforge-study
     schedforge-calibrate
     schedforge-search
+    schedforge-resolution
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 install(DIRECTORY include/schedforge DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})

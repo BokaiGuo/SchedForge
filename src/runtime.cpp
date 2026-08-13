@@ -4,8 +4,15 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <fstream>
+#include <functional>
 #include <limits>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <random>
+#include <set>
 #include <stdexcept>
 #include <thread>
 
@@ -27,6 +34,135 @@ struct PackedMatrices {
     int mr = 1;
     int nr = 1;
 };
+
+class ThreadTeam {
+public:
+    explicit ThreadTeam(int thread_count) : thread_count_(thread_count) {
+        workers_.reserve(static_cast<std::size_t>(thread_count_));
+        for (int worker_index = 0; worker_index < thread_count_; ++worker_index) {
+            workers_.emplace_back([this, worker_index] { worker_loop(worker_index); });
+        }
+    }
+
+    ~ThreadTeam() {
+        {
+            std::lock_guard lock(mutex_);
+            stopping_ = true;
+            ++generation_;
+        }
+        start_.notify_all();
+        for (auto& worker : workers_) worker.join();
+    }
+
+    void run(const std::function<void(int)>& job) {
+        std::lock_guard dispatch_lock(dispatch_mutex_);
+        {
+            std::lock_guard lock(mutex_);
+            job_ = job;
+            completed_ = 0;
+            ++generation_;
+        }
+        start_.notify_all();
+        std::unique_lock lock(mutex_);
+        finished_.wait(lock, [this] { return completed_ == thread_count_; });
+        job_ = {};
+    }
+
+private:
+    void worker_loop(int worker_index) {
+        std::size_t observed_generation = 0;
+        while (true) {
+            std::function<void(int)> job;
+            {
+                std::unique_lock lock(mutex_);
+                start_.wait(lock, [this, observed_generation] {
+                    return stopping_ || generation_ != observed_generation;
+                });
+                if (stopping_) return;
+                observed_generation = generation_;
+                job = job_;
+            }
+            job(worker_index);
+            {
+                std::lock_guard lock(mutex_);
+                ++completed_;
+                if (completed_ == thread_count_) finished_.notify_one();
+            }
+        }
+    }
+
+    int thread_count_;
+    std::vector<std::thread> workers_;
+    std::mutex dispatch_mutex_;
+    std::mutex mutex_;
+    std::condition_variable start_;
+    std::condition_variable finished_;
+    std::function<void(int)> job_;
+    std::size_t generation_ = 0;
+    int completed_ = 0;
+    bool stopping_ = false;
+};
+
+ThreadTeam& thread_team(int thread_count) {
+    static std::mutex teams_mutex;
+    static std::map<int, std::unique_ptr<ThreadTeam>> teams;
+    std::lock_guard lock(teams_mutex);
+    auto& team = teams[thread_count];
+    if (!team) team = std::make_unique<ThreadTeam>(thread_count);
+    return *team;
+}
+
+#if defined(__linux__)
+int read_topology_value(int cpu, const char* name) {
+    std::ifstream input("/sys/devices/system/cpu/cpu" + std::to_string(cpu) +
+                        "/topology/" + name);
+    int value = cpu;
+    input >> value;
+    return value;
+}
+
+const std::vector<int>& preferred_cpus() {
+    static const std::vector<int> cpus = [] {
+        cpu_set_t allowed;
+        CPU_ZERO(&allowed);
+        if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) return std::vector<int>{};
+
+        std::vector<int> primary;
+        std::vector<int> siblings;
+        std::set<std::pair<int, int>> seen_cores;
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+            if (!CPU_ISSET(cpu, &allowed)) continue;
+            const int package = read_topology_value(cpu, "physical_package_id");
+            const int core = read_topology_value(cpu, "core_id");
+            if (seen_cores.insert({package, core}).second) primary.push_back(cpu);
+            else siblings.push_back(cpu);
+        }
+        primary.insert(primary.end(), siblings.begin(), siblings.end());
+        return primary;
+    }();
+    return cpus;
+}
+
+const cpu_set_t& allowed_cpu_set() {
+    static const cpu_set_t allowed = [] {
+        cpu_set_t result;
+        CPU_ZERO(&result);
+        const auto& cpus = preferred_cpus();
+        if (cpus.empty()) {
+            CPU_SET(0, &result);
+        } else {
+            for (const int cpu : cpus) CPU_SET(cpu, &result);
+        }
+        return result;
+    }();
+    return allowed;
+}
+
+int preferred_cpu(int worker_index) {
+    const auto& cpus = preferred_cpus();
+    return cpus.empty() ? worker_index : cpus[static_cast<std::size_t>(worker_index) % cpus.size()];
+}
+#endif
 
 PackedMatrices pack_matrices(const Problem& problem, const Schedule& schedule,
                              const TensorData& data) {
@@ -115,6 +251,169 @@ void update_row(float* output, const float* b, float a, int count, int vector_wi
 #endif
     for (; j < count; ++j) {
         output[j] += a * b[j];
+    }
+}
+
+#if defined(__AVX2__)
+template <int Rows>
+void register_kernel_8(const Problem& problem, const Schedule& schedule,
+                       const TensorData& data, std::vector<float>& output,
+                       int row, int column) {
+    __m256 accumulators[Rows];
+    for (int lane = 0; lane < Rows; ++lane) {
+        accumulators[lane] = _mm256_setzero_ps();
+    }
+
+    for (int k = 0; k < problem.k; ++k) {
+        const __m256 b_values = _mm256_loadu_ps(
+            data.b.data() + static_cast<std::size_t>(k) * problem.n + column);
+        for (int lane = 0; lane < Rows; ++lane) {
+            const __m256 a_value = _mm256_broadcast_ss(
+                data.a.data() + static_cast<std::size_t>(row + lane) * problem.k + k);
+#if defined(__FMA__)
+            accumulators[lane] = _mm256_fmadd_ps(a_value, b_values, accumulators[lane]);
+#else
+            accumulators[lane] = _mm256_add_ps(
+                accumulators[lane], _mm256_mul_ps(a_value, b_values));
+#endif
+        }
+    }
+
+    if (schedule.fused && problem.bias) {
+        const __m256 bias = _mm256_loadu_ps(data.bias.data() + column);
+        for (int lane = 0; lane < Rows; ++lane) {
+            accumulators[lane] = _mm256_add_ps(accumulators[lane], bias);
+        }
+    }
+    if (schedule.fused && problem.relu) {
+        const __m256 zero = _mm256_setzero_ps();
+        for (int lane = 0; lane < Rows; ++lane) {
+            accumulators[lane] = _mm256_max_ps(accumulators[lane], zero);
+        }
+    }
+    for (int lane = 0; lane < Rows; ++lane) {
+        _mm256_storeu_ps(output.data() +
+                             static_cast<std::size_t>(row + lane) * problem.n + column,
+                         accumulators[lane]);
+    }
+}
+
+template <int Rows>
+void register_kernel_16(const Problem& problem, const Schedule& schedule,
+                        const TensorData& data, std::vector<float>& output,
+                        int row, int column) {
+    __m256 low[Rows];
+    __m256 high[Rows];
+    for (int lane = 0; lane < Rows; ++lane) {
+        low[lane] = _mm256_setzero_ps();
+        high[lane] = _mm256_setzero_ps();
+    }
+
+    for (int k = 0; k < problem.k; ++k) {
+        const float* b = data.b.data() + static_cast<std::size_t>(k) * problem.n + column;
+        const __m256 b_low = _mm256_loadu_ps(b);
+        const __m256 b_high = _mm256_loadu_ps(b + 8);
+        for (int lane = 0; lane < Rows; ++lane) {
+            const __m256 a_value = _mm256_broadcast_ss(
+                data.a.data() + static_cast<std::size_t>(row + lane) * problem.k + k);
+#if defined(__FMA__)
+            low[lane] = _mm256_fmadd_ps(a_value, b_low, low[lane]);
+            high[lane] = _mm256_fmadd_ps(a_value, b_high, high[lane]);
+#else
+            low[lane] = _mm256_add_ps(low[lane], _mm256_mul_ps(a_value, b_low));
+            high[lane] = _mm256_add_ps(high[lane], _mm256_mul_ps(a_value, b_high));
+#endif
+        }
+    }
+
+    if (schedule.fused && problem.bias) {
+        const __m256 bias_low = _mm256_loadu_ps(data.bias.data() + column);
+        const __m256 bias_high = _mm256_loadu_ps(data.bias.data() + column + 8);
+        for (int lane = 0; lane < Rows; ++lane) {
+            low[lane] = _mm256_add_ps(low[lane], bias_low);
+            high[lane] = _mm256_add_ps(high[lane], bias_high);
+        }
+    }
+    if (schedule.fused && problem.relu) {
+        const __m256 zero = _mm256_setzero_ps();
+        for (int lane = 0; lane < Rows; ++lane) {
+            low[lane] = _mm256_max_ps(low[lane], zero);
+            high[lane] = _mm256_max_ps(high[lane], zero);
+        }
+    }
+    for (int lane = 0; lane < Rows; ++lane) {
+        float* destination = output.data() +
+            static_cast<std::size_t>(row + lane) * problem.n + column;
+        _mm256_storeu_ps(destination, low[lane]);
+        _mm256_storeu_ps(destination + 8, high[lane]);
+    }
+}
+
+void dispatch_register_kernel_8(const Problem& problem, const Schedule& schedule,
+                                const TensorData& data, std::vector<float>& output,
+                                int row, int rows, int column) {
+    switch (rows) {
+        case 8: register_kernel_8<8>(problem, schedule, data, output, row, column); break;
+        case 7: register_kernel_8<7>(problem, schedule, data, output, row, column); break;
+        case 6: register_kernel_8<6>(problem, schedule, data, output, row, column); break;
+        case 5: register_kernel_8<5>(problem, schedule, data, output, row, column); break;
+        case 4: register_kernel_8<4>(problem, schedule, data, output, row, column); break;
+        case 3: register_kernel_8<3>(problem, schedule, data, output, row, column); break;
+        case 2: register_kernel_8<2>(problem, schedule, data, output, row, column); break;
+        default: register_kernel_8<1>(problem, schedule, data, output, row, column); break;
+    }
+}
+#endif
+
+void execute_register_blocked(const Problem& problem, const Schedule& schedule,
+                              const TensorData& data, std::vector<float>& output,
+                              int row_begin, int row_end) {
+    const int bm = schedule.tiled ? std::max(1, schedule.bm) : row_end - row_begin;
+    const int bn = schedule.tiled ? std::max(8, schedule.bn) : problem.n;
+    const int mr = std::clamp(schedule.mr, 1, 8);
+
+    for (int ii = row_begin; ii < row_end; ii += bm) {
+        const int i_end = std::min(ii + bm, row_end);
+        for (int jj = 0; jj < problem.n; jj += bn) {
+            const int j_end = std::min(jj + bn, problem.n);
+            for (int i0 = ii; i0 < i_end; i0 += mr) {
+                const int rows = std::min(mr, i_end - i0);
+                int j = jj;
+#if defined(__AVX2__)
+                if (rows <= 6) {
+                    for (; j + 16 <= j_end; j += 16) {
+                        switch (rows) {
+                            case 6: register_kernel_16<6>(problem, schedule, data, output, i0, j); break;
+                            case 5: register_kernel_16<5>(problem, schedule, data, output, i0, j); break;
+                            case 4: register_kernel_16<4>(problem, schedule, data, output, i0, j); break;
+                            case 3: register_kernel_16<3>(problem, schedule, data, output, i0, j); break;
+                            case 2: register_kernel_16<2>(problem, schedule, data, output, i0, j); break;
+                            default: register_kernel_16<1>(problem, schedule, data, output, i0, j); break;
+                        }
+                    }
+                }
+                for (; j + 8 <= j_end; j += 8) {
+                    dispatch_register_kernel_8(problem, schedule, data, output,
+                                               i0, rows, j);
+                }
+#endif
+                for (; j < j_end; ++j) {
+                    for (int lane = 0; lane < rows; ++lane) {
+                        float value = 0.0F;
+                        for (int k = 0; k < problem.k; ++k) {
+                            value += data.a[static_cast<std::size_t>(i0 + lane) * problem.k + k] *
+                                     data.b[static_cast<std::size_t>(k) * problem.n + j];
+                        }
+                        if (schedule.fused && problem.bias) value += data.bias[static_cast<std::size_t>(j)];
+                        if (schedule.fused && problem.relu) value = std::max(0.0F, value);
+                        output[static_cast<std::size_t>(i0 + lane) * problem.n + j] = value;
+                    }
+                }
+            }
+            if (!schedule.fused) {
+                apply_epilogue_range(problem, data, output, ii, i_end, jj, j_end);
+            }
+        }
     }
 }
 
@@ -268,19 +567,26 @@ void execute(const LoopIR& loop, const TensorData& data, std::vector<float>& out
         if (loop.schedule.pin_threads) {
             cpu_set_t cpu_set;
             CPU_ZERO(&cpu_set);
-            CPU_SET(cpu, &cpu_set);
+            CPU_SET(preferred_cpu(cpu), &cpu_set);
+            pthread_setaffinity_np(pthread_self(), sizeof(cpu_set), &cpu_set);
+        } else {
+            const cpu_set_t& cpu_set = allowed_cpu_set();
             pthread_setaffinity_np(pthread_self(), sizeof(cpu_set), &cpu_set);
         }
 #else
         (void)cpu;
 #endif
-        std::fill(output.begin() + static_cast<std::size_t>(begin) * loop.problem.n,
-                  output.begin() + static_cast<std::size_t>(end) * loop.problem.n, 0.0F);
         if (loop.schedule.order == LoopOrder::IJK) {
             execute_ijk(loop.problem, loop.schedule, data, output, begin, end);
         } else if (loop.schedule.pack_a || loop.schedule.pack_b) {
+            std::fill(output.begin() + static_cast<std::size_t>(begin) * loop.problem.n,
+                      output.begin() + static_cast<std::size_t>(end) * loop.problem.n, 0.0F);
             execute_packed(loop.problem, loop.schedule, data, packed, output, begin, end);
+        } else if (loop.schedule.vector_width >= 8) {
+            execute_register_blocked(loop.problem, loop.schedule, data, output, begin, end);
         } else {
+            std::fill(output.begin() + static_cast<std::size_t>(begin) * loop.problem.n,
+                      output.begin() + static_cast<std::size_t>(end) * loop.problem.n, 0.0F);
             execute_ikj(loop.problem, loop.schedule, data, output, begin, end);
         }
     };
@@ -288,14 +594,12 @@ void execute(const LoopIR& loop, const TensorData& data, std::vector<float>& out
         worker(0, loop.problem.m, 0);
         return;
     }
-    std::vector<std::thread> threads;
     const int rows_per_thread = (loop.problem.m + thread_count - 1) / thread_count;
-    for (int thread = 0; thread < thread_count; ++thread) {
-        const int begin = thread * rows_per_thread;
+    thread_team(thread_count).run([&](int thread_index) {
+        const int begin = thread_index * rows_per_thread;
         const int end = std::min(begin + rows_per_thread, loop.problem.m);
-        if (begin < end) threads.emplace_back(worker, begin, end, thread);
-    }
-    for (auto& thread : threads) thread.join();
+        if (begin < end) worker(begin, end, thread_index);
+    });
 }
 
 double max_abs_error(const std::vector<float>& lhs, const std::vector<float>& rhs) {

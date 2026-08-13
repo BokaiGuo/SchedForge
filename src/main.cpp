@@ -56,8 +56,10 @@ Options parse(int argc, char** argv) {
 
 void print_result(const schedforge::SearchResult& result) {
     std::cout << "Search space: " << result.search_space << " schedules\n"
-              << "Static pruning: " << result.search_space << " -> " << result.after_static_pruning << "\n"
-              << "Cache simulation: " << result.after_static_pruning << " -> " << result.benchmarked << "\n\n"
+              << "Static pruning + runtime deduplication: " << result.search_space << " -> "
+              << result.after_static_pruning << "\n"
+              << "Hardware-screened candidates: " << result.benchmarked << "\n"
+              << "Tuning cache: " << (result.cache_hit ? "hit" : "miss") << "\n\n"
               << "Best schedule:\n  " << schedforge::schedule_name(result.schedule) << "\n"
               << "  tile = " << result.schedule.bm << 'x' << result.schedule.bn << 'x' << result.schedule.bk << "\n"
               << "  register block = " << result.schedule.mr << 'x' << result.schedule.nr << "\n"
@@ -75,7 +77,7 @@ void print_result(const schedforge::SearchResult& result) {
               << "  simulated LLC miss = " << result.simulation.llc_miss_rate() * 100.0 << "%\n"
               << "  simulated DTLB misses = " << result.simulation.dtlb_misses << "\n"
               << "  register pressure = " << result.simulation.register_pressure << "\n"
-              << "  simulator ranking = #" << result.simulator_rank << "\n";
+              << "  hardware screening rank = #" << result.measurement_rank << "\n";
 }
 
 }  // namespace
