@@ -58,6 +58,10 @@ std::string kernel_key(const LoopIR& loop) {
            std::to_string(std::hash<std::string>{}(loop.dump()));
 }
 
+constexpr const char* kJITSymbol = "schedforge_matmul";
+constexpr const char* kAOTSymbol = "schedforge_matmul_v1";
+constexpr const char* kAOTMetadataSymbol = "schedforge_aot_metadata_v1";
+
 std::string error_string(llvm::Error error) {
     return llvm::toString(std::move(error));
 }
@@ -552,15 +556,41 @@ void initialize_llvm() {
     });
 }
 
-std::string emit_assembly(const llvm::Module& source) {
+std::unique_ptr<llvm::Module> build_module(llvm::LLVMContext& context,
+                                           const LoopIR& loop,
+                                           const std::string& name,
+                                           const std::string& symbol) {
+    const auto execution = analyze_loop_ir(loop);
+    auto module = std::make_unique<llvm::Module>(name, context);
+    if (can_build_register_kernel(loop.problem, execution))
+        build_register_tiled_function(*module, loop.problem, execution);
+    else if (execution.vector_width > 1 || execution.order == LoopOrder::IKJ)
+        build_ikj_function(*module, loop.problem, execution);
+    else build_ijk_function(*module, loop.problem, execution);
+    auto* function = module->getFunction(kJITSymbol);
+    if (!function) throw std::runtime_error("LLVM kernel symbol is missing");
+    function->setName(symbol);
+    if (llvm::verifyModule(*module, &llvm::errs()))
+        throw std::runtime_error("LLVM module verification failed");
+    optimize_module(*module);
+    return module;
+}
+
+std::unique_ptr<llvm::TargetMachine> create_target_machine(llvm::Reloc::Model relocation) {
     std::string lookup_error;
     const std::string triple = llvm::sys::getDefaultTargetTriple();
     const llvm::Target* target = llvm::TargetRegistry::lookupTarget(triple, lookup_error);
     if (!target) throw std::runtime_error("LLVM target lookup failed: " + lookup_error);
     llvm::TargetOptions options;
     std::unique_ptr<llvm::TargetMachine> machine(target->createTargetMachine(
-        triple, llvm::sys::getHostCPUName(), "", options, std::nullopt));
+        triple, llvm::sys::getHostCPUName(), "", options, relocation));
     if (!machine) throw std::runtime_error("LLVM target machine creation failed");
+    return machine;
+}
+
+std::string emit_assembly(const llvm::Module& source) {
+    const std::string triple = llvm::sys::getDefaultTargetTriple();
+    auto machine = create_target_machine(llvm::Reloc::PIC_);
     auto module = llvm::CloneModule(source);
     module->setTargetTriple(triple);
     module->setDataLayout(machine->createDataLayout());
@@ -571,6 +601,45 @@ std::string emit_assembly(const llvm::Module& source) {
         throw std::runtime_error("LLVM assembly emission is unsupported");
     passes.run(*module);
     return std::string(storage.begin(), storage.end());
+}
+
+std::vector<std::uint8_t> emit_object(const llvm::Module& source) {
+    const std::string triple = llvm::sys::getDefaultTargetTriple();
+    auto machine = create_target_machine(llvm::Reloc::PIC_);
+    auto module = llvm::CloneModule(source);
+    module->setTargetTriple(triple);
+    module->setDataLayout(machine->createDataLayout());
+    llvm::SmallVector<char, 0> storage;
+    llvm::raw_svector_ostream output(storage);
+    llvm::legacy::PassManager passes;
+    if (machine->addPassesToEmitFile(passes, output, nullptr,
+                                     llvm::CodeGenFileType::ObjectFile))
+        throw std::runtime_error("LLVM object emission is unsupported");
+    passes.run(*module);
+    return {storage.begin(), storage.end()};
+}
+
+void add_aot_metadata(llvm::Module& module, const LoopIR& loop,
+                      const std::string& triple, const std::string& cpu) {
+    const auto execution = analyze_loop_ir(loop);
+    std::ostringstream metadata;
+    metadata << "format_version=1\n"
+             << "abi=" << kAOTSymbol << '\n'
+             << "symbol=" << kAOTSymbol << '\n'
+             << "target_triple=" << triple << '\n'
+             << "target_cpu=" << cpu << '\n'
+             << "m=" << loop.problem.m << '\n'
+             << "n=" << loop.problem.n << '\n'
+             << "k=" << loop.problem.k << '\n'
+             << "bias=" << loop.problem.bias << '\n'
+             << "relu=" << loop.problem.relu << '\n'
+             << "threads=" << execution.threads << '\n';
+    auto* initializer = llvm::ConstantDataArray::getString(
+        module.getContext(), metadata.str(), true);
+    auto* global = new llvm::GlobalVariable(
+        module, initializer->getType(), true, llvm::GlobalValue::ExternalLinkage,
+        initializer, kAOTMetadataSymbol);
+    global->setDSOLocal(false);
 }
 
 std::shared_ptr<CachedKernel> compile_kernel(const LoopIR& loop, bool& cache_hit) {
@@ -584,17 +653,8 @@ std::shared_ptr<CachedKernel> compile_kernel(const LoopIR& loop, bool& cache_hit
         }
     }
     cache_hit = false;
-    const auto execution = analyze_loop_ir(loop);
     auto context = std::make_unique<llvm::LLVMContext>();
-    auto module = std::make_unique<llvm::Module>("schedforge_jit", *context);
-    if (can_build_register_kernel(loop.problem, execution))
-        build_register_tiled_function(*module, loop.problem, execution);
-    else if (execution.vector_width > 1 || execution.order == LoopOrder::IKJ)
-        build_ikj_function(*module, loop.problem, execution);
-    else build_ijk_function(*module, loop.problem, execution);
-    if (llvm::verifyModule(*module, &llvm::errs()))
-        throw std::runtime_error("LLVM module verification failed");
-    optimize_module(*module);
+    auto module = build_module(*context, loop, "schedforge_jit", kJITSymbol);
     auto kernel = std::make_shared<CachedKernel>();
     llvm::raw_string_ostream stream(kernel->llvm_ir);
     module->print(stream, nullptr);
@@ -609,7 +669,7 @@ std::shared_ptr<CachedKernel> compile_kernel(const LoopIR& loop, bool& cache_hit
     if (auto error = kernel->jit->addIRModule(
             llvm::orc::ThreadSafeModule(std::move(module), std::move(context))))
         throw std::runtime_error(error_string(std::move(error)));
-    auto symbol = kernel->jit->lookup("schedforge_matmul");
+    auto symbol = kernel->jit->lookup(kJITSymbol);
     if (!symbol) throw std::runtime_error(error_string(symbol.takeError()));
     kernel->function = symbol->toPtr<MatMulFunction>();
     std::lock_guard lock(kernel_cache_mutex);
@@ -620,6 +680,34 @@ std::shared_ptr<CachedKernel> compile_kernel(const LoopIR& loop, bool& cache_hit
 }  // namespace
 
 bool LLVMJITBackend::available() const { return true; }
+
+bool LLVMAOTBackend::available() const { return true; }
+
+AOTObject LLVMAOTBackend::compile(const LoopIR& loop) const {
+    initialize_llvm();
+    verify_loop_ir(loop);
+    const auto execution = analyze_loop_ir(loop);
+    if (execution.threads != 1)
+        throw std::invalid_argument("v0.11 AOT requires threads=1; multi-kernel dispatch is not yet implemented");
+    if (execution.gelu || execution.residual)
+        throw std::invalid_argument("v0.11 AOT manifest does not encode GELU or residual epilogues");
+    const auto start = std::chrono::steady_clock::now();
+    llvm::LLVMContext context;
+    auto module = build_module(context, loop, "schedforge_aot", kAOTSymbol);
+    AOTObject result;
+    result.target_triple = llvm::sys::getDefaultTargetTriple();
+    result.target_cpu = llvm::sys::getHostCPUName().str();
+    add_aot_metadata(*module, loop, result.target_triple, result.target_cpu);
+    llvm::raw_string_ostream stream(result.llvm_ir);
+    module->print(stream, nullptr);
+    stream.flush();
+    result.assembly = emit_assembly(*module);
+    result.assembly_report = AssemblyAnalyzer{}.analyze(result.assembly);
+    result.object_code = emit_object(*module);
+    result.compile_milliseconds = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - start).count();
+    return result;
+}
 
 LLVMJITResult LLVMJITBackend::benchmark(const LoopIR& loop, const TensorData& data,
                                         int warmup,

@@ -264,6 +264,106 @@ void test_compiler_architecture() {
     require(search.hardware_measurements == 2 && search.best_gflops > 0.0, "search strategies");
 }
 
+void test_aot_deployment() {
+    schedforge::Schedule schedule;
+    schedule.mr = 4;
+    schedule.nr = 8;
+    schedule.vector_width = 8;
+    schedule.threads = 1;
+    const schedforge::Problem problem{13, 17, 11, true, true};
+    const auto loop = schedforge::apply_schedule(problem, schedule);
+    const auto object = schedforge::LLVMAOTBackend{}.compile(loop);
+    require(object.object_code.size() > 4 && object.object_code[0] == 0x7f &&
+            object.object_code[1] == 'E' && object.object_code[2] == 'L' &&
+            object.object_code[3] == 'F' &&
+            object.llvm_ir.find("schedforge_matmul_v1") != std::string::npos,
+            "llvm aot elf object");
+
+    const auto package = std::filesystem::temp_directory_path() / "schedforge_test_aot.sfe";
+    std::filesystem::remove_all(package);
+    const auto created = schedforge::create_aot_package(loop, package);
+    const auto inspected = schedforge::inspect_aot_package(package);
+    require(created.manifest.object_checksum == inspected.object_checksum &&
+            inspected.problem.m == problem.m &&
+            std::filesystem::file_size(package / "kernel.so") > 0,
+            "aot package round trip");
+    const auto measured = schedforge::benchmark_aot_package(
+        package, schedforge::make_data(problem, 103), 0, 2);
+    require(measured.max_error < 1.0e-3 && measured.gflops > 0.0,
+            "aot dlopen execution");
+
+    {
+        std::ofstream corrupt(package / "kernel.so", std::ios::binary | std::ios::app);
+        corrupt.put('\0');
+    }
+    bool rejected = false;
+    try {
+        (void)schedforge::inspect_aot_package(package);
+    } catch (const std::runtime_error&) {
+        rejected = true;
+    }
+    require(rejected, "aot checksum rejects tampering");
+    std::filesystem::remove_all(package);
+
+    (void)schedforge::create_aot_package(loop, package);
+    const auto manifest_path = package / "manifest.sfe";
+    std::ifstream manifest_input(manifest_path);
+    std::string manifest_text((std::istreambuf_iterator<char>(manifest_input)),
+                              std::istreambuf_iterator<char>());
+    const auto cpu_field = manifest_text.find("target_cpu=");
+    const auto cpu_end = manifest_text.find('\n', cpu_field);
+    manifest_text.replace(cpu_field, cpu_end - cpu_field,
+                          "target_cpu=incompatible-test-cpu");
+    std::ofstream(manifest_path, std::ios::trunc) << manifest_text;
+    rejected = false;
+    try {
+        (void)schedforge::inspect_aot_package(package);
+    } catch (const std::runtime_error&) {
+        rejected = true;
+    }
+    require(rejected, "aot target guard rejects incompatible cpu");
+    std::filesystem::remove_all(package);
+
+    (void)schedforge::create_aot_package(loop, package);
+    std::ifstream shape_manifest_input(manifest_path);
+    manifest_text.assign(std::istreambuf_iterator<char>(shape_manifest_input),
+                         std::istreambuf_iterator<char>());
+    const auto shape_field = manifest_text.find("m=13");
+    manifest_text.replace(shape_field, 4, "m=14");
+    std::ofstream(manifest_path, std::ios::trunc) << manifest_text;
+    rejected = false;
+    try {
+        (void)schedforge::inspect_aot_package(package);
+    } catch (const std::runtime_error&) {
+        rejected = true;
+    }
+    require(rejected, "aot embedded metadata rejects manifest shape tampering");
+    std::filesystem::remove_all(package);
+
+    auto parallel = schedule;
+    parallel.threads = 2;
+    rejected = false;
+    try {
+        (void)schedforge::LLVMAOTBackend{}.compile(
+            schedforge::apply_schedule(problem, parallel));
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    require(rejected, "aot v1 rejects unsupported thread dispatch");
+
+    auto residual_loop = loop;
+    schedforge::LoopOperation residual;
+    residual.kind = schedforge::LoopOpKind::AddResidual;
+    residual_loop.insertEpilogueBeforeStores(std::move(residual));
+    rejected = false;
+    try {
+        (void)schedforge::LLVMAOTBackend{}.compile(residual_loop);
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    require(rejected, "aot v1 rejects unmanifested graph epilogues");
+}
+
 void test_graph_compiler() {
     const schedforge::MLPConfig config{1, 4, 8, 16};
     auto graph = schedforge::build_transformer_mlp_graph(config, true);
@@ -747,6 +847,7 @@ int main() {
         test_correctness_non_multiple();
         test_simulator_and_search();
         test_compiler_architecture();
+        test_aot_deployment();
         test_graph_compiler();
         test_moe_compiler();
         test_attention_compiler();

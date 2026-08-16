@@ -2,6 +2,30 @@
 
 All notable changes to SchedForge are documented here.
 
+## [0.11.0] - 2026-08-16
+
+### Added
+
+- LLVM 18 `TargetMachine` ELF object emission from the same optimized Scheduled
+  LoopIR module used by ORC JIT and assembly analysis.
+- Versioned target-specific `.sfe` deployment packages containing a manifest,
+  shape and ABI guards, LoopIR, LLVM IR, assembly, `kernel.o`, and `kernel.so`.
+- `schedforge-aot compile|inspect|run` with checksum validation, host target
+  checks, POSIX `dlopen`/`dlsym`, and numerical verification without runtime
+  LLVM compilation.
+- Separate-process CTest coverage plus `schedforge-aot-study` measurements for
+  cold JIT compilation, AOT compilation/linking, load latency, execution, and
+  correctness.
+
+### Changed
+
+- `.sfe` now has a real machine-code deployment form in addition to the older
+  text ExecutablePlan serializers; the AOT form is a directory with a `.sfe`
+  suffix so artifacts remain inspectable.
+- AOT format v1 is deliberately shape-specialized, same-target, FP32 MatMul,
+  and single-threaded. Unsupported thread dispatch and target mismatches fail
+  explicitly rather than silently changing semantics.
+
 ## [0.10.0] - 2026-08-13
 
 ### Added

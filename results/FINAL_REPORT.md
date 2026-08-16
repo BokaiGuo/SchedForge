@@ -245,6 +245,31 @@ spill pattern. This negative result is retained in
 `results/fused_attention_llvm.csv` and is the primary remaining v0.10 code-
 quality boundary.
 
+## Target-Specific AOT Deployment
+
+SchedForge 0.11 adds a real machine-code deployment path for Scheduled LoopIR.
+The optimized LLVM module is emitted as a PIC ELF `kernel.o`, linked into
+`kernel.so`, and packaged with `manifest.sfe`, canonical LoopIR, LLVM IR, and
+assembly in an inspectable `.sfe` directory. A separate process validates the
+format, ABI, exact shape, target triple, target CPU, and checksums before loading
+`schedforge_matmul_v1` with `dlopen`/`dlsym`. No LLVM compilation occurs in the
+runtime load or execution path.
+
+The recorded one-thread cubic study is:
+
+| Shape | JIT compile ms | AOT compile ms | AOT link ms | AOT load ms | AOT run ms | Error |
+|---|---:|---:|---:|---:|---:|---:|
+| 64³ | 264.371 | 268.110 | 38.063 | 0.073 | 0.007 | 1.43e-6 |
+| 128³ | 12.388 | 10.608 | 44.346 | 0.064 | 0.137 | 3.34e-6 |
+| 256³ | 12.208 | 11.657 | 41.420 | 0.081 | 0.844 | 5.72e-6 |
+
+The first LLVM initialization dominates the 64³ compile row. The ORC execution
+measurement also includes its current host worker-thread wrapper even when the
+LoopIR requests one thread, while AOT invokes the loaded function directly.
+Therefore the execution difference measures current deployment/runtime overhead
+as well as code, and is not attributed solely to object emission. Raw values are
+stored in `results/aot_deployment.csv`.
+
 ## MoE Compiler Validation
 
 SchedForge 0.4 adds a single-host FP32 Top-2 MoE MLP compiler/runtime path. MoE
@@ -340,10 +365,10 @@ only selection and are preserved in `results/top_resolution_*`.
   FlashAttention-2. Paged KV, reduced-precision attention, backward/dropout,
   distributed attention, and native-parity spill-free fused LLVM code are outside this release.
 - Decoder Layer execution is FP32. Compile-time weight concatenation is
-  implemented, while portable AOT object caching and true BF16/INT8 Decoder
-  kernels remain outside v0.10.
-- Portable ELF object caching and standalone AOT `.sfe` loading remain v0.11
-  work; v0.10 uses in-process LLVM ORC JIT.
+  implemented, while true BF16/INT8 Decoder kernels remain future work.
+- AOT format v1 is same-target, shape-specialized FP32 MatMul with one runtime
+  thread. Whole-graph constant relocation, multi-kernel AOT dispatch, and
+  cross-CPU feature compatibility remain future work.
 - Large Decoder profiles and expensive Prefill profiles are compile-only under
   the checked-in 1.2 GFLOP/256 MiB execution budget; no latency is claimed for
   those rows.

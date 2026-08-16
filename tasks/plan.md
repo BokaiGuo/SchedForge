@@ -1,7 +1,7 @@
 # Plan
 
-1. Carry LoopIR thread semantics into LLVM invocation.
-2. Expand assembly quality analysis and study tooling.
-3. Add fused exact Attention LLVM lowering and execution.
-4. Measure native/LLVM and fused Attention performance.
-5. Update v0.10 docs, tests, CI, and release evidence.
+1. Refactor shared LoopIR LLVM module construction.
+2. Emit target-specific ELF object and shared library.
+3. Persist and validate versioned `.sfe` packages.
+4. Add independent compile/inspect/run commands.
+5. Measure, document, test, and release v0.11.

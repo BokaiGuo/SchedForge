@@ -21,7 +21,7 @@ model-to-machine CPU AI 编译器。它能够
 导入 StableHLO 子集，构建真正的多算子 Tensor SSA Graph，执行 Shape 推导、
 图正规化、融合、Dispatch 形成、Layout 传播、Bufferization 和 Workspace
 复用，再通过 Structured Tensor Compute、Transform IR、Loop IR、Tensorization
-和 LLVM 18 ORC JIT 或原生 AVX2 后端生成并执行 CPU 代码。
+和 LLVM 18 ORC JIT、目标特化 ELF AOT 包或原生 AVX2 后端生成并执行 CPU 代码。
 
 当前旗舰 Workload 是一层完整的 Llama/Mistral 风格 Transformer Decoder。
 一个 StableHLO 输入会被导入为一张图，编译为一个 `DecoderExecutablePlan`，并由
@@ -70,7 +70,7 @@ flowchart LR
     G --> H
     H --> I["代价模型与自动调优"]
     I --> J["原生 AVX2 后端"]
-    I --> K["LLVM 即时编译后端"]
+    I --> K["LLVM JIT / ELF AOT 后端"]
     J --> L["真机测试与 perf"]
     K --> L
     L --> M["模型校准与误差分析"]
@@ -99,6 +99,9 @@ flowchart LR
   并行 Split-KV Decode，以及单函数可执行 LLVM Online-Softmax Attention。
 - **Production LLVM 研究**：ORC 执行保留 Scheduled LoopIR 的线程语义；汇编
   报告覆盖指令、分支、地址计算、栈访问和 Spill，并提供可复现双后端矩阵。
+- **AOT 部署**：LLVM `TargetMachine` 生成 PIC ELF Object；带版本的 `.sfe`
+  保存目标、Shape、ABI Guard 与校验和，并可由新进程在不运行 LLVM 编译器的
+  情况下通过 `dlopen` 直接执行。
 - **内存与布局编译**：Layout 进入 Tensor Type；支持跨 Dispatch 布局传播、
   Bufferization、生命周期分析、64 字节对齐 Workspace 复用和 Guarded Specialization。
 - **结构化 Kernel Compiler**：Iteration Domain、并行/归约 Iterator、Indexing Map、
@@ -175,6 +178,12 @@ cmake -S . -B build -G Ninja \
 
 # 使用 LLVM 即时编译后端运行
 ./build/schedforge-run --backend=llvm --M=256 --N=256 --K=256
+
+# 编译、检查并运行目标特化 AOT 包
+./build/schedforge-aot compile --M=128 --N=128 --K=128 \
+  --output=results/matmul_128.sfe
+./build/schedforge-aot inspect --artifact=results/matmul_128.sfe
+./build/schedforge-aot run --artifact=results/matmul_128.sfe --repetitions=10
 
 # 校准硬件参数后执行自动调优
 ./build/schedforge-bench --M=192 --N=192 --K=192 \
@@ -276,6 +285,8 @@ vector=8;unroll=4;threads=8;pack=ab;prefetch=4;fuse=true;pin=true
 | `schedforge-decoder` | 编译并执行完整 Dense 或 MoE Decoder Layer |
 | `schedforge-decoder-bench` | 运行真实规模 Decoder 与全图计划实验 |
 | `schedforge-codegen-study` | 从相同 LoopIR 对比 Native 与 LLVM 代码质量 |
+| `schedforge-aot` | 编译、检查并运行目标特化 `.sfe` AOT 包 |
+| `schedforge-aot-study` | 测量 JIT 编译与 AOT 编译、加载、执行成本 |
 
 ## Decoder Layer Compiler 实测 Demo
 
@@ -326,6 +337,22 @@ GQA Prefill `S=128` 为 **0.786 ms**，GQA Decode `Sk=1024` 为 **0.214 ms**，
 最大误差低于 `5e-8`。专门化 Native 路径仍快 **2.1-3.1×**，而且融合 LLVM
 汇编仍存在 Vector Spill Pattern。这些负结果被明确保留。详见
 `results/llvm_codegen_study.csv` 与 `results/fused_attention_llvm.csv`。
+
+## AOT 可执行部署
+
+SchedForge 0.11 会把同一份优化后 Scheduled LoopIR 交给 LLVM 18
+`TargetMachine`，生成 PIC ELF Relocatable Object，再链接为可加载的
+`kernel.so`，最终写入带版本的 `.sfe` 目录。Manifest 会检查 ABI、精确 MatMul
+Shape、Target Triple、Host CPU，以及 LoopIR、Object 和 Shared Object 的校验和。
+同一组不变量也会嵌入 `kernel.so` 并在调用前交叉核对。`schedforge-aot run`
+随后直接执行 `dlopen`/`dlsym`，运行时不调用 LLVM。
+
+在记录的 Intel Core i5-14600K 上，`64/128/256³` 的 AOT 加载延迟为
+**0.064-0.081 ms**，最大误差均低于 `6e-6`；直接执行时间为
+**0.007/0.137/0.844 ms**。ORC 对比路径即使单线程也包含当前宿主 Worker Thread
+封装，因此这里证明的是部署与调用开销，而不是声称 Object Emission 本身改变了
+机器码质量。详见 `results/aot_deployment.csv` 与
+[AOT 部署说明](docs/AOT_DEPLOYMENT.md)。
 
 ## MoE Compiler 实测 Demo
 
@@ -431,6 +458,8 @@ scripts/              性能计数器辅助脚本
   GPU FlashAttention-2 的实现或性能声明。
 - Paged KV、BF16/INT8 Attention、Dropout/Backward、分布式 Attention，以及
   无 Spill 且达到 Native Parity 的 LLVM Fused Attention 尚未实现。
+- AOT Format v1 仅支持同目标、Shape 特化 FP32 MatMul 和单 Runtime Thread；
+  Whole-Graph 常量重定位与多 Kernel Dispatch 仍属于后续工作。
 - 模拟器只提供诊断信息，既不是性能选择裁判，也不会逐周期复现 Intel
   处理器的乱序执行。
 - 性能会受到 CPU 型号、频率策略、编译器版本、输入规模和后台负载影响，
@@ -444,6 +473,7 @@ scripts/              性能计数器辅助脚本
 - [MoE Compiler Pipeline](docs/MOE_COMPILER.md)
 - [Attention Compiler Pipeline](docs/ATTENTION_COMPILER.md)
 - [Decoder Layer Compiler Pipeline](docs/DECODER_COMPILER.md)
+- [AOT 可执行部署](docs/AOT_DEPLOYMENT.md)
 - [实验方法](docs/EXPERIMENT.md)
 - [最终实验报告](results/FINAL_REPORT.md)
 - [架构决策记录](docs/decisions/)

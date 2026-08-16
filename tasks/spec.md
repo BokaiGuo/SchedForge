@@ -1,58 +1,64 @@
-# Spec: SchedForge v0.10 Production LLVM and Fused CodeGen
+# Spec: SchedForge v0.11 AOT Executable Deployment
 
 ## Objective
-Close the largest remaining backend gap after the v0.8 realistic Decoder suite
-and v0.9 whole-graph planner. The same Scheduled LoopIR must carry its thread
-semantics into native and LLVM execution, expose comparable machine-code quality
-metrics, and lower exact IO-aware Attention into one executable LLVM function.
+Turn Scheduled LoopIR into a portable-on-the-same-target deployment artifact
+instead of requiring process-local ORC JIT compilation. A `.sfe` package must
+contain a versioned manifest, target and shape guards, the canonical schedule,
+LLVM object code, a loadable shared library, and enough metadata for an
+independent runtime process to validate and invoke the exported kernel.
 
 ## Tech Stack
-C++20, CMake, LLVM 18 IRBuilder/O3/ORC LLJIT, existing Scheduled LoopIR,
-Attention TilePipelineIR, AVX2 native runtime, and CSV evidence artifacts.
+C++20, CMake, LLVM 18 IRBuilder/O3/TargetMachine object emission, ELF shared
+objects, POSIX `dlopen`/`dlsym`, existing Scheduled LoopIR and TensorData.
 
 ## Commands
-Build: `cmake -S . -B build-v010 -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build-v010 --parallel`
-Test: `ctest --test-dir build-v010 --output-on-failure`
-Codegen study: `./build-v010/schedforge-codegen-study --output=results/llvm_codegen_study.csv`
-Attention study: `./build-v010/schedforge-attention --fused-llvm --sequence=128 --repetitions=5`
-Sanitizers: `cmake -S . -B build-v010-asan -DSCHEDFORGE_ENABLE_SANITIZERS=ON -DCMAKE_BUILD_TYPE=Debug`
+Build: `cmake -S . -B build-v011 -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build-v011 --parallel`
+Test: `ctest --test-dir build-v011 --output-on-failure`
+Compile: `./build-v011/schedforge-aot compile --M=128 --N=128 --K=128 --output=results/matmul_128.sfe`
+Inspect: `./build-v011/schedforge-aot inspect --artifact=results/matmul_128.sfe`
+Run: `./build-v011/schedforge-aot run --artifact=results/matmul_128.sfe --repetitions=10`
+Study: `./build-v011/schedforge-aot-study --output=results/aot_deployment.csv`
 
 ## Project Structure
-`src/llvm_backend.cpp`: LoopIR LLVM compilation, parallel invocation, assembly analysis.
-`src/attention_llvm_backend.cpp`: fused exact online-softmax Attention LLVM backend.
-`include/schedforge/compiler.h`: backend quality result APIs.
-`include/schedforge/attention_compiler.h`: fused Attention LLVM result API.
-`tools/schedforge-codegen-study.cpp`: same-LoopIR native/LLVM comparison.
-`tests/test_schedforge.cpp`: backend semantics, quality metrics, fused Attention correctness.
-`results/`: host-specific measured codegen evidence.
+`include/schedforge/compiler.h`: public AOT artifact, manifest, compiler, and runtime APIs.
+`src/llvm_backend.cpp`: shared LoopIR-to-LLVM lowering plus ELF object emission.
+`src/aot_runtime.cpp`: `.sfe` package persistence, target guards, loading, execution.
+`tools/schedforge-aot.cpp`: compile, inspect, and run deployment CLI.
+`tools/schedforge-aot-study.cpp`: measured JIT-versus-AOT evidence.
+`tests/test_schedforge.cpp`: object, package, guard, load, and correctness tests.
 
 ## Code Style
-Use typed value objects and RAII. Generated code decisions must derive from
-LoopIR or TilePipelineIR, not duplicated display strings. Preserve explicit
-measured versus analytical evidence boundaries.
+Use typed value objects, RAII for dynamic-library handles, deterministic
+line-oriented manifests, atomic package replacement, and explicit errors for
+ABI, target, shape, or artifact mismatches.
 
 ## Testing Strategy
-Unit-test parallel LLVM correctness, cache behavior, assembly metrics, and fused
-Attention correctness at small shapes. Run Release and ASan/UBSan. Run measured
-native/LLVM and Attention studies on the current host. Do not claim performance
-for paths that only emit text.
+Unit-test ELF magic, manifest round trips, target/shape guards, exported symbol
+lookup, numerical correctness, and repeated loads. Run the CLI in a separate
+process through CTest so deployment evidence cannot accidentally reuse the ORC
+cache. Run Release, ASan/UBSan, install, and the host AOT study.
 
 ## Boundaries
-- Always: compare native and LLVM from the same Scheduled LoopIR.
-- Always: measure complete execution and validate against independent references.
-- Always: report thread count, instruction metrics, spills, compile time, and speed ratio.
-- Never: call emitted-but-unexecuted LLVM IR a production kernel.
-- Never: claim LLVM parity if the checked-in measurements do not show it.
-- Future: portable object-file AOT, Paged KV, BF16/INT8 Decoder, transfer tuning,
-  NEON hardware validation, and compiler fuzzing remain v0.11-v0.16 work.
+- Always: object bytes come from LLVM TargetMachine object emission.
+- Always: runtime loads prebuilt code without invoking LLVM compilation.
+- Always: validate format version, ABI, host target, problem shape, and checksums.
+- Never: describe text-only `.sfe` plans as AOT machine-code deployment.
+- Never: claim cross-ISA portability; v0.11 artifacts are target-specific.
+- Never: accept GELU/residual LoopIR until the manifest encodes their data ABI.
+- Future: Paged KV, quantized Decoder, transfer tuning, NEON validation, and
+  fuzzing remain v0.12-v0.16 work.
 
 ## Success Criteria
-1. LLVM execution honors LoopIR thread count with disjoint row partitions.
-2. Assembly reports include total instructions, branches, loads/stores, address
-   generation proxies, stack accesses, FMA count, and spill detection.
-3. A reproducible CLI compares native and LLVM on identical LoopIR and writes CSV.
-4. IO-aware Attention can compile and execute as one LLVM function containing
-   QK, online max/sum rescaling, PV accumulation, and final normalization.
-5. All new paths validate below `1e-3`; Release, sanitizers, install, and CI pass.
-6. README, architecture, changelog, report, version, raw results, and claim
-   boundaries are updated and pushed to GitHub.
+1. `schedforge-aot compile` emits a `.sfe` directory containing `manifest.sfe`,
+   `kernel.o`, and `kernel.so` from one Scheduled LoopIR.
+2. `schedforge-aot run` loads `kernel.so` with `dlopen`, resolves the versioned
+   C ABI symbol, executes real inputs, and validates error below `1e-3`.
+3. Corrupted packages and incompatible target, ABI, checksum, or shape metadata
+   fail before kernel invocation.
+4. A separate-process CTest compiles then runs an artifact successfully.
+5. Checked-in measurements compare cold JIT compilation with AOT load and run.
+6. Release, sanitizers, install, documentation, CI, commit, and push pass.
+
+## Open Questions
+None for v0.11. The package is intentionally a directory with a `.sfe` suffix;
+single-file archive transport can be added later without changing its manifest.

@@ -21,7 +21,7 @@ StableHLO subset into a multi-operation Tensor SSA graph, performs shape
 inference, graph canonicalization, fusion, dispatch formation, layout planning,
 bufferization, and workspace reuse, then lowers each dispatch through
 Structured Tensor Compute, Transform IR, scheduled Loop IR, tensorization, and
-LLVM 18 ORC JIT or native AVX2 execution.
+LLVM 18 ORC JIT, target-specific ELF AOT packages, or native AVX2 execution.
 
 The flagship workload is now a complete Llama/Mistral-style Transformer Decoder
 Layer. One StableHLO input is imported into one graph, compiled into one
@@ -57,8 +57,9 @@ flowchart TD
     F --> G["Transform IR + AutoScheduler"]
     G --> H["Scheduled Loop IR"]
     H --> I["Tensorization / AVX2 Intrinsics"]
-    I --> J["LLVM Vector IR + ORC JIT"]
-    J --> K["SchedForge Runtime"]
+    I --> J["LLVM Vector IR + ORC JIT / ELF AOT"]
+    J --> AOT["Versioned .sfe + kernel.so"]
+    AOT --> K["SchedForge Runtime"]
     K --> L["CPU + perf / PMU Feedback"]
 ```
 
@@ -88,6 +89,9 @@ flowchart TD
 - **Production LLVM study:** Scheduled LoopIR threads are preserved by ORC
   execution; assembly reports expose instructions, branches, address work,
   stack traffic, and spills, with a reproducible Native-versus-LLVM matrix.
+- **AOT deployment:** LLVM `TargetMachine` emits PIC ELF objects; versioned
+  `.sfe` packages carry target/shape/ABI guards and checksums, then execute in a
+  fresh process through `dlopen` without runtime LLVM compilation.
 - **Memory and layout compiler:** layout is part of tensor type; graph layout
   propagation, dispatch-boundary materialization, bufferization, lifetime
   analysis, aligned workspace reuse, and guarded shape specialization.
@@ -171,6 +175,12 @@ cmake -S . -B build -G Ninja \
 
 # Execute through LLVM ORC JIT
 ./build/schedforge-run --backend=llvm --M=256 --N=256 --K=256
+
+# Compile, inspect, and execute a target-specific AOT package
+./build/schedforge-aot compile --M=128 --N=128 --K=128 \
+  --output=results/matmul_128.sfe
+./build/schedforge-aot inspect --artifact=results/matmul_128.sfe
+./build/schedforge-aot run --artifact=results/matmul_128.sfe --repetitions=10
 
 # Run calibrated auto-scheduling
 ./build/schedforge-bench --M=192 --N=192 --K=192 \
@@ -278,6 +288,8 @@ inspectable and verifiable before target lowering.
 | `schedforge-decoder` | Compile and execute a complete Dense or MoE Decoder Layer |
 | `schedforge-decoder-bench` | Run realistic Decoder and whole-plan studies |
 | `schedforge-codegen-study` | Compare Native and LLVM code quality from identical LoopIR |
+| `schedforge-aot` | Compile, inspect, and execute target-specific `.sfe` AOT packages |
+| `schedforge-aot-study` | Measure JIT compile versus AOT compile/load/run costs |
 
 ## Decoder Layer Compiler Demo
 
@@ -336,6 +348,23 @@ The specialized native paths remain **2.1-3.1× faster**, and the emitted fused
 Attention assembly still contains a vector spill pattern. These negative code-
 quality results are first-class evidence, not hidden limitations. See
 `results/llvm_codegen_study.csv` and `results/fused_attention_llvm.csv`.
+
+## AOT Executable Deployment
+
+SchedForge 0.11 lowers the same optimized Scheduled LoopIR through LLVM 18
+`TargetMachine` into a PIC ELF relocatable object, links a loadable
+`kernel.so`, and writes a versioned `.sfe` directory. Its manifest guards the
+ABI, exact MatMul shape, target triple, host CPU, and checksums for LoopIR,
+object code, and shared code. The same invariants are embedded in `kernel.so`
+and cross-checked before invocation. `schedforge-aot run` uses `dlopen`/`dlsym`;
+it does not invoke LLVM compilation at runtime.
+
+On the recorded Intel Core i5-14600K, AOT load latency was **0.064-0.081 ms**
+for `64/128/256³`, and all outputs remained below `6e-6` maximum error. Direct
+AOT execution measured **0.007/0.137/0.844 ms**. The ORC comparison includes
+its current host worker-thread wrapper even at one thread, so this is deployment
+overhead evidence, not a claim that object emission alone improves machine code.
+See `results/aot_deployment.csv` and [AOT deployment](docs/AOT_DEPLOYMENT.md).
 
 ## MoE Compiler Demo
 
@@ -449,6 +478,9 @@ scripts/               Hardware-counter helpers
   not an implementation or performance claim for GPU FlashAttention-2.
 - Paged KV allocation, BF16/INT8 attention, dropout/backward, distributed
   attention, and spill-free native-parity fused LLVM code remain future work.
+- AOT format v1 is same-target, shape-specialized FP32 MatMul and one runtime
+  thread; whole-graph constant relocation and multi-kernel dispatch remain
+  future deployment work.
 - The simulator is a diagnostic model, not a performance-selection oracle or a
   cycle-accurate Intel out-of-order simulator.
 - Performance numbers depend on CPU, frequency policy, compiler, workload, and
@@ -462,6 +494,7 @@ scripts/               Hardware-counter helpers
 - [MoE compiler pipeline](docs/MOE_COMPILER.md)
 - [Attention compiler pipeline](docs/ATTENTION_COMPILER.md)
 - [Decoder Layer compiler pipeline](docs/DECODER_COMPILER.md)
+- [AOT executable deployment](docs/AOT_DEPLOYMENT.md)
 - [Experiment design](docs/EXPERIMENT.md)
 - [Final experiment report](results/FINAL_REPORT.md)
 - [Architecture decisions](docs/decisions/)

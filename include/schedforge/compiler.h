@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace schedforge {
 
@@ -135,6 +136,60 @@ public:
     LLVMJITResult benchmark(const LoopIR& loop, const TensorData& data,
                             int warmup, int repetitions) const;
 };
+
+struct AOTObject {
+    std::string symbol = "schedforge_matmul_v1";
+    std::string target_triple;
+    std::string target_cpu;
+    std::string llvm_ir;
+    std::string assembly;
+    std::vector<std::uint8_t> object_code;
+    AssemblyReport assembly_report;
+    double compile_milliseconds = 0.0;
+};
+
+class LLVMAOTBackend {
+public:
+    bool available() const;
+    AOTObject compile(const LoopIR& loop) const;
+};
+
+struct AOTManifest {
+    int format_version = 1;
+    std::string schedforge_version = "0.11.0";
+    std::string abi = "schedforge_matmul_v1";
+    std::string symbol = "schedforge_matmul_v1";
+    std::string target_triple;
+    std::string target_cpu;
+    Problem problem;
+    int threads = 1;
+    std::string loop_checksum;
+    std::string object_checksum;
+    std::string shared_object_checksum;
+    std::string dump() const;
+    static AOTManifest parse(const std::string& text);
+};
+
+struct AOTPackageResult {
+    AOTManifest manifest;
+    double compile_milliseconds = 0.0;
+    double link_milliseconds = 0.0;
+    std::filesystem::path path;
+};
+
+struct AOTBenchmarkResult {
+    double load_milliseconds = 0.0;
+    double execution_milliseconds = 0.0;
+    double gflops = 0.0;
+    double max_error = 0.0;
+};
+
+AOTPackageResult create_aot_package(const LoopIR& loop,
+                                    const std::filesystem::path& path);
+AOTManifest inspect_aot_package(const std::filesystem::path& path);
+AOTBenchmarkResult benchmark_aot_package(const std::filesystem::path& path,
+                                         const TensorData& data,
+                                         int warmup, int repetitions);
 
 struct CostBreakdown {
     double compute_cycles = 0.0;
