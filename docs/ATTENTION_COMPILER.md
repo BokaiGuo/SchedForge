@@ -115,8 +115,11 @@ multiple appends. Decode accepts any cache length within the compiled `Sk`
 guard. Split-KV computes partial `(m, l, O)` states in parallel and merges them
 exactly, enabling GQA and MQA head sharing.
 
-Paged KV is intentionally separate: Flash-style attention is a compute
-algorithm, while paged KV is a storage/allocation strategy.
+Paged KV is implemented as a storage/allocation strategy in
+`next_milestones.h`. It maintains a logical page table over physical pages,
+supports append and active-page guards, and gathers into the existing exact
+decode runtime. Direct page-aware tiled traversal is intentionally kept as a
+separate optimization from the attention algorithm.
 
 ## Simulation and Measurement
 

@@ -2,6 +2,29 @@
 
 All notable changes to SchedForge are documented here.
 
+## [0.12.0-0.16.0] - 2026-08-20
+
+### Added
+
+- v0.12 Paged KV page tables, physical-page allocation, boundary-safe append,
+  truncate/recycle, logical gather, active-page release guards, and exact decode integration.
+- v0.13 per-output-channel INT8 weight-only MatMul with FP32 accumulation,
+  bias/ReLU epilogues, reference validation, and measured study output.
+- v0.14 real host-memory transfer tuning over chunk sizes and worker counts,
+  with copy validation and bandwidth reporting.
+- v0.15 ARM NEON intrinsic source generation and compile-time capability probe.
+  Non-ARM hosts report unavailable rather than claiming NEON execution.
+- v0.16 deterministic LoopIR fuzzing with rejection/failure accounting,
+  numerical invariants, standalone CLI, and CTest coverage.
+
+### Evidence Boundaries
+
+- The current host is x86_64: NEON source generation is implemented, but ARM
+  execution is not claimed without an ARM build/host.
+- INT8 currently covers weight-only MatMul, not the complete Decoder graph.
+- Paged decode currently gathers pages into the existing exact attention kernel;
+  direct page-aware tiled traversal remains a future optimization.
+
 ## [0.11.0] - 2026-08-16
 
 ### Added

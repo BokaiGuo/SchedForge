@@ -5,6 +5,7 @@
 #include "schedforge/moe_compiler.h"
 #include "schedforge/attention_compiler.h"
 #include "schedforge/decoder_compiler.h"
+#include "schedforge/next_milestones.h"
 
 #include <algorithm>
 #include <cmath>
@@ -362,6 +363,57 @@ void test_aot_deployment() {
         rejected = true;
     }
     require(rejected, "aot v1 rejects unmanifested graph epilogues");
+}
+
+void test_next_milestones() {
+    schedforge::PagedKVConfig paged_config{1, 2, 4, 4, 4, 12};
+    auto paged = schedforge::make_paged_kv_cache(paged_config);
+    std::vector<float> keys(2 * 7 * 4), values(2 * 7 * 4);
+    std::iota(keys.begin(), keys.end(), 0.0F);
+    std::iota(values.begin(), values.end(), 1.0F);
+    schedforge::append_paged_kv(paged, keys, values, 7);
+    require(paged.page_table.size() == 2 && paged.length == 7,
+            "paged kv allocation and append");
+    const auto flat = schedforge::gather_paged_kv(paged);
+    require(flat.length == 7 && flat.keys == keys && flat.values == values,
+            "paged kv gather preserves logical order");
+    bool rejected = false;
+    try {
+        schedforge::release_paged_kv_pages(paged, {paged.page_table.front()});
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    require(rejected, "paged kv active page guard");
+    const auto pages_before_truncate = paged.page_table.size();
+    schedforge::truncate_paged_kv(paged, 3);
+    require(paged.length == 3 && paged.page_table.size() < pages_before_truncate &&
+            !paged.free_pages.empty(), "paged kv truncate releases tail pages");
+
+    schedforge::QuantizedMatMulConfig quant_config{7, 9, 5, true, true, true};
+    std::vector<float> input(35, 0.25F), weights(45, 0.2F), bias(9, 0.1F);
+    const auto quantized = schedforge::quantize_matmul_weights(weights, quant_config);
+    const auto quantized_result = schedforge::execute_quantized_matmul(
+        quant_config, input, quantized, bias, 0, 2);
+    require(quantized_result.max_error < 0.01 && quantized_result.gflops > 0.0,
+            "int8 per-channel matmul");
+    quant_config.per_channel = false;
+    const auto tensor_quantized = schedforge::quantize_matmul_weights(weights, quant_config);
+    require(tensor_quantized.scales.size() == 1 && tensor_quantized.scales.front() < 1.0F,
+            "int8 per-tensor scale");
+
+    std::vector<std::uint8_t> transfer(1U << 20U, 7);
+    const auto schedule = schedforge::tune_transfer_schedule(transfer, 2, 1);
+    const auto transfer_result = schedforge::benchmark_transfer(transfer, schedule, 2);
+    require(transfer_result.bytes == transfer.size() &&
+            transfer_result.gigabytes_per_second > 0.0,
+            "transfer tuning executes and validates");
+
+    const auto neon = schedforge::inspect_neon_codegen();
+    require(neon.source.find("arm_neon.h") != std::string::npos &&
+            neon.source.find("vfmaq") != std::string::npos,
+            "neon source generation");
+    const auto fuzz = schedforge::run_schedforge_fuzz(19, 128);
+    require(fuzz.failures == 0 && fuzz.passed > 0, "compiler fuzz invariants");
 }
 
 void test_graph_compiler() {
@@ -848,6 +900,7 @@ int main() {
         test_simulator_and_search();
         test_compiler_architecture();
         test_aot_deployment();
+        test_next_milestones();
         test_graph_compiler();
         test_moe_compiler();
         test_attention_compiler();

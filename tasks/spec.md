@@ -1,64 +1,47 @@
-# Spec: SchedForge v0.11 AOT Executable Deployment
+# Spec: SchedForge v0.12-v0.16 Runtime and Validation Line
 
 ## Objective
-Turn Scheduled LoopIR into a portable-on-the-same-target deployment artifact
-instead of requiring process-local ORC JIT compilation. A `.sfe` package must
-contain a versioned manifest, target and shape guards, the canonical schedule,
-LLVM object code, a loadable shared library, and enough metadata for an
-independent runtime process to validate and invoke the exported kernel.
-
-## Tech Stack
-C++20, CMake, LLVM 18 IRBuilder/O3/TargetMachine object emission, ELF shared
-objects, POSIX `dlopen`/`dlsym`, existing Scheduled LoopIR and TensorData.
+Complete the next five runtime/compiler milestones as tested vertical slices:
+Paged KV storage and decode, quantized FP32-output MatMul, measured transfer
+tuning, ARM NEON codegen inspection with a real intrinsic source path, and
+deterministic compiler fuzzing. Every slice must execute real code or clearly
+report unavailable host hardware; proxy-only results cannot be labeled as
+hardware validation.
 
 ## Commands
-Build: `cmake -S . -B build-v011 -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build-v011 --parallel`
-Test: `ctest --test-dir build-v011 --output-on-failure`
-Compile: `./build-v011/schedforge-aot compile --M=128 --N=128 --K=128 --output=results/matmul_128.sfe`
-Inspect: `./build-v011/schedforge-aot inspect --artifact=results/matmul_128.sfe`
-Run: `./build-v011/schedforge-aot run --artifact=results/matmul_128.sfe --repetitions=10`
-Study: `./build-v011/schedforge-aot-study --output=results/aot_deployment.csv`
+Build: `cmake -S . -B build-v016 -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build-v016 --parallel`
+Test: `ctest --test-dir build-v016 --output-on-failure`
+Study: `./build-v016/schedforge-next-study`
+Fuzz: `./build-v016/schedforge-fuzz --iterations=1000 --seed=1`
+Sanitizers: `cmake -S . -B build-v016-asan -DSCHEDFORGE_ENABLE_SANITIZERS=ON -DCMAKE_BUILD_TYPE=Debug`
 
-## Project Structure
-`include/schedforge/compiler.h`: public AOT artifact, manifest, compiler, and runtime APIs.
-`src/llvm_backend.cpp`: shared LoopIR-to-LLVM lowering plus ELF object emission.
-`src/aot_runtime.cpp`: `.sfe` package persistence, target guards, loading, execution.
-`tools/schedforge-aot.cpp`: compile, inspect, and run deployment CLI.
-`tools/schedforge-aot-study.cpp`: measured JIT-versus-AOT evidence.
-`tests/test_schedforge.cpp`: object, package, guard, load, and correctness tests.
-
-## Code Style
-Use typed value objects, RAII for dynamic-library handles, deterministic
-line-oriented manifests, atomic package replacement, and explicit errors for
-ABI, target, shape, or artifact mismatches.
-
-## Testing Strategy
-Unit-test ELF magic, manifest round trips, target/shape guards, exported symbol
-lookup, numerical correctness, and repeated loads. Run the CLI in a separate
-process through CTest so deployment evidence cannot accidentally reuse the ORC
-cache. Run Release, ASan/UBSan, install, and the host AOT study.
+## Implemented Slices
+- v0.12: page-table KV allocation, non-contiguous physical pages, append,
+  truncate/recycle, active-page guards, gather, and decode execution through the existing exact
+  attention runtime.
+- v0.13: per-channel INT8 weight quantization and real FP32-output MatMul with
+  reference validation and measured latency/GFLOPS.
+- v0.14: chunk/worker transfer schedule search over real memory copies with
+  destination validation and measured bandwidth.
+- v0.15: NEON intrinsic source generation and compile-time ARM detection. The
+  x86 host reports NEON unavailable instead of fabricating hardware results.
+- v0.16: deterministic randomized LoopIR generation, rejection accounting,
+  numerical invariants, CTest integration, and standalone fuzz CLI.
 
 ## Boundaries
-- Always: object bytes come from LLVM TargetMachine object emission.
-- Always: runtime loads prebuilt code without invoking LLVM compilation.
-- Always: validate format version, ABI, host target, problem shape, and checksums.
-- Never: describe text-only `.sfe` plans as AOT machine-code deployment.
-- Never: claim cross-ISA portability; v0.11 artifacts are target-specific.
-- Never: accept GELU/residual LoopIR until the manifest encodes their data ABI.
-- Future: Paged KV, quantized Decoder, transfer tuning, NEON validation, and
-  fuzzing remain v0.12-v0.16 work.
+- Always: separate measured hardware facts, generated source, and unavailable targets.
+- Never: claim NEON machine-code execution on this x86 host.
+- Never: call transfer tuning a NUMA benchmark; it is host-memory copy tuning.
+- Never: call INT8 weight-only MatMul a complete quantized Decoder until all
+  Decoder projections and attention paths consume quantized constants.
+- Future: full quantized Decoder graph lowering, cross-target NEON execution,
+  Paged KV direct tiled traversal without gather, and libFuzzer corpus minimization.
 
 ## Success Criteria
-1. `schedforge-aot compile` emits a `.sfe` directory containing `manifest.sfe`,
-   `kernel.o`, and `kernel.so` from one Scheduled LoopIR.
-2. `schedforge-aot run` loads `kernel.so` with `dlopen`, resolves the versioned
-   C ABI symbol, executes real inputs, and validates error below `1e-3`.
-3. Corrupted packages and incompatible target, ABI, checksum, or shape metadata
-   fail before kernel invocation.
-4. A separate-process CTest compiles then runs an artifact successfully.
-5. Checked-in measurements compare cold JIT compilation with AOT load and run.
-6. Release, sanitizers, install, documentation, CI, commit, and push pass.
-
-## Open Questions
-None for v0.11. The package is intentionally a directory with a `.sfe` suffix;
-single-file archive transport can be added later without changing its manifest.
+1. All five APIs compile, execute, and have regression tests.
+2. Paged KV preserves logical token order under page boundaries.
+3. INT8 output error is below `1e-2` on the checked-in test shape.
+4. Transfer tuning reports positive measured bandwidth and validates bytes.
+5. NEON report contains intrinsic source and honest host capability status.
+6. 128+ deterministic fuzz cases pass with zero invariant failures.
+7. Release, ASan/UBSan, install, CI, README, report, and changelog are updated.

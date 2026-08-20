@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(SchedForge VERSION 0.11.0 LANGUAGES CXX)
+project(SchedForge VERSION 0.16.0 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -37,6 +37,7 @@ add_library(schedforge
     src/decoder_compiler.cpp
     src/llvm_backend.cpp
     src/aot_runtime.cpp
+    src/next_milestones.cpp
     src/runtime.cpp
     src/simulator.cpp
     src/autoscheduler.cpp
@@ -88,6 +89,10 @@ add_executable(schedforge-aot tools/schedforge-aot.cpp)
 target_link_libraries(schedforge-aot PRIVATE schedforge)
 add_executable(schedforge-aot-study tools/schedforge-aot-study.cpp)
 target_link_libraries(schedforge-aot-study PRIVATE schedforge)
+add_executable(schedforge-next-study tools/schedforge-next-study.cpp)
+target_link_libraries(schedforge-next-study PRIVATE schedforge)
+add_executable(schedforge-fuzz tools/schedforge-fuzz.cpp)
+target_link_libraries(schedforge-fuzz PRIVATE schedforge)
 
 enable_testing()
 add_executable(schedforge-tests tests/test_schedforge.cpp)
@@ -101,6 +106,8 @@ set_tests_properties(schedforge-aot-compile PROPERTIES FIXTURES_SETUP schedforge
 add_test(NAME schedforge-aot-run COMMAND schedforge-aot run
     --artifact=${CMAKE_CURRENT_BINARY_DIR}/ctest-matmul.sfe --warmup=0 --repetitions=1)
 set_tests_properties(schedforge-aot-run PROPERTIES FIXTURES_REQUIRED schedforge-aot-artifact)
+add_test(NAME schedforge-next-study COMMAND schedforge-next-study --quick)
+add_test(NAME schedforge-fuzz COMMAND schedforge-fuzz --iterations=128 --seed=17)
 
 install(TARGETS schedforge
     EXPORT SchedForgeTargets
@@ -125,6 +132,8 @@ install(TARGETS
     schedforge-codegen-study
     schedforge-aot
     schedforge-aot-study
+    schedforge-next-study
+    schedforge-fuzz
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 install(DIRECTORY include/schedforge DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})

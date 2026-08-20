@@ -127,3 +127,9 @@ jobs:
             --output=build/codegen.csv --attention-output=build/fused_attention.csv
           grep -q "native_gflops_over_llvm" build/codegen.csv
           grep -q "llvm_speed_fraction" build/fused_attention.csv
+
+      - name: Smoke test v0.12-v0.16 runtime line
+        run: |
+          ./build/schedforge-next-study --quick
+          test -s results/next_milestones.csv
+          ./build/schedforge-fuzz --iterations=128 --seed=17

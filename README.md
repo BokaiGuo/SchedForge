@@ -290,6 +290,28 @@ inspectable and verifiable before target lowering.
 | `schedforge-codegen-study` | Compare Native and LLVM code quality from identical LoopIR |
 | `schedforge-aot` | Compile, inspect, and execute target-specific `.sfe` AOT packages |
 | `schedforge-aot-study` | Measure JIT compile versus AOT compile/load/run costs |
+| `schedforge-next-study` | Run Paged KV, INT8, transfer, and NEON capability studies |
+| `schedforge-fuzz` | Run deterministic LoopIR and numerical invariant fuzzing |
+
+## v0.12-v0.16 Runtime Line
+
+The next milestone line is implemented as executable, testable slices rather
+than simulator claims. v0.12 adds non-contiguous physical-page KV storage and
+exact decode integration; v0.13 adds per-channel INT8 weight-only MatMul with
+FP32 output; v0.14 tunes real host-memory copies over chunk and worker choices;
+v0.15 generates ARM NEON intrinsic source and reports whether the current host
+can execute it; v0.16 fuzzes random LoopIR shapes/schedules against numerical
+references.
+
+```bash
+./build/schedforge-next-study
+./build/schedforge-fuzz --iterations=1000 --seed=1
+```
+
+The checked-in `results/next_milestones.csv` records the current host study.
+This machine is x86_64, so NEON is reported as unavailable; no ARM performance
+claim is made. INT8 is currently a weight-only MatMul slice, and Paged KV uses a
+validated gather bridge into the exact existing attention runtime.
 
 ## Decoder Layer Compiler Demo
 
@@ -481,6 +503,11 @@ scripts/               Hardware-counter helpers
 - AOT format v1 is same-target, shape-specialized FP32 MatMul and one runtime
   thread; whole-graph constant relocation and multi-kernel dispatch remain
   future deployment work.
+- v0.13 INT8 is weight-only MatMul, not yet a complete quantized Decoder.
+- v0.15 NEON source generation is present, but this x86_64 host cannot validate
+  ARM execution or performance.
+- v0.12 Paged KV currently gathers non-contiguous pages before attention; direct
+  page-aware tiled traversal remains a performance follow-up.
 - The simulator is a diagnostic model, not a performance-selection oracle or a
   cycle-accurate Intel out-of-order simulator.
 - Performance numbers depend on CPU, frequency policy, compiler, workload, and

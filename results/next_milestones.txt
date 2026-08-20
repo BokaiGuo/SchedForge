@@ -1,0 +1,5 @@
+version=0.16.0
+paged_kv=!sfg.paged_kv<pages=2, page_tokens=8, length=16, capacity=64, free=6> flat_length=16
+int8_ms=0.419513 int8_error=4.76837e-07
+transfer=chunk=16384,workers=4,non_temporal=0 gbps=41.8915
+neon=architecture=x86_64,compiled_for_neon=0,host_supports_neon=0,diagnostic=host build is not ARM NEON; use an AArch64 cross compiler for codegen validation

@@ -270,6 +270,24 @@ Therefore the execution difference measures current deployment/runtime overhead
 as well as code, and is not attributed solely to object emission. Raw values are
 stored in `results/aot_deployment.csv`.
 
+## v0.12-v0.16 Runtime Milestones
+
+The runtime line is implemented as executable slices and checked by the same
+Release and sanitizer suites:
+
+| Slice | Implemented evidence | Current boundary |
+|---|---|---|
+| v0.12 Paged KV | Page table, physical pages, append/gather, active-page guards, exact decode bridge | Decode gathers pages before the tiled kernel |
+| v0.13 INT8 | Per-channel weight-only INT8 MatMul, FP32 accumulation, bias/ReLU, error check | Complete quantized Decoder is not claimed |
+| v0.14 Transfer | Real memcpy chunk/worker search with destination validation and bandwidth | Host-memory copy tuning, not NUMA/RDMA |
+| v0.15 NEON | ARM NEON intrinsic source and compile-time capability report | Current x86_64 host cannot execute ARM code |
+| v0.16 Fuzzing | Random LoopIR generation, rejection accounting, numerical invariants, CTest CLI | libFuzzer corpus minimization remains future work |
+
+The checked-in `results/next_milestones.csv` records 16 logical KV tokens in
+two physical pages, INT8 error below `5e-7` on the study shape, positive measured
+transfer bandwidth, and an honest `neon_host=0` result on x86_64. The 128-case
+deterministic fuzz smoke completes with zero invariant failures.
+
 ## MoE Compiler Validation
 
 SchedForge 0.4 adds a single-host FP32 Top-2 MoE MLP compiler/runtime path. MoE
@@ -362,8 +380,9 @@ only selection and are preserved in `results/top_resolution_*`.
 - MoE quantization, heterogeneous-core placement, NUMA scheduling, block-sparse
   lowering, and distributed expert parallelism are outside this release.
 - Attention is a CPU cache-hierarchy Flash-style lowering, not GPU
-  FlashAttention-2. Paged KV, reduced-precision attention, backward/dropout,
-  distributed attention, and native-parity spill-free fused LLVM code are outside this release.
+  FlashAttention-2. Paged KV storage is implemented, while direct page-aware
+  traversal, reduced-precision attention, backward/dropout, distributed
+  attention, and native-parity spill-free fused LLVM code remain outside this release.
 - Decoder Layer execution is FP32. Compile-time weight concatenation is
   implemented, while true BF16/INT8 Decoder kernels remain future work.
 - AOT format v1 is same-target, shape-specialized FP32 MatMul with one runtime

@@ -287,6 +287,25 @@ vector=8;unroll=4;threads=8;pack=ab;prefetch=4;fuse=true;pin=true
 | `schedforge-codegen-study` | 从相同 LoopIR 对比 Native 与 LLVM 代码质量 |
 | `schedforge-aot` | 编译、检查并运行目标特化 `.sfe` AOT 包 |
 | `schedforge-aot-study` | 测量 JIT 编译与 AOT 编译、加载、执行成本 |
+| `schedforge-next-study` | 运行 Paged KV、INT8、Transfer 和 NEON 能力实验 |
+| `schedforge-fuzz` | 对 LoopIR 与数值不变量执行确定性 Fuzzing |
+
+## v0.12-v0.16 Runtime 里程碑线
+
+这条里程碑线全部落成可执行、可测试的切片，而不是模拟器宣传：v0.12 增加
+非连续物理页 KV 与精确 Decode 接入；v0.13 增加按输出通道缩放的 INT8
+Weight-only MatMul 和 FP32 输出；v0.14 在真实主机内存拷贝上搜索 Chunk/Worker
+调度；v0.15 生成 ARM NEON Intrinsic 源码并报告当前主机是否可执行；v0.16
+用随机 LoopIR Shape/Schedule 对照数值参考进行 Fuzzing。
+
+```bash
+./build/schedforge-next-study
+./build/schedforge-fuzz --iterations=1000 --seed=1
+```
+
+当前主机是 x86_64，因此 NEON 会诚实报告不可用，不声明 ARM 性能。INT8 当前
+是 Weight-only MatMul 切片；Paged KV 当前通过经过验证的 Gather Bridge 接入
+已有精确 Attention Runtime。
 
 ## Decoder Layer Compiler 实测 Demo
 
@@ -460,6 +479,10 @@ scripts/              性能计数器辅助脚本
   无 Spill 且达到 Native Parity 的 LLVM Fused Attention 尚未实现。
 - AOT Format v1 仅支持同目标、Shape 特化 FP32 MatMul 和单 Runtime Thread；
   Whole-Graph 常量重定位与多 Kernel Dispatch 仍属于后续工作。
+- v0.13 INT8 当前是 Weight-only MatMul，尚未覆盖完整量化 Decoder。
+- v0.15 已有 NEON 源码生成，但本 x86_64 主机不能验证 ARM 执行与性能。
+- v0.12 Paged KV 当前在 Attention 前 Gather 非连续页；直接分页 Tiled Traversal
+  仍是后续性能工作。
 - 模拟器只提供诊断信息，既不是性能选择裁判，也不会逐周期复现 Intel
   处理器的乱序执行。
 - 性能会受到 CPU 型号、频率策略、编译器版本、输入规模和后台负载影响，
