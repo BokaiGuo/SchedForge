@@ -117,9 +117,10 @@ exactly, enabling GQA and MQA head sharing.
 
 Paged KV is implemented as a storage/allocation strategy in
 `next_milestones.h`. It maintains a logical page table over physical pages,
-supports append and active-page guards, and gathers into the existing exact
-decode runtime. Direct page-aware tiled traversal is intentionally kept as a
-separate optimization from the attention algorithm.
+supports append, truncate/recycle, and active-page guards. Decode follows the
+logical page table directly and performs exact online softmax without a
+contiguous gather. `gather_paged_kv` remains available only for inspection and
+debug/reference workflows.
 
 ## Simulation and Measurement
 

@@ -1,2 +1,2 @@
-version,paged_tokens,paged_pages,int8_ms,int8_error,transfer_chunk,transfer_workers,transfer_gbps,neon_compiled,neon_host
-0.16.0,16,2,0.419513,4.76837e-07,16384,4,41.8915,0,0
+version,paged_tokens,paged_pages,paged_attention_error,paged_attention_ms,int8_ms,int8_error,decoder_int8_ms,decoder_int8_error,transfer_chunk,transfer_workers,transfer_gbps,neon_compiled,neon_host,neon_cross_compile
+0.17.0,16,2,0,0.000721,0.023896,2.38419e-07,0.004482,0.00172807,262144,1,43.0733,0,0,1

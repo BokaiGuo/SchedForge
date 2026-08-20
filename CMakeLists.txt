@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(SchedForge VERSION 0.16.0 LANGUAGES CXX)
+project(SchedForge VERSION 0.17.0 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)

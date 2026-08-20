@@ -1,4 +1,4 @@
-# Spec: SchedForge v0.12-v0.16 Runtime and Validation Line
+# Spec: SchedForge v0.12-v0.17 Runtime and Validation Line
 
 ## Objective
 Complete the next five runtime/compiler milestones as tested vertical slices:
@@ -17,25 +17,26 @@ Sanitizers: `cmake -S . -B build-v016-asan -DSCHEDFORGE_ENABLE_SANITIZERS=ON -DC
 
 ## Implemented Slices
 - v0.12: page-table KV allocation, non-contiguous physical pages, append,
-  truncate/recycle, active-page guards, gather, and decode execution through the existing exact
-  attention runtime.
+  truncate/recycle, active-page guards, and direct page-aware decode traversal.
 - v0.13: per-channel INT8 weight quantization and real FP32-output MatMul with
   reference validation and measured latency/GFLOPS.
 - v0.14: chunk/worker transfer schedule search over real memory copies with
   destination validation and measured bandwidth.
-- v0.15: NEON intrinsic source generation and compile-time ARM detection. The
-  x86 host reports NEON unavailable instead of fabricating hardware results.
+- v0.15: valid NEON intrinsic source generation and AArch64 freestanding syntax
+  cross-compilation. The x86 host reports runtime NEON unavailable.
 - v0.16: deterministic randomized LoopIR generation, rejection accounting,
   numerical invariants, CTest integration, and standalone fuzz CLI.
+- v0.17: Dense Decoder INT8 Q/K/V/O/Gate/Up/Down projections for prefill and
+  KV-cache Decode, direct paged traversal, and NEON cross-target syntax gates.
 
 ## Boundaries
 - Always: separate measured hardware facts, generated source, and unavailable targets.
 - Never: claim NEON machine-code execution on this x86 host.
 - Never: call transfer tuning a NUMA benchmark; it is host-memory copy tuning.
-- Never: call INT8 weight-only MatMul a complete quantized Decoder until all
-  Decoder projections and attention paths consume quantized constants.
-- Future: full quantized Decoder graph lowering, cross-target NEON execution,
-  Paged KV direct tiled traversal without gather, and libFuzzer corpus minimization.
+- Never: call Dense Decoder INT8 validation MoE expert quantization or ARM runtime
+  performance validation.
+- Future: MoE expert INT8 weights, cross-target NEON execution, and libFuzzer
+  corpus minimization.
 
 ## Success Criteria
 1. All five APIs compile, execute, and have regression tests.

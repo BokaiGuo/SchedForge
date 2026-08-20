@@ -2,6 +2,28 @@
 
 All notable changes to SchedForge are documented here.
 
+## [0.17.0] - 2026-08-20
+
+### Added
+
+- Direct page-aware online-softmax Decode traversal over non-contiguous KV pages;
+  the hot path no longer gathers pages into a contiguous cache.
+- Dense Decoder INT8 weight-only execution covering Q/K/V, output projection,
+  Gate/Up, and Down projections, including prefill and KV-cache Decode paths.
+- AArch64 NEON intrinsic source corrected to a valid matrix multiply microkernel
+  and checked with Clang cross-target syntax compilation using a freestanding probe.
+- Runtime study CSV now records direct paged-attention error/latency and NEON
+  cross-compilation status.
+
+### Evidence Boundaries
+
+- The current host is x86_64: NEON source is cross-compiled for syntax, but ARM
+  runtime performance is not claimed without an ARM host.
+- INT8 Decoder coverage is complete for the Dense path; MoE expert weights remain
+  on the existing FP32 runtime path.
+- Paged Decode traverses page tables directly; `gather_paged_kv` remains an
+  explicit inspection/debug utility, not part of the execution hot path.
+
 ## [0.12.0-0.16.0] - 2026-08-20
 
 ### Added
@@ -17,13 +39,11 @@ All notable changes to SchedForge are documented here.
 - v0.16 deterministic LoopIR fuzzing with rejection/failure accounting,
   numerical invariants, standalone CLI, and CTest coverage.
 
-### Evidence Boundaries
+### Historical Evidence Boundaries
 
 - The current host is x86_64: NEON source generation is implemented, but ARM
   execution is not claimed without an ARM build/host.
-- INT8 currently covers weight-only MatMul, not the complete Decoder graph.
-- Paged decode currently gathers pages into the existing exact attention kernel;
-  direct page-aware tiled traversal remains a future optimization.
+- The v0.17 release resolves the former INT8 Decoder and paged-gather boundaries.
 
 ## [0.11.0] - 2026-08-16
 

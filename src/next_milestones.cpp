@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <numeric>
 #include <random>
@@ -91,6 +93,295 @@ std::vector<float> quantized_reference(const QuantizedMatMulConfig& config,
             output[static_cast<std::size_t>(row) * config.n + column] = accumulator;
         }
     return output;
+}
+
+void validate_paged_attention(const AttentionExecutablePlan& plan,
+                              const std::vector<float>& query,
+                              const PagedKVCache& cache) {
+    const auto& config = plan.config;
+    if (cache.length <= 0 || cache.length > config.sequence_kv)
+        throw std::invalid_argument("paged KV length violates compiled guard");
+    if (config.causal && config.sequence_query > cache.length)
+        throw std::invalid_argument("paged causal query exceeds available KV length");
+    if (cache.config.batch != config.batch || cache.config.kv_heads != config.kv_heads ||
+        cache.config.head_dim != config.head_dim ||
+        cache.config.head_dim_value != config.head_dim_value)
+        throw std::invalid_argument("paged KV shape violates compiled guard");
+    if (config.query_heads % config.kv_heads != 0)
+        throw std::invalid_argument("invalid grouped-query attention configuration");
+    const std::size_t query_values = static_cast<std::size_t>(config.batch) *
+        config.query_heads * config.sequence_query * config.head_dim;
+    if (query.size() != query_values)
+        throw std::invalid_argument("paged attention query shape mismatch");
+    const int required_pages = (cache.length + cache.config.page_tokens - 1) /
+        cache.config.page_tokens;
+    if (static_cast<int>(cache.page_table.size()) < required_pages)
+        throw std::invalid_argument("paged KV page table is incomplete");
+}
+
+const float* paged_pointer(const PagedKVCache& cache, const std::vector<float>& storage,
+                           int batch, int head, int token, int width) {
+    const int physical_page = cache.page_table[static_cast<std::size_t>(
+        token / cache.config.page_tokens)];
+    const int page_token = token % cache.config.page_tokens;
+    return storage.data() + page_offset(cache.config, physical_page, batch, head,
+                                        page_token, 0, width);
+}
+
+float scalar_dot(const float* lhs, const float* rhs, int size) {
+    float result = 0.0F;
+    for (int index = 0; index < size; ++index) result += lhs[index] * rhs[index];
+    return result;
+}
+
+std::vector<float> paged_attention_online(const AttentionExecutablePlan& plan,
+                                          const std::vector<float>& query,
+                                          const PagedKVCache& cache) {
+    const auto& config = plan.config;
+    const float scale = config.scale > 0.0F ? config.scale :
+        1.0F / std::sqrt(static_cast<float>(config.head_dim));
+    std::vector<float> output(static_cast<std::size_t>(config.batch) *
+        config.query_heads * config.sequence_query * config.head_dim_value, 0.0F);
+    for (int batch = 0; batch < config.batch; ++batch)
+        for (int head = 0; head < config.query_heads; ++head) {
+            const int kv_head = head * config.kv_heads / config.query_heads;
+            for (int query_token = 0; query_token < config.sequence_query; ++query_token) {
+                const float* query_row = query.data() +
+                    (((static_cast<std::size_t>(batch) * config.query_heads + head) *
+                      config.sequence_query + query_token) * config.head_dim);
+                float maximum = -std::numeric_limits<float>::infinity();
+                float denominator = 0.0F;
+                std::vector<float> numerator(static_cast<std::size_t>(config.head_dim_value), 0.0F);
+                const int absolute_query = cache.length - config.sequence_query + query_token;
+                for (int key_token = 0; key_token < cache.length; ++key_token) {
+                    if (config.causal && key_token > absolute_query) continue;
+                    const float score = scalar_dot(
+                        query_row, paged_pointer(cache, cache.keys, batch, kv_head,
+                                                 key_token, config.head_dim),
+                        config.head_dim) * scale;
+                    const float next_maximum = std::max(maximum, score);
+                    const float old_scale = std::isfinite(maximum)
+                        ? std::exp(maximum - next_maximum) : 0.0F;
+                    const float probability = std::exp(score - next_maximum);
+                    denominator = denominator * old_scale + probability;
+                    const float* value = paged_pointer(cache, cache.values, batch, kv_head,
+                                                       key_token, config.head_dim_value);
+                    for (int dim = 0; dim < config.head_dim_value; ++dim)
+                        numerator[static_cast<std::size_t>(dim)] =
+                            numerator[static_cast<std::size_t>(dim)] * old_scale +
+                            probability * value[dim];
+                    maximum = next_maximum;
+                }
+                const std::size_t output_base =
+                    (((static_cast<std::size_t>(batch) * config.query_heads + head) *
+                      config.sequence_query + query_token) * config.head_dim_value);
+                for (int dim = 0; dim < config.head_dim_value; ++dim)
+                    output[output_base + dim] = numerator[static_cast<std::size_t>(dim)] /
+                        denominator;
+            }
+        }
+    return output;
+}
+
+std::vector<float> paged_attention_reference(const AttentionExecutablePlan& plan,
+                                             const std::vector<float>& query,
+                                             const PagedKVCache& cache) {
+    const auto& config = plan.config;
+    const float scale = config.scale > 0.0F ? config.scale :
+        1.0F / std::sqrt(static_cast<float>(config.head_dim));
+    std::vector<float> output(static_cast<std::size_t>(config.batch) *
+        config.query_heads * config.sequence_query * config.head_dim_value, 0.0F);
+    for (int batch = 0; batch < config.batch; ++batch)
+        for (int head = 0; head < config.query_heads; ++head) {
+            const int kv_head = head * config.kv_heads / config.query_heads;
+            for (int query_token = 0; query_token < config.sequence_query; ++query_token) {
+                const float* query_row = query.data() +
+                    (((static_cast<std::size_t>(batch) * config.query_heads + head) *
+                      config.sequence_query + query_token) * config.head_dim);
+                const int absolute_query = cache.length - config.sequence_query + query_token;
+                float maximum = -std::numeric_limits<float>::infinity();
+                for (int key_token = 0; key_token < cache.length; ++key_token) {
+                    if (config.causal && key_token > absolute_query) continue;
+                    maximum = std::max(maximum, scalar_dot(
+                        query_row, paged_pointer(cache, cache.keys, batch, kv_head,
+                                                 key_token, config.head_dim),
+                        config.head_dim) * scale);
+                }
+                float denominator = 0.0F;
+                const std::size_t output_base =
+                    (((static_cast<std::size_t>(batch) * config.query_heads + head) *
+                      config.sequence_query + query_token) * config.head_dim_value);
+                for (int key_token = 0; key_token < cache.length; ++key_token) {
+                    if (config.causal && key_token > absolute_query) continue;
+                    const float probability = std::exp(scalar_dot(
+                        query_row, paged_pointer(cache, cache.keys, batch, kv_head,
+                                                 key_token, config.head_dim),
+                        config.head_dim) * scale - maximum);
+                    denominator += probability;
+                    const float* value = paged_pointer(cache, cache.values, batch, kv_head,
+                                                       key_token, config.head_dim_value);
+                    for (int dim = 0; dim < config.head_dim_value; ++dim)
+                        output[output_base + dim] += probability * value[dim];
+                }
+                for (int dim = 0; dim < config.head_dim_value; ++dim)
+                    output[output_base + dim] /= denominator;
+            }
+        }
+    return output;
+}
+
+std::vector<float> transpose_decoder_weight(const std::vector<float>& weight,
+                                            int input_width, int output_width) {
+    if (weight.size() != static_cast<std::size_t>(input_width) * output_width)
+        throw std::invalid_argument("decoder weight shape mismatch");
+    std::vector<float> transposed(weight.size());
+    for (int input = 0; input < input_width; ++input)
+        for (int output = 0; output < output_width; ++output)
+            transposed[static_cast<std::size_t>(output) * input_width + input] =
+                weight[static_cast<std::size_t>(input) * output_width + output];
+    return transposed;
+}
+
+QuantizedMatMulWeights quantize_decoder_matrix(const std::vector<float>& weight,
+                                               int input_width, int output_width,
+                                               bool per_channel) {
+    return quantize_matmul_weights(transpose_decoder_weight(weight, input_width, output_width),
+        {1, output_width, input_width, false, false, per_channel});
+}
+
+std::vector<float> decoder_rms_norm(const std::vector<float>& input,
+                                    const std::vector<float>& weight,
+                                    int rows, int width, float epsilon) {
+    if (input.size() != static_cast<std::size_t>(rows) * width ||
+        weight.size() != static_cast<std::size_t>(width))
+        throw std::invalid_argument("quantized decoder RMSNorm shape mismatch");
+    std::vector<float> output(input.size());
+    for (int row = 0; row < rows; ++row) {
+        double square_sum = 0.0;
+        for (int column = 0; column < width; ++column) {
+            const float value = input[static_cast<std::size_t>(row) * width + column];
+            square_sum += static_cast<double>(value) * value;
+        }
+        const float inverse = 1.0F / std::sqrt(
+            static_cast<float>(square_sum / width) + epsilon);
+        for (int column = 0; column < width; ++column)
+            output[static_cast<std::size_t>(row) * width + column] =
+                input[static_cast<std::size_t>(row) * width + column] * inverse * weight[column];
+    }
+    return output;
+}
+
+std::vector<float> decoder_quantized_project(const std::vector<float>& input,
+                                             const QuantizedMatMulWeights& weight,
+                                             int rows, int input_width,
+                                             int output_width) {
+    std::vector<float> output;
+    quantized_invoke({rows, output_width, input_width, false, false,
+                      weight.scales.size() > 1},
+                     input, weight, {}, output);
+    return output;
+}
+
+void decoder_apply_rope(std::vector<float>& tensor, int batch, int heads,
+                        int sequence, int head_dim, float theta) {
+    for (int batch_index = 0; batch_index < batch; ++batch_index)
+        for (int head = 0; head < heads; ++head)
+            for (int token = 0; token < sequence; ++token)
+                for (int dim = 0; dim + 1 < head_dim; dim += 2) {
+                    const float frequency = std::pow(theta,
+                        -static_cast<float>(dim) / static_cast<float>(head_dim));
+                    const float angle = static_cast<float>(token) * frequency;
+                    const std::size_t base = (((static_cast<std::size_t>(batch_index) * heads + head) *
+                                                sequence + token) * head_dim + dim);
+                    const float even = tensor[base];
+                    const float odd = tensor[base + 1];
+                    tensor[base] = even * std::cos(angle) - odd * std::sin(angle);
+                    tensor[base + 1] = even * std::sin(angle) + odd * std::cos(angle);
+                }
+}
+
+std::vector<float> row_major_to_heads(const std::vector<float>& input, int batch,
+                                      int sequence, int heads, int head_dim) {
+    std::vector<float> output(input.size());
+    for (int batch_index = 0; batch_index < batch; ++batch_index)
+        for (int token = 0; token < sequence; ++token)
+            for (int head = 0; head < heads; ++head)
+                for (int dim = 0; dim < head_dim; ++dim)
+                    output[(((static_cast<std::size_t>(batch_index) * heads + head) *
+                              sequence + token) * head_dim + dim)] =
+                        input[static_cast<std::size_t>(batch_index * sequence + token) *
+                              heads * head_dim + head * head_dim + dim];
+    return output;
+}
+
+std::vector<float> heads_to_row_major(const std::vector<float>& input, int batch,
+                                      int sequence, int heads, int head_dim) {
+    std::vector<float> output(input.size());
+    for (int batch_index = 0; batch_index < batch; ++batch_index)
+        for (int token = 0; token < sequence; ++token)
+            for (int head = 0; head < heads; ++head)
+                for (int dim = 0; dim < head_dim; ++dim)
+                    output[static_cast<std::size_t>(batch_index * sequence + token) *
+                           heads * head_dim + head * head_dim + dim] =
+                        input[(((static_cast<std::size_t>(batch_index) * heads + head) *
+                                sequence + token) * head_dim + dim)];
+    return output;
+}
+
+std::vector<float> add_vectors(const std::vector<float>& lhs,
+                               const std::vector<float>& rhs) {
+    if (lhs.size() != rhs.size()) throw std::invalid_argument("quantized decoder residual mismatch");
+    std::vector<float> output(lhs.size());
+    for (std::size_t index = 0; index < lhs.size(); ++index) output[index] = lhs[index] + rhs[index];
+    return output;
+}
+
+std::vector<float> execute_quantized_decoder_once(
+    const DecoderConfig& config, const DecoderData& data,
+    const QuantizedDecoderWeights& weights) {
+    if (config.ffn != DecoderFFNKind::Dense)
+        throw std::invalid_argument("INT8 decoder currently requires dense FFN weights");
+    const int rows = config.batch * config.sequence;
+    const int kv_width = config.kv_heads * config.head_dim;
+    const auto normalized1 = decoder_rms_norm(data.input, data.rms1_weight, rows,
+                                               config.hidden, config.rms_epsilon);
+    auto query = row_major_to_heads(decoder_quantized_project(
+        normalized1, weights.query, rows, config.hidden, config.hidden),
+        config.batch, config.sequence, config.query_heads, config.head_dim);
+    auto key = row_major_to_heads(decoder_quantized_project(
+        normalized1, weights.key, rows, config.hidden, kv_width),
+        config.batch, config.sequence, config.kv_heads, config.head_dim);
+    auto value = row_major_to_heads(decoder_quantized_project(
+        normalized1, weights.value, rows, config.hidden, kv_width),
+        config.batch, config.sequence, config.kv_heads, config.head_dim);
+    decoder_apply_rope(query, config.batch, config.query_heads, config.sequence,
+                       config.head_dim, config.rope_theta);
+    decoder_apply_rope(key, config.batch, config.kv_heads, config.sequence,
+                       config.head_dim, config.rope_theta);
+    AttentionData attention_data{query,
+        config.context_sequence > 0 ? data.cached_key : key,
+        config.context_sequence > 0 ? data.cached_value : value};
+    const AttentionConfig attention_config{config.batch, config.query_heads, config.kv_heads,
+        config.sequence, config.context_sequence > 0 ? config.context_sequence : config.sequence,
+        config.head_dim, config.head_dim, config.causal, 0.0F};
+    const auto attended = reference_attention(attention_config, attention_data);
+    const auto merged = heads_to_row_major(attended, config.batch, config.sequence,
+                                           config.query_heads, config.head_dim);
+    const auto projected = decoder_quantized_project(merged, weights.output, rows,
+                                                      config.hidden, config.hidden);
+    const auto attention_residual = add_vectors(projected, data.input);
+    const auto normalized2 = decoder_rms_norm(attention_residual, data.rms2_weight, rows,
+                                               config.hidden, config.rms_epsilon);
+    const auto gate = decoder_quantized_project(normalized2, weights.gate, rows,
+                                                 config.hidden, config.intermediate);
+    const auto up = decoder_quantized_project(normalized2, weights.up, rows,
+                                               config.hidden, config.intermediate);
+    std::vector<float> activated(gate.size());
+    for (std::size_t index = 0; index < gate.size(); ++index)
+        activated[index] = (gate[index] / (1.0F + std::exp(-gate[index]))) * up[index];
+    const auto down = decoder_quantized_project(activated, weights.down, rows,
+                                                 config.intermediate, config.hidden);
+    return add_vectors(attention_residual, down);
 }
 
 }  // namespace
@@ -217,8 +508,29 @@ KVCache gather_paged_kv(const PagedKVCache& cache) {
 AttentionBenchmarkResult execute_paged_decode_attention(
     const AttentionExecutablePlan& plan, const std::vector<float>& query,
     const PagedKVCache& cache, int warmup, int repetitions, bool validate_result) {
-    const auto flat = gather_paged_kv(cache);
-    return execute_decode_attention(plan, query, flat, warmup, repetitions, validate_result);
+    validate_paged_attention(plan, query, cache);
+    for (int iteration = 0; iteration < std::max(0, warmup); ++iteration)
+        (void)paged_attention_online(plan, query, cache);
+    std::vector<double> timings;
+    std::vector<float> output;
+    for (int iteration = 0; iteration < std::max(1, repetitions); ++iteration) {
+        const auto start = std::chrono::steady_clock::now();
+        output = paged_attention_online(plan, query, cache);
+        timings.push_back(std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start).count());
+    }
+    std::sort(timings.begin(), timings.end());
+    AttentionBenchmarkResult result;
+    result.milliseconds = std::accumulate(timings.begin(), timings.end(), 0.0) /
+        static_cast<double>(timings.size());
+    result.p50_milliseconds = timings[timings.size() / 2];
+    result.p95_milliseconds = timings[std::min(timings.size() - 1,
+        static_cast<std::size_t>(std::ceil(0.95 * static_cast<double>(timings.size())) - 1))];
+    result.output = std::move(output);
+    if (validate_result)
+        result.max_error = max_abs_error(result.output,
+            paged_attention_reference(plan, query, cache));
+    return result;
 }
 
 QuantizedMatMulWeights quantize_matmul_weights(const std::vector<float>& weights,
@@ -268,6 +580,45 @@ QuantizedMatMulResult execute_quantized_matmul(
     const double milliseconds = timings[timings.size() / 2];
     return {milliseconds, 2.0 * config.m * config.n * config.k / (milliseconds * 1.0e6),
             max_abs_error(output, quantized_reference(config, input, weights, bias)), output};
+}
+
+QuantizedDecoderWeights quantize_decoder_weights(const DecoderConfig& config,
+                                                  const DecoderData& data,
+                                                  bool per_channel) {
+    if (config.ffn != DecoderFFNKind::Dense)
+        throw std::invalid_argument("INT8 decoder currently requires dense FFN weights");
+    const int kv_width = config.kv_heads * config.head_dim;
+    return {
+        quantize_decoder_matrix(data.query_weight, config.hidden, config.hidden, per_channel),
+        quantize_decoder_matrix(data.key_weight, config.hidden, kv_width, per_channel),
+        quantize_decoder_matrix(data.value_weight, config.hidden, kv_width, per_channel),
+        quantize_decoder_matrix(data.output_weight, config.hidden, config.hidden, per_channel),
+        quantize_decoder_matrix(data.gate_weight, config.hidden, config.intermediate, per_channel),
+        quantize_decoder_matrix(data.up_weight, config.hidden, config.intermediate, per_channel),
+        quantize_decoder_matrix(data.down_weight, config.intermediate, config.hidden, per_channel)};
+}
+
+QuantizedDecoderResult execute_quantized_decoder_layer(
+    const DecoderConfig& config, const DecoderData& data,
+    const QuantizedDecoderWeights& weights, int warmup, int repetitions) {
+    for (int iteration = 0; iteration < std::max(0, warmup); ++iteration)
+        (void)execute_quantized_decoder_once(config, data, weights);
+    std::vector<double> timings;
+    std::vector<float> output;
+    for (int iteration = 0; iteration < std::max(1, repetitions); ++iteration) {
+        const auto start = std::chrono::steady_clock::now();
+        output = execute_quantized_decoder_once(config, data, weights);
+        timings.push_back(std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start).count());
+    }
+    std::sort(timings.begin(), timings.end());
+    QuantizedDecoderResult result;
+    result.milliseconds = timings[timings.size() / 2];
+    result.tokens_per_second = result.milliseconds > 0.0
+        ? static_cast<double>(config.batch * config.sequence) * 1000.0 / result.milliseconds : 0.0;
+    result.output = std::move(output);
+    result.max_error = max_abs_error(result.output, reference_decoder_layer(config, data));
+    return result;
 }
 
 std::string TransferSchedule::dump() const {
@@ -334,14 +685,18 @@ TransferSchedule tune_transfer_schedule(const std::vector<std::uint8_t>& source,
 }
 
 std::string generate_neon_matmul_source(int m, int n, int k) {
-    if (m <= 0 || n <= 0 || k <= 0) throw std::invalid_argument("invalid NEON source shape");
+    if (m <= 0 || n < 4 || k <= 0) throw std::invalid_argument("invalid NEON source shape");
     std::ostringstream out;
     out << "#include <arm_neon.h>\n"
         << "void schedforge_neon_matmul(const float* a, const float* b, float* c) {\n"
-        << "  float32x4_t acc = vdupq_n_f32(0.0f);\n"
-        << "  for (int kk = 0; kk < " << k << "; ++kk) {\n"
-        << "    acc = vfmaq_n_f32(acc, vld1q_f32(a + kk * " << n << "), b[kk]);\n"
-        << "  }\n  vst1q_f32(c, acc);\n}\n";
+        << "  for (int row = 0; row < " << m << "; ++row) {\n"
+        << "    for (int column = 0; column + 4 <= " << n << "; column += 4) {\n"
+        << "      float32x4_t acc = vdupq_n_f32(0.0f);\n"
+        << "      for (int kk = 0; kk < " << k << "; ++kk) {\n"
+        << "        acc = vfmaq_n_f32(acc, vld1q_f32(b + kk * " << n
+        << " + column), a[row * " << k << " + kk]);\n"
+        << "      }\n      vst1q_f32(c + row * " << n << " + column, acc);\n"
+        << "    }\n  }\n}\n";
     return out.str();
 }
 
@@ -364,13 +719,44 @@ NeonCodegenReport inspect_neon_codegen() {
     report.diagnostic = "host build is not ARM NEON; use an AArch64 cross compiler for codegen validation";
 #endif
     report.source = generate_neon_matmul_source();
+    for (const std::string candidate : {"/usr/bin/clang++-18", "/usr/bin/clang++",
+                                        "/usr/local/swift/usr/bin/clang++"}) {
+        if (!std::filesystem::exists(candidate)) continue;
+        report.cross_compile_attempted = true;
+        report.cross_compiler = candidate;
+        const auto unique = std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+        const auto source_path = std::filesystem::temp_directory_path() /
+            ("schedforge-neon-" + unique + ".cpp");
+        const auto diagnostic_path = source_path.string() + ".log";
+        {
+            std::ofstream source_file(source_path);
+            source_file << report.source;
+        }
+        const std::string command = candidate +
+            " -target aarch64-linux-gnu -march=armv8-a+simd -ffreestanding -fsyntax-only \"" +
+            source_path.string() + "\" >\"" + diagnostic_path + "\" 2>&1";
+        report.cross_compile_succeeded = std::system(command.c_str()) == 0;
+        std::ifstream diagnostic_file(diagnostic_path);
+        const std::string cross_diagnostic((std::istreambuf_iterator<char>(diagnostic_file)),
+                                           std::istreambuf_iterator<char>());
+        if (!cross_diagnostic.empty()) report.diagnostic += "; " + cross_diagnostic;
+        std::filesystem::remove(source_path);
+        std::filesystem::remove(diagnostic_path);
+        break;
+    }
+    if (!report.cross_compile_attempted)
+        report.diagnostic += "; no Clang cross compiler found";
     return report;
 }
 
 std::string NeonCodegenReport::dump() const {
     std::ostringstream out;
     out << "architecture=" << architecture << ",compiled_for_neon=" << compiled_for_neon
-        << ",host_supports_neon=" << host_supports_neon << ",diagnostic=" << diagnostic;
+        << ",host_supports_neon=" << host_supports_neon
+        << ",cross_compile_attempted=" << cross_compile_attempted
+        << ",cross_compile_succeeded=" << cross_compile_succeeded
+        << ",cross_compiler=" << cross_compiler << ",diagnostic=" << diagnostic;
     return out.str();
 }
 

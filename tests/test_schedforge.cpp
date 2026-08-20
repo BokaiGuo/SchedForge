@@ -389,6 +389,25 @@ void test_next_milestones() {
     require(paged.length == 3 && paged.page_table.size() < pages_before_truncate &&
             !paged.free_pages.empty(), "paged kv truncate releases tail pages");
 
+    const schedforge::AttentionConfig paged_attention_config{
+        1, 4, 2, 1, 7, 4, 4, true, 0.0F};
+    schedforge::AttentionPlanOptions paged_options;
+    paged_options.strategy = schedforge::AttentionLoweringStrategy::SplitKVDecode;
+    const auto paged_plan = schedforge::AttentionCompiler{}.compile(
+        paged_attention_config, paged_options);
+    std::vector<float> decode_query(16, 0.125F);
+    auto full_paged = schedforge::make_paged_kv_cache(paged_config);
+    schedforge::append_paged_kv(full_paged, keys, values, 7);
+    const auto paged_result = schedforge::execute_paged_decode_attention(
+        paged_plan, decode_query, full_paged, 0, 2, true);
+    auto contiguous = schedforge::make_kv_cache(paged_attention_config, 7);
+    schedforge::append_kv(contiguous, keys, values, 7);
+    const auto contiguous_result = schedforge::execute_decode_attention(
+        paged_plan, decode_query, contiguous, 0, 2, false);
+    require(paged_result.max_error < 1.0e-5 &&
+            schedforge::max_abs_error(paged_result.output, contiguous_result.output) < 1.0e-5,
+            "paged attention direct traversal agrees with contiguous decode");
+
     schedforge::QuantizedMatMulConfig quant_config{7, 9, 5, true, true, true};
     std::vector<float> input(35, 0.25F), weights(45, 0.2F), bias(9, 0.1F);
     const auto quantized = schedforge::quantize_matmul_weights(weights, quant_config);
@@ -410,7 +429,8 @@ void test_next_milestones() {
 
     const auto neon = schedforge::inspect_neon_codegen();
     require(neon.source.find("arm_neon.h") != std::string::npos &&
-            neon.source.find("vfmaq") != std::string::npos,
+            neon.source.find("vfmaq") != std::string::npos &&
+            neon.source.find("b + kk * 4") != std::string::npos,
             "neon source generation");
     const auto fuzz = schedforge::run_schedforge_fuzz(19, 128);
     require(fuzz.failures == 0 && fuzz.passed > 0, "compiler fuzz invariants");
@@ -823,6 +843,14 @@ void test_decoder_compiler() {
     require(dense_result.max_error < 1.0e-3 &&
             dense_result.output.size() == dense_data.input.size(),
             "dense decoder execution");
+    const auto quantized_decoder_weights = schedforge::quantize_decoder_weights(
+        dense_config, dense_data);
+    const auto quantized_decoder_result = schedforge::execute_quantized_decoder_layer(
+        dense_config, dense_data, quantized_decoder_weights, 0, 1);
+    require(quantized_decoder_result.max_error < 0.15 &&
+            quantized_decoder_result.tokens_per_second > 0.0 &&
+            quantized_decoder_result.output.size() == dense_data.input.size(),
+            "dense decoder INT8 execution");
 
     auto moe_config = dense_config;
     moe_config.ffn = schedforge::DecoderFFNKind::MoE;
@@ -860,6 +888,13 @@ void test_decoder_compiler() {
                 schedforge::AttentionLoweringStrategy::SplitKVDecode &&
             decode_result.max_error < 1.0e-3 && decode_result.tokens_per_second > 0.0,
             "decoder KV-cache decode execution");
+    const auto quantized_decode_weights = schedforge::quantize_decoder_weights(
+        decode_config, decode_data);
+    const auto quantized_decode_result = schedforge::execute_quantized_decoder_layer(
+        decode_config, decode_data, quantized_decode_weights, 0, 1);
+    require(quantized_decode_result.max_error < 0.15 &&
+            quantized_decode_result.output.size() == decode_data.input.size(),
+            "decoder INT8 KV-cache decode execution");
 
     const auto optimized = schedforge::ExecutablePlanOptimizer{}.optimize(
         imported, dense_config, dense_data, 2, 4, 1);

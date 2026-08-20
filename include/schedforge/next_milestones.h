@@ -2,6 +2,7 @@
 
 #include "schedforge/attention_compiler.h"
 #include "schedforge/compiler.h"
+#include "schedforge/decoder_compiler.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -70,6 +71,31 @@ QuantizedMatMulResult execute_quantized_matmul(
     const QuantizedMatMulWeights& weights, const std::vector<float>& bias,
     int warmup = 1, int repetitions = 5);
 
+struct QuantizedDecoderWeights {
+    QuantizedMatMulWeights query;
+    QuantizedMatMulWeights key;
+    QuantizedMatMulWeights value;
+    QuantizedMatMulWeights output;
+    QuantizedMatMulWeights gate;
+    QuantizedMatMulWeights up;
+    QuantizedMatMulWeights down;
+};
+
+struct QuantizedDecoderResult {
+    double milliseconds = 0.0;
+    double tokens_per_second = 0.0;
+    double max_error = 0.0;
+    std::vector<float> output;
+};
+
+QuantizedDecoderWeights quantize_decoder_weights(const DecoderConfig& config,
+                                                  const DecoderData& data,
+                                                  bool per_channel = true);
+QuantizedDecoderResult execute_quantized_decoder_layer(
+    const DecoderConfig& config, const DecoderData& data,
+    const QuantizedDecoderWeights& weights, int warmup = 1,
+    int repetitions = 5);
+
 struct TransferSchedule {
     std::size_t chunk_bytes = 64 * 1024;
     int workers = 1;
@@ -94,7 +120,10 @@ TransferSchedule tune_transfer_schedule(const std::vector<std::uint8_t>& source,
 struct NeonCodegenReport {
     bool compiled_for_neon = false;
     bool host_supports_neon = false;
+    bool cross_compile_attempted = false;
+    bool cross_compile_succeeded = false;
     std::string architecture;
+    std::string cross_compiler;
     std::string source;
     std::string diagnostic;
     std::string dump() const;

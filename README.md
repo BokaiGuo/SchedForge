@@ -293,25 +293,24 @@ inspectable and verifiable before target lowering.
 | `schedforge-next-study` | Run Paged KV, INT8, transfer, and NEON capability studies |
 | `schedforge-fuzz` | Run deterministic LoopIR and numerical invariant fuzzing |
 
-## v0.12-v0.16 Runtime Line
+## v0.12-v0.17 Runtime Line
 
-The next milestone line is implemented as executable, testable slices rather
-than simulator claims. v0.12 adds non-contiguous physical-page KV storage and
-exact decode integration; v0.13 adds per-channel INT8 weight-only MatMul with
-FP32 output; v0.14 tunes real host-memory copies over chunk and worker choices;
-v0.15 generates ARM NEON intrinsic source and reports whether the current host
-can execute it; v0.16 fuzzes random LoopIR shapes/schedules against numerical
-references.
+The runtime line is implemented as executable, testable slices rather than
+simulator claims. v0.12 adds non-contiguous physical-page KV storage and direct
+page-aware Decode traversal; v0.13 adds per-channel INT8 weight-only MatMul;
+v0.14 tunes real host-memory copies; v0.15 generates valid ARM NEON source and
+cross-compiles it for AArch64 syntax; v0.16 fuzzes LoopIR; v0.17 applies INT8
+weights across every Dense Decoder projection and Decode path.
 
 ```bash
 ./build/schedforge-next-study
 ./build/schedforge-fuzz --iterations=1000 --seed=1
 ```
 
-The checked-in `results/next_milestones.csv` records the current host study.
-This machine is x86_64, so NEON is reported as unavailable; no ARM performance
-claim is made. INT8 is currently a weight-only MatMul slice, and Paged KV uses a
-validated gather bridge into the exact existing attention runtime.
+The checked-in `results/next_milestones.csv` records direct paged-attention
+latency/error, Dense Decoder INT8 validation, transfer bandwidth, and the
+AArch64 cross-compilation result. This machine is x86_64, so no ARM runtime
+performance claim is made; `gather_paged_kv` remains only as an inspection API.
 
 ## Decoder Layer Compiler Demo
 
@@ -492,22 +491,24 @@ scripts/               Hardware-counter helpers
   and validate end to end.
 - Realistic Large rows are compile-feasibility evidence on this host; no Large
   runtime latency is claimed when weight or FLOP budgets reject execution.
-- AVX2 is the physically validated SIMD backend. AVX-512 and NEON are target
-  abstractions but are not validated code-generation backends in this release.
+- AVX2 is the physically validated SIMD backend. NEON source passes AArch64
+  cross-target syntax compilation, but AVX-512 and ARM runtime performance are
+  not validated on this host.
 - MoE P-core/E-core placement, NUMA-aware execution, quantized experts,
   block-sparse lowering, and distributed expert parallelism are not implemented.
 - Attention is a CPU cache-hierarchy adaptation of Flash-style exact attention,
   not an implementation or performance claim for GPU FlashAttention-2.
-- Paged KV allocation, BF16/INT8 attention, dropout/backward, distributed
-  attention, and spill-free native-parity fused LLVM code remain future work.
+- BF16/INT8 attention, dropout/backward, distributed attention, and spill-free
+  native-parity fused LLVM code remain future work.
 - AOT format v1 is same-target, shape-specialized FP32 MatMul and one runtime
   thread; whole-graph constant relocation and multi-kernel dispatch remain
   future deployment work.
-- v0.13 INT8 is weight-only MatMul, not yet a complete quantized Decoder.
-- v0.15 NEON source generation is present, but this x86_64 host cannot validate
+- v0.17 applies weight-only INT8 to every Dense Decoder projection; MoE expert
+  quantization and reduced-precision attention remain future work.
+- v0.17 cross-compiles valid NEON source, but this x86_64 host cannot validate
   ARM execution or performance.
-- v0.12 Paged KV currently gathers non-contiguous pages before attention; direct
-  page-aware tiled traversal remains a performance follow-up.
+- Paged Decode now traverses non-contiguous pages directly with online softmax;
+  `gather_paged_kv` is inspection-only.
 - The simulator is a diagnostic model, not a performance-selection oracle or a
   cycle-accurate Intel out-of-order simulator.
 - Performance numbers depend on CPU, frequency policy, compiler, workload, and

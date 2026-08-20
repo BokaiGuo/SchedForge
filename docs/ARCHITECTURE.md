@@ -134,12 +134,12 @@ not implied by the existence of object emission.
 
 ## Runtime Milestone Line
 
-The runtime now exposes Paged KV storage, INT8 weight-only MatMul, measured
-transfer scheduling, NEON source/capability inspection, and deterministic
-LoopIR fuzzing. These are explicit APIs in `next_milestones.h`, covered by
-CTest and `schedforge-next-study`/`schedforge-fuzz`. The current x86_64 host
-validates the first, second, third, and fifth slices directly; NEON is source
-and capability validation only until an ARM host is available.
+The runtime now exposes direct page-aware KV Decode, Dense Decoder INT8
+weight-only projections, measured transfer scheduling, AArch64 NEON syntax
+cross-compilation, and deterministic LoopIR fuzzing. These are explicit APIs in
+`next_milestones.h`, covered by CTest and
+`schedforge-next-study`/`schedforge-fuzz`. The current x86_64 host validates all
+CPU execution slices directly; NEON runtime performance still requires ARM.
 
 ## Flagship Workloads
 
@@ -163,8 +163,8 @@ and capability validation only until an ARM host is available.
 - LLVM-generated register microkernels are validated for legal static shapes;
   the native backend remains the highest-throughput path on the current host.
 - Attention is a CPU Flash-style exact lowering, not a GPU FlashAttention-2
-  implementation. Paged KV storage is implemented; direct page-aware tiled
-  traversal and spill-free native-parity fused LLVM code remain future work.
+  implementation. Paged KV Decode traverses pages directly; spill-free
+  native-parity fused LLVM code remains future work.
 - StableHLO support is deliberately a subset, not a complete specification
   implementation.
 - AVX2 is validated on one Intel CPU; AVX-512, NEON, and multi-node NUMA require

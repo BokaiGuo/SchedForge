@@ -3,4 +3,7 @@
 - [x] v0.14 measured transfer schedule search
 - [x] v0.15 NEON intrinsic source and honest host probe
 - [x] v0.16 deterministic fuzz harness and CTest target
+- [x] v0.17 direct paged Decode traversal
+- [x] v0.17 Dense Decoder INT8 prefill and KV-cache Decode
+- [x] v0.17 AArch64 NEON freestanding syntax gate
 - [x] Release, sanitizer, install, docs, and evidence validation
