@@ -384,6 +384,81 @@ std::vector<float> execute_quantized_decoder_once(
     return add_vectors(attention_residual, down);
 }
 
+QuantizedMatMulWeights quantize_moe_matrix(const std::vector<float>& weights,
+                                           int expert, int experts, int input_width,
+                                           int output_width, bool per_channel) {
+    const std::size_t matrix_size = static_cast<std::size_t>(input_width) * output_width;
+    if (weights.size() != static_cast<std::size_t>(experts) * matrix_size)
+        throw std::invalid_argument("MoE expert weight shape mismatch");
+    std::vector<float> matrix(matrix_size);
+    std::copy_n(weights.begin() + static_cast<std::ptrdiff_t>(expert * matrix_size),
+                matrix_size, matrix.begin());
+    return quantize_decoder_matrix(matrix, input_width, output_width, per_channel);
+}
+
+void validate_quantized_moe(const MoeConfig& config, const MoeData& data,
+                            const RoutingTrace& routing,
+                            const QuantizedMoeWeights& weights) {
+    if (config.tokens <= 0 || config.hidden <= 0 || config.intermediate <= 0 ||
+        config.experts <= 0 || config.top_k <= 0 || config.top_k > config.experts)
+        throw std::invalid_argument("invalid quantized MoE configuration");
+    if (routing.tokens <= 0 || routing.tokens > config.tokens ||
+        routing.experts != config.experts || routing.top_k != config.top_k ||
+        routing.expert_ids.size() != static_cast<std::size_t>(routing.tokens * routing.top_k) ||
+        routing.expert_weights.size() != routing.expert_ids.size())
+        throw std::invalid_argument("invalid quantized MoE routing trace");
+    if (data.input.size() != static_cast<std::size_t>(routing.tokens * config.hidden))
+        throw std::invalid_argument("quantized MoE input shape mismatch");
+    if (weights.w1.size() != static_cast<std::size_t>(config.experts) ||
+        weights.w3.size() != static_cast<std::size_t>(config.experts) ||
+        weights.w2.size() != static_cast<std::size_t>(config.experts))
+        throw std::invalid_argument("quantized MoE expert count mismatch");
+}
+
+std::vector<float> execute_quantized_moe_once(const MoeConfig& config,
+                                              const MoeData& data,
+                                              const RoutingTrace& routing,
+                                              const QuantizedMoeWeights& weights) {
+    std::vector<float> output(static_cast<std::size_t>(routing.tokens * config.hidden), 0.0F);
+    for (int token = 0; token < routing.tokens; ++token) {
+        const std::vector<float> input(data.input.begin() +
+            static_cast<std::ptrdiff_t>(token * config.hidden), data.input.begin() +
+            static_cast<std::ptrdiff_t>((token + 1) * config.hidden));
+        for (int slot = 0; slot < routing.top_k; ++slot) {
+            const std::size_t route_index = static_cast<std::size_t>(token * routing.top_k + slot);
+            const int expert = routing.expert_ids[route_index];
+            if (expert < 0 || expert >= config.experts)
+                throw std::invalid_argument("quantized MoE routing expert out of range");
+            std::vector<float> gate;
+            std::vector<float> up;
+            quantized_invoke({1, config.intermediate, config.hidden, false, false,
+                              weights.w1[static_cast<std::size_t>(expert)].scales.size() > 1},
+                             input, weights.w1[static_cast<std::size_t>(expert)], {}, gate);
+            quantized_invoke({1, config.intermediate, config.hidden, false, false,
+                              weights.w3[static_cast<std::size_t>(expert)].scales.size() > 1},
+                             input, weights.w3[static_cast<std::size_t>(expert)], {}, up);
+            for (int intermediate = 0; intermediate < config.intermediate; ++intermediate)
+                up[static_cast<std::size_t>(intermediate)] =
+                    up[static_cast<std::size_t>(intermediate)] /
+                    (1.0F + std::exp(-up[static_cast<std::size_t>(intermediate)]));
+            std::vector<float> activated(static_cast<std::size_t>(config.intermediate));
+            for (int intermediate = 0; intermediate < config.intermediate; ++intermediate)
+                activated[static_cast<std::size_t>(intermediate)] =
+                    gate[static_cast<std::size_t>(intermediate)] *
+                    up[static_cast<std::size_t>(intermediate)];
+            std::vector<float> expert_output;
+            quantized_invoke({1, config.hidden, config.intermediate, false, false,
+                              weights.w2[static_cast<std::size_t>(expert)].scales.size() > 1},
+                             activated, weights.w2[static_cast<std::size_t>(expert)], {},
+                             expert_output);
+            for (int feature = 0; feature < config.hidden; ++feature)
+                output[static_cast<std::size_t>(token) * config.hidden + feature] +=
+                    routing.expert_weights[route_index] * expert_output[static_cast<std::size_t>(feature)];
+        }
+    }
+    return output;
+}
+
 }  // namespace
 
 std::string PagedKVCache::dump() const {
@@ -621,6 +696,47 @@ QuantizedDecoderResult execute_quantized_decoder_layer(
     return result;
 }
 
+QuantizedMoeWeights quantize_moe_weights(const MoeConfig& config,
+                                         const MoeData& data, bool per_channel) {
+    QuantizedMoeWeights result;
+    result.w1.reserve(static_cast<std::size_t>(config.experts));
+    result.w3.reserve(static_cast<std::size_t>(config.experts));
+    result.w2.reserve(static_cast<std::size_t>(config.experts));
+    for (int expert = 0; expert < config.experts; ++expert) {
+        result.w1.push_back(quantize_moe_matrix(data.w1, expert, config.experts,
+                                                config.hidden, config.intermediate, per_channel));
+        result.w3.push_back(quantize_moe_matrix(data.w3, expert, config.experts,
+                                                config.hidden, config.intermediate, per_channel));
+        result.w2.push_back(quantize_moe_matrix(data.w2, expert, config.experts,
+                                                config.intermediate, config.hidden, per_channel));
+    }
+    return result;
+}
+
+QuantizedMoeResult execute_quantized_moe(
+    const MoeConfig& config, const MoeData& data, const RoutingTrace& routing,
+    const QuantizedMoeWeights& weights, int warmup, int repetitions) {
+    validate_quantized_moe(config, data, routing, weights);
+    for (int iteration = 0; iteration < std::max(0, warmup); ++iteration)
+        (void)execute_quantized_moe_once(config, data, routing, weights);
+    std::vector<double> timings;
+    std::vector<float> output;
+    for (int iteration = 0; iteration < std::max(1, repetitions); ++iteration) {
+        const auto start = std::chrono::steady_clock::now();
+        output = execute_quantized_moe_once(config, data, routing, weights);
+        timings.push_back(std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start).count());
+    }
+    std::sort(timings.begin(), timings.end());
+    QuantizedMoeResult result;
+    result.milliseconds = timings[timings.size() / 2];
+    result.tokens_per_second = result.milliseconds > 0.0
+        ? static_cast<double>(routing.tokens) * 1000.0 / result.milliseconds : 0.0;
+    result.output = std::move(output);
+    result.max_error = max_abs_error(result.output, reference_moe(config, data, routing));
+    return result;
+}
+
 std::string TransferSchedule::dump() const {
     std::ostringstream out;
     out << "chunk=" << chunk_bytes << ",workers=" << workers << ",non_temporal=" << non_temporal;
@@ -700,6 +816,30 @@ std::string generate_neon_matmul_source(int m, int n, int k) {
     return out.str();
 }
 
+void execute_neon_matmul(const float* input, const float* weights, float* output,
+                         int m, int n, int k) {
+    if (!input || !weights || !output || m <= 0 || n <= 0 || k <= 0)
+        throw std::invalid_argument("invalid NEON matmul arguments");
+    for (int row = 0; row < m; ++row) {
+        int column = 0;
+#if defined(__aarch64__) || defined(__ARM_NEON) || defined(__ARM_NEON__)
+        for (; column + 4 <= n; column += 4) {
+            float32x4_t accumulator = vdupq_n_f32(0.0F);
+            for (int depth = 0; depth < k; ++depth)
+                accumulator = vfmaq_n_f32(accumulator,
+                    vld1q_f32(weights + depth * n + column), input[row * k + depth]);
+            vst1q_f32(output + row * n + column, accumulator);
+        }
+#endif
+        for (; column < n; ++column) {
+            float accumulator = 0.0F;
+            for (int depth = 0; depth < k; ++depth)
+                accumulator += input[row * k + depth] * weights[depth * n + column];
+            output[row * n + column] = accumulator;
+        }
+    }
+}
+
 NeonCodegenReport inspect_neon_codegen() {
     NeonCodegenReport report;
 #if defined(__aarch64__)
@@ -719,6 +859,32 @@ NeonCodegenReport inspect_neon_codegen() {
     report.diagnostic = "host build is not ARM NEON; use an AArch64 cross compiler for codegen validation";
 #endif
     report.source = generate_neon_matmul_source();
+    report.runtime_attempted = true;
+    constexpr int runtime_m = 8;
+    constexpr int runtime_n = 8;
+    constexpr int runtime_k = 8;
+    std::vector<float> runtime_input(runtime_m * runtime_k, 0.125F);
+    std::vector<float> runtime_weights(runtime_k * runtime_n, 0.25F);
+    std::vector<float> runtime_output(runtime_m * runtime_n, 0.0F);
+    std::vector<float> runtime_reference(runtime_output.size(), 0.0F);
+    for (int row = 0; row < runtime_m; ++row)
+        for (int column = 0; column < runtime_n; ++column)
+            for (int depth = 0; depth < runtime_k; ++depth)
+                runtime_reference[row * runtime_n + column] +=
+                    runtime_input[row * runtime_k + depth] *
+                    runtime_weights[depth * runtime_n + column];
+    const auto runtime_start = std::chrono::steady_clock::now();
+    execute_neon_matmul(runtime_input.data(), runtime_weights.data(), runtime_output.data(),
+                        runtime_m, runtime_n, runtime_k);
+    report.runtime_milliseconds = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - runtime_start).count();
+    report.runtime_max_error = max_abs_error(runtime_output, runtime_reference);
+#if defined(__aarch64__) || defined(__ARM_NEON) || defined(__ARM_NEON__)
+    report.runtime_succeeded = report.runtime_max_error < 1.0e-6;
+#else
+    report.runtime_succeeded = false;
+    report.runtime_attempted = false;
+#endif
     for (const std::string candidate : {"/usr/bin/clang++-18", "/usr/bin/clang++",
                                         "/usr/local/swift/usr/bin/clang++"}) {
         if (!std::filesystem::exists(candidate)) continue;
@@ -756,6 +922,10 @@ std::string NeonCodegenReport::dump() const {
         << ",host_supports_neon=" << host_supports_neon
         << ",cross_compile_attempted=" << cross_compile_attempted
         << ",cross_compile_succeeded=" << cross_compile_succeeded
+        << ",runtime_attempted=" << runtime_attempted
+        << ",runtime_succeeded=" << runtime_succeeded
+        << ",runtime_ms=" << runtime_milliseconds
+        << ",runtime_error=" << runtime_max_error
         << ",cross_compiler=" << cross_compiler << ",diagnostic=" << diagnostic;
     return out.str();
 }

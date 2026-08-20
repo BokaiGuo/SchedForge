@@ -6,4 +6,6 @@
 - [x] v0.17 direct paged Decode traversal
 - [x] v0.17 Dense Decoder INT8 prefill and KV-cache Decode
 - [x] v0.17 AArch64 NEON freestanding syntax gate
+- [x] v0.18 MoE Expert INT8 W1/W3/W2 execution
+- [x] v0.18 QEMU AArch64 NEON runtime smoke
 - [x] Release, sanitizer, install, docs, and evidence validation

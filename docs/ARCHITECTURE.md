@@ -139,7 +139,8 @@ weight-only projections, measured transfer scheduling, AArch64 NEON syntax
 cross-compilation, and deterministic LoopIR fuzzing. These are explicit APIs in
 `next_milestones.h`, covered by CTest and
 `schedforge-next-study`/`schedforge-fuzz`. The current x86_64 host validates all
-CPU execution slices directly; NEON runtime performance still requires ARM.
+CPU execution slices directly; generated NEON is also executed as an AArch64
+ELF under QEMU, while native ARM hardware performance still requires ARM.
 
 ## Flagship Workloads
 

@@ -2,7 +2,7 @@
 
 All notable changes to SchedForge are documented here.
 
-## [0.17.0] - 2026-08-20
+## [0.18.0] - 2026-08-20
 
 ### Added
 
@@ -10,6 +10,8 @@ All notable changes to SchedForge are documented here.
   the hot path no longer gathers pages into a contiguous cache.
 - Dense Decoder INT8 weight-only execution covering Q/K/V, output projection,
   Gate/Up, and Down projections, including prefill and KV-cache Decode paths.
+- MoE Expert INT8 weight-only execution covering routed W1/W3, SwiGLU, W2,
+  and weighted Top-K combine with FP32 accumulation.
 - AArch64 NEON intrinsic source corrected to a valid matrix multiply microkernel
   and checked with Clang cross-target syntax compilation using a freestanding probe.
 - Runtime study CSV now records direct paged-attention error/latency and NEON
@@ -17,12 +19,16 @@ All notable changes to SchedForge are documented here.
 
 ### Evidence Boundaries
 
-- The current host is x86_64: NEON source is cross-compiled for syntax, but ARM
-  runtime performance is not claimed without an ARM host.
-- INT8 Decoder coverage is complete for the Dense path; MoE expert weights remain
-  on the existing FP32 runtime path.
+- The current host is x86_64: NEON source is cross-compiled and executed as a
+  static AArch64 ELF under QEMU; native ARM performance still requires ARM hardware.
+- INT8 covers Dense Decoder and MoE Expert W1/W3/W2 paths; reduced-precision
+  attention remains outside this milestone.
 - Paged Decode traverses page tables directly; `gather_paged_kv` remains an
   explicit inspection/debug utility, not part of the execution hot path.
+- QEMU-backed AArch64 ELF smoke execution validates the generated NEON kernel's
+  runtime result without requiring host-wide binfmt registration.
+
+## [0.17.0] - 2026-08-20
 
 ## [0.12.0-0.16.0] - 2026-08-20
 

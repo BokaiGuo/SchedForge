@@ -1,4 +1,4 @@
-# Spec: SchedForge v0.12-v0.17 Runtime and Validation Line
+# Spec: SchedForge v0.12-v0.18 Runtime and Validation Line
 
 ## Objective
 Complete the next five runtime/compiler milestones as tested vertical slices:
@@ -28,15 +28,16 @@ Sanitizers: `cmake -S . -B build-v016-asan -DSCHEDFORGE_ENABLE_SANITIZERS=ON -DC
   numerical invariants, CTest integration, and standalone fuzz CLI.
 - v0.17: Dense Decoder INT8 Q/K/V/O/Gate/Up/Down projections for prefill and
   KV-cache Decode, direct paged traversal, and NEON cross-target syntax gates.
+- v0.18: MoE Expert INT8 W1/W3/W2 execution and QEMU AArch64 runtime smoke.
 
 ## Boundaries
 - Always: separate measured hardware facts, generated source, and unavailable targets.
 - Never: claim NEON machine-code execution on this x86 host.
 - Never: call transfer tuning a NUMA benchmark; it is host-memory copy tuning.
-- Never: call Dense Decoder INT8 validation MoE expert quantization or ARM runtime
-  performance validation.
-- Future: MoE expert INT8 weights, cross-target NEON execution, and libFuzzer
-  corpus minimization.
+- Never: call QEMU execution native ARM hardware performance validation or call
+  FP32 routing a fully quantized MoE pipeline.
+- Future: quantized MoE routing, native ARM benchmarking, and libFuzzer corpus
+  minimization.
 
 ## Success Criteria
 1. All five APIs compile, execute, and have regression tests.

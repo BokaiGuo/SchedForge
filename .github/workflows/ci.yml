@@ -128,11 +128,17 @@ jobs:
           grep -q "native_gflops_over_llvm" build/codegen.csv
           grep -q "llvm_speed_fraction" build/fused_attention.csv
 
-      - name: Smoke test v0.12-v0.17 runtime line
+      - name: Smoke test v0.12-v0.18 runtime line
         run: |
           ./build/schedforge-next-study --quick
           test -s results/next_milestones.csv
-          grep -q ",1$" results/next_milestones.csv
+          grep -q ",1,0$" results/next_milestones.csv
           /usr/bin/clang++-18 -target aarch64-linux-gnu -march=armv8-a+simd \
             -ffreestanding -fsyntax-only results/generated_neon_matmul.cpp
           ./build/schedforge-fuzz --iterations=128 --seed=17
+
+      - name: Run AArch64 NEON runtime smoke under QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user binutils-aarch64-linux-gnu
+          ./scripts/run_neon_qemu.sh

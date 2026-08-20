@@ -290,21 +290,23 @@ vector=8;unroll=4;threads=8;pack=ab;prefetch=4;fuse=true;pin=true
 | `schedforge-next-study` | 运行 Paged KV、INT8、Transfer 和 NEON 能力实验 |
 | `schedforge-fuzz` | 对 LoopIR 与数值不变量执行确定性 Fuzzing |
 
-## v0.12-v0.17 Runtime 里程碑线
+## v0.12-v0.18 Runtime 里程碑线
 
 这条里程碑线全部落成可执行、可测试的切片，而不是模拟器宣传：v0.12 增加
 非连续物理页 KV 和直接分页 Decode 遍历；v0.13 增加 INT8 Weight-only
 MatMul；v0.14 在真实主机内存拷贝上搜索 Chunk/Worker 调度；v0.15 生成有效
 ARM NEON Intrinsic 并执行 AArch64 交叉语法编译；v0.16 执行 LoopIR Fuzzing；
-v0.17 将 INT8 权重接入 Dense Decoder 的全部投影与 Decode 路径。
+v0.17 将 INT8 权重接入 Dense Decoder 的全部投影与 Decode 路径；v0.18 增加
+MoE Expert W1/W3/W2 INT8 执行。
 
 ```bash
 ./build/schedforge-next-study
 ./build/schedforge-fuzz --iterations=1000 --seed=1
+./scripts/run_neon_qemu.sh
 ```
 
-当前主机是 x86_64，因此不声明 ARM 运行时性能；NEON 已通过 AArch64 交叉语法
-编译。INT8 Dense Decoder 已实际执行并校验，Paged Decode 热路径直接遍历页表；
+当前主机是 x86_64，因此不声明 ARM 原生硬件性能；NEON 已通过 AArch64 交叉语法
+编译，并通过 QEMU 执行 AArch64 ELF 做运行正确性检查。INT8 Dense Decoder 已实际执行并校验，Paged Decode 热路径直接遍历页表；
 `gather_paged_kv` 仅保留为检查/调试 API。
 
 ## Decoder Layer Compiler 实测 Demo
@@ -471,17 +473,18 @@ scripts/              性能计数器辅助脚本
   拒绝的档位不声明真实 Runtime Latency。
 - 当前只在真实硬件上验证了 AVX2 后端。NEON 已通过 AArch64 交叉语法编译，
   但 AVX-512 与 ARM 运行时性能尚未在当前主机验证。
-- MoE 的 P-core/E-core 放置、NUMA-aware 执行、量化 Expert、Block-sparse
-  Lowering 与分布式 Expert Parallelism 尚未实现。
+- MoE 的 P-core/E-core 放置、NUMA-aware 执行、量化 Router、Block-sparse
+  Lowering 与分布式 Expert Parallelism 尚未实现；Expert W1/W3/W2
+  Weight-only INT8 已实现。
 - Attention 是面向 CPU Cache Hierarchy 的 Flash-style 精确 Attention，不是
   GPU FlashAttention-2 的实现或性能声明。
 - BF16/INT8 Attention、Dropout/Backward、分布式 Attention，以及无 Spill
   且达到 Native Parity 的 LLVM Fused Attention 尚未实现。
 - AOT Format v1 仅支持同目标、Shape 特化 FP32 MatMul 和单 Runtime Thread；
   Whole-Graph 常量重定位与多 Kernel Dispatch 仍属于后续工作。
-- v0.17 已将 Weight-only INT8 接入 Dense Decoder 全部投影；MoE Expert 量化与
-  低精度 Attention 仍是后续工作。
-- v0.17 已交叉编译 NEON 源码，但本 x86_64 主机不能验证 ARM 执行与性能。
+- v0.17 已将 Weight-only INT8 接入 Dense Decoder 全部投影与 MoE Expert
+  W1/W3/W2；低精度 Attention 仍是后续工作。
+- v0.17 已交叉编译并通过 QEMU 执行 NEON AArch64 ELF；本 x86_64 主机仍不能代表 ARM 原生硬件性能。
 - Paged Decode 已直接遍历非连续页并执行在线 Softmax；`gather_paged_kv`
   仅用于检查与调试。
 - 模拟器只提供诊断信息，既不是性能选择裁判，也不会逐周期复现 Intel

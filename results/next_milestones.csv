@@ -1,2 +1,2 @@
-version,paged_tokens,paged_pages,paged_attention_error,paged_attention_ms,int8_ms,int8_error,decoder_int8_ms,decoder_int8_error,transfer_chunk,transfer_workers,transfer_gbps,neon_compiled,neon_host,neon_cross_compile
-0.17.0,16,2,0,0.000721,0.023896,2.38419e-07,0.004482,0.00172807,262144,1,43.0733,0,0,1
+version,paged_tokens,paged_pages,paged_attention_error,paged_attention_ms,int8_ms,int8_error,decoder_int8_ms,decoder_int8_error,moe_int8_ms,moe_int8_error,moe_int8_tokens_per_second,transfer_chunk,transfer_workers,transfer_gbps,neon_compiled,neon_host,neon_cross_compile,neon_runtime
+0.18.0,16,2,0,0.000567,0.023873,2.38419e-07,0.003592,0.00172807,0.012523,1.95794e-05,638825,262144,1,47.3547,0,0,1,0

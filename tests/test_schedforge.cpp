@@ -432,6 +432,9 @@ void test_next_milestones() {
             neon.source.find("vfmaq") != std::string::npos &&
             neon.source.find("b + kk * 4") != std::string::npos,
             "neon source generation");
+    require(neon.runtime_max_error < 1.0e-6 &&
+            (neon.runtime_succeeded || !neon.host_supports_neon),
+            "neon runtime correctness boundary");
     const auto fuzz = schedforge::run_schedforge_fuzz(19, 128);
     require(fuzz.failures == 0 && fuzz.passed > 0, "compiler fuzz invariants");
 }
@@ -895,6 +898,20 @@ void test_decoder_compiler() {
     require(quantized_decode_result.max_error < 0.15 &&
             quantized_decode_result.output.size() == decode_data.input.size(),
             "decoder INT8 KV-cache decode execution");
+
+    const schedforge::MoeConfig quantized_moe_config{8, 16, 24, 4, 2};
+    const auto quantized_moe_data = schedforge::make_moe_data(quantized_moe_config, 91);
+    const auto quantized_moe_routing = schedforge::route_topk(
+        quantized_moe_config, quantized_moe_data);
+    const auto quantized_moe_weights = schedforge::quantize_moe_weights(
+        quantized_moe_config, quantized_moe_data);
+    const auto quantized_moe_result = schedforge::execute_quantized_moe(
+        quantized_moe_config, quantized_moe_data, quantized_moe_routing,
+        quantized_moe_weights, 0, 1);
+    require(quantized_moe_result.max_error < 0.2 &&
+            quantized_moe_result.tokens_per_second > 0.0 &&
+            quantized_moe_result.output.size() == quantized_moe_data.input.size(),
+            "MoE Expert INT8 execution");
 
     const auto optimized = schedforge::ExecutablePlanOptimizer{}.optimize(
         imported, dense_config, dense_data, 2, 4, 1);

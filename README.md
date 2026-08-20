@@ -293,24 +293,27 @@ inspectable and verifiable before target lowering.
 | `schedforge-next-study` | Run Paged KV, INT8, transfer, and NEON capability studies |
 | `schedforge-fuzz` | Run deterministic LoopIR and numerical invariant fuzzing |
 
-## v0.12-v0.17 Runtime Line
+## v0.12-v0.18 Runtime Line
 
 The runtime line is implemented as executable, testable slices rather than
 simulator claims. v0.12 adds non-contiguous physical-page KV storage and direct
 page-aware Decode traversal; v0.13 adds per-channel INT8 weight-only MatMul;
 v0.14 tunes real host-memory copies; v0.15 generates valid ARM NEON source and
-cross-compiles it for AArch64 syntax; v0.16 fuzzes LoopIR; v0.17 applies INT8
-weights across every Dense Decoder projection and Decode path.
+cross-compiles it for AArch64 syntax and runs a QEMU AArch64 ELF smoke; v0.16
+fuzzes LoopIR; v0.17 applies INT8 weights across every Dense Decoder projection
+and Decode path; v0.18 adds MoE Expert W1/W3/W2 INT8 execution.
 
 ```bash
 ./build/schedforge-next-study
 ./build/schedforge-fuzz --iterations=1000 --seed=1
+./scripts/run_neon_qemu.sh
 ```
 
 The checked-in `results/next_milestones.csv` records direct paged-attention
 latency/error, Dense Decoder INT8 validation, transfer bandwidth, and the
 AArch64 cross-compilation result. This machine is x86_64, so no ARM runtime
 performance claim is made; `gather_paged_kv` remains only as an inspection API.
+The QEMU smoke runs the generated AArch64 ELF and checks the NEON result.
 
 ## Decoder Layer Compiler Demo
 
@@ -494,8 +497,9 @@ scripts/               Hardware-counter helpers
 - AVX2 is the physically validated SIMD backend. NEON source passes AArch64
   cross-target syntax compilation, but AVX-512 and ARM runtime performance are
   not validated on this host.
-- MoE P-core/E-core placement, NUMA-aware execution, quantized experts,
-  block-sparse lowering, and distributed expert parallelism are not implemented.
+- MoE P-core/E-core placement, NUMA-aware execution, quantized routing,
+  block-sparse lowering, and distributed expert parallelism are not implemented;
+  Expert W1/W3/W2 weight-only INT8 is implemented.
 - Attention is a CPU cache-hierarchy adaptation of Flash-style exact attention,
   not an implementation or performance claim for GPU FlashAttention-2.
 - BF16/INT8 attention, dropout/backward, distributed attention, and spill-free
@@ -504,9 +508,9 @@ scripts/               Hardware-counter helpers
   thread; whole-graph constant relocation and multi-kernel dispatch remain
   future deployment work.
 - v0.17 applies weight-only INT8 to every Dense Decoder projection; MoE expert
-  quantization and reduced-precision attention remain future work.
-- v0.17 cross-compiles valid NEON source, but this x86_64 host cannot validate
-  ARM execution or performance.
+  W1/W3/W2 quantization is also implemented; reduced-precision attention remains future work.
+- v0.17 cross-compiles valid NEON source and runs an AArch64 ELF smoke under
+  QEMU; native ARM hardware performance still requires an ARM host.
 - Paged Decode now traverses non-contiguous pages directly with online softmax;
   `gather_paged_kv` is inspection-only.
 - The simulator is a diagnostic model, not a performance-selection oracle or a

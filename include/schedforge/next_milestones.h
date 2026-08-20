@@ -96,6 +96,26 @@ QuantizedDecoderResult execute_quantized_decoder_layer(
     const QuantizedDecoderWeights& weights, int warmup = 1,
     int repetitions = 5);
 
+struct QuantizedMoeWeights {
+    std::vector<QuantizedMatMulWeights> w1;
+    std::vector<QuantizedMatMulWeights> w3;
+    std::vector<QuantizedMatMulWeights> w2;
+};
+
+struct QuantizedMoeResult {
+    double milliseconds = 0.0;
+    double tokens_per_second = 0.0;
+    double max_error = 0.0;
+    std::vector<float> output;
+};
+
+QuantizedMoeWeights quantize_moe_weights(const MoeConfig& config,
+                                         const MoeData& data,
+                                         bool per_channel = true);
+QuantizedMoeResult execute_quantized_moe(
+    const MoeConfig& config, const MoeData& data, const RoutingTrace& routing,
+    const QuantizedMoeWeights& weights, int warmup = 1, int repetitions = 5);
+
 struct TransferSchedule {
     std::size_t chunk_bytes = 64 * 1024;
     int workers = 1;
@@ -122,6 +142,10 @@ struct NeonCodegenReport {
     bool host_supports_neon = false;
     bool cross_compile_attempted = false;
     bool cross_compile_succeeded = false;
+    bool runtime_attempted = false;
+    bool runtime_succeeded = false;
+    double runtime_milliseconds = 0.0;
+    double runtime_max_error = 0.0;
     std::string architecture;
     std::string cross_compiler;
     std::string source;
@@ -131,6 +155,8 @@ struct NeonCodegenReport {
 
 NeonCodegenReport inspect_neon_codegen();
 std::string generate_neon_matmul_source(int m = 4, int n = 4, int k = 4);
+void execute_neon_matmul(const float* input, const float* weights, float* output,
+                         int m, int n, int k);
 
 struct FuzzSummary {
     std::uint64_t seed = 1;
